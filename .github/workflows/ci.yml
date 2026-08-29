@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       LIMEN_REV: fd3f505d01be871d3b547221f384666b1d013326
-      QALLOW_REV: 03ba4d45feeb6772bb0989474f9bdee1e8e29174
+      QALLOW_REV: 42ce93f17092d3124e238de69f160a18de09b5db
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -78,7 +78,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       VEYN_REV: 06cb9eaa4b1f970ac20c596d4da0c4e19c2a3ede
-      QALLOW_REV: 03ba4d45feeb6772bb0989474f9bdee1e8e29174
+      QALLOW_REV: 42ce93f17092d3124e238de69f160a18de09b5db
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
