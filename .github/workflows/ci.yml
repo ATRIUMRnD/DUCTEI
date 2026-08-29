@@ -86,9 +86,16 @@ jobs:
         with:
           python-version: "3.12"
       - name: checkout VEYN at pinned rev
+        uses: actions/checkout@v4
+        with:
+          repository: CGXDevTeam/VEYN
+          ref: ${{ env.VEYN_REV }}
+          path: veyn-checkout
+          token: ${{ github.token }}
+      - name: place VEYN at /tmp/VEYN
         run: |
-          git clone https://github.com/xingxerx/VEYN.git /tmp/VEYN
-          git -C /tmp/VEYN checkout "$VEYN_REV"
+          rm -rf /tmp/VEYN
+          cp -a veyn-checkout /tmp/VEYN
       - name: install VEYN's system deps (BLE/dbus, ALSA, HID/udev)
         run: |
           sudo apt-get update
