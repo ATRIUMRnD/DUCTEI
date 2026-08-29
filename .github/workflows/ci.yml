@@ -48,7 +48,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       LIMEN_REV: fd3f505d01be871d3b547221f384666b1d013326
-      QALLOW_REV: 0a546b307c21b81f93ee56f5013698357662eff9
+      QALLOW_REV: 42ce93f17092d3124e238de69f160a18de09b5db
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -77,8 +77,8 @@ jobs:
   e2e-smoke-veyn:
     runs-on: ubuntu-latest
     env:
-      VEYN_REV: 1913f41e4b867351ef12bad196cc7653a674c84d
-      QALLOW_REV: 0a546b307c21b81f93ee56f5013698357662eff9
+      VEYN_REV: 06cb9eaa4b1f970ac20c596d4da0c4e19c2a3ede
+      QALLOW_REV: 42ce93f17092d3124e238de69f160a18de09b5db
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -86,9 +86,16 @@ jobs:
         with:
           python-version: "3.12"
       - name: checkout VEYN at pinned rev
+        uses: actions/checkout@v4
+        with:
+          repository: CGXDevTeam/VEYN
+          ref: ${{ env.VEYN_REV }}
+          path: veyn-checkout
+          token: ${{ secrets.VEYN_READ_TOKEN }}
+      - name: place VEYN at /tmp/VEYN
         run: |
-          git clone https://github.com/xingxerx/VEYN.git /tmp/VEYN
-          git -C /tmp/VEYN checkout "$VEYN_REV"
+          rm -rf /tmp/VEYN
+          cp -a veyn-checkout /tmp/VEYN
       - name: install VEYN's system deps (BLE/dbus, ALSA, HID/udev)
         run: |
           sudo apt-get update
