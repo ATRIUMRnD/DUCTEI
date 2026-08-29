@@ -91,7 +91,7 @@ jobs:
           repository: CGXDevTeam/VEYN
           ref: ${{ env.VEYN_REV }}
           path: veyn-checkout
-          token: ${{ github.token }}
+          token: ${{ secrets.VEYN_READ_TOKEN }}
       - name: place VEYN at /tmp/VEYN
         run: |
           rm -rf /tmp/VEYN
