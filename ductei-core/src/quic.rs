@@ -119,7 +119,8 @@ impl super::transport::Transport for QuicClient {
             send.finish().map_err(|e| ChannelError::Io(e.to_string()))?;
             let mut ack = [0u8; 1];
             recv.read_exact(&mut ack).await.map_err(|e| ChannelError::Io(e.to_string()))?;
-            Ok(ack[0] == 1)
+            // Success on applied (1) or already-present (2). Only 0 is rejection.
+            Ok(ack[0] != 0)
         })
     }
 }
@@ -151,11 +152,16 @@ pub fn serve_quic_blocking(addr: SocketAddr, signed: SelfSigned, mut ch: Channel
                     Ok(s) => s,
                     Err(_) => break, // peer closed the connection
                 };
-                let ok = match read_frame(&mut recv).await? {
-                    Some(env) => if ch.send(env).is_ok() { 1u8 } else { 0u8 },
+                let ack = match read_frame(&mut recv).await? {
+                    Some(env) => match ch.send(env) {
+                        Ok(()) => 1u8,
+                        Err(crate::ChannelError::StaleDelta { .. }) => 2u8,
+                        Err(crate::ChannelError::ScopeDenied(_)) => 0u8,
+                        Err(_) => 0u8,
+                    },
                     None => break,
                 };
-                send.write_all(&[ok]).await.map_err(|e| IoError::other(e.to_string()))?;
+                send.write_all(&[ack]).await.map_err(|e| IoError::other(e.to_string()))?;
                 send.finish().map_err(|e| IoError::other(e.to_string()))?;
             }
         }

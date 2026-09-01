@@ -3,7 +3,9 @@
 //! Every inbound envelope passes: scope policy → causal gate → JSONL
 //! persistence, and only THEN is acked (persistence-first). The transport
 //! trait is vendor-neutral so gRPC/QUIC can slot in later.
-//! Frame: u32 LE length | JSON bytes.  Ack: 1 byte (1=accepted, 0=rejected).
+//! Frame: u32 LE length | JSON bytes. Ack: 1 byte with tri-state:
+//!   1 = applied (new write persisted), 2 = stale/already-present (receipt),
+//!   0 = rejected (scope-denied/malformed/failed-to-apply).
 
 use crate::{Channel, ChannelError, Envelope};
 use std::io::{Read, Write};
@@ -44,7 +46,8 @@ impl Transport for TcpClient {
         write_frame(&mut self.stream, env).map_err(|e| ChannelError::Io(e.to_string()))?;
         let mut ack = [0u8; 1];
         self.stream.read_exact(&mut ack).map_err(|e| ChannelError::Io(e.to_string()))?;
-        Ok(ack[0] == 1)
+        // Success on applied (1) or already-present (2). Only 0 is rejection.
+        Ok(ack[0] != 0)
     }
 }
 
@@ -53,11 +56,13 @@ impl Transport for TcpClient {
 pub fn serve_connection(mut stream: TcpStream, ch: &mut Channel) -> std::io::Result<usize> {
     let mut accepted = 0usize;
     while let Some(env) = read_frame(&mut stream)? {
-        let ok = match ch.send(env) {
+        let ack = match ch.send(env) {
             Ok(()) => { accepted += 1; 1u8 }
-            Err(_) => 0u8, // scope-denied or stale: logged channel-side, not applied
+            Err(ChannelError::StaleDelta { .. }) => 2u8,
+            Err(ChannelError::ScopeDenied(_)) => 0u8,
+            Err(_) => 0u8, // I/O or other error: not applied
         };
-        stream.write_all(&[ok])?;
+        stream.write_all(&[ack])?;
         stream.flush()?;
     }
     Ok(accepted)
@@ -97,12 +102,14 @@ pub fn send_local_first(
                 if accepted {
                     Ok(DeliveryPath::Network)
                 } else {
+                    // Ack=0 is an explicit rejection (scope-denied/malformed). Do not fallback.
                     Err(ChannelError::ScopeDenied(env.key.clone()))
                 }
             }
-            Err(_) => {
-                local.send(env.clone())?;
-                Ok(DeliveryPath::LocalFallback)
+            Err(e) => {
+                // Connect succeeded but a later I/O error occurred (write/read/ack).
+                // Receiver persistence is unknown — do NOT LocalFallback here.
+                Err(e)
             }
         },
         Err(_) => {

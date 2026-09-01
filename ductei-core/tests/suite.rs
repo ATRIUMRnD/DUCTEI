@@ -124,7 +124,8 @@ fn transport_two_node_loopback() {
     });
     let mut c = TcpClient::connect(addr).unwrap();
     assert!(c.send_envelope(&env("a", &["qallow.semantic.cert"], 1, 1)).unwrap());
-    assert!(!c.send_envelope(&env("a", &["qallow.semantic.cert"], 1, 1)).unwrap());
+    // Duplicate (same triple) is a successful receipt (ack=2), not a rejection.
+    assert!(c.send_envelope(&env("a", &["qallow.semantic.cert"], 1, 1)).unwrap());
     assert!(!c.send_envelope(&env("b", &["limen.credentials"], 1, 2)).unwrap());
     assert!(c.send_envelope(&env("a", &["qallow.semantic.cert"], 1, 2)).unwrap());
     drop(c);
@@ -236,6 +237,146 @@ fn transport_degrades_to_local_when_network_unavailable() {
     let (envs, _) = local.replay(0).unwrap();
     assert_eq!(envs.len(), 1);
     assert_eq!(envs[0].key, "a");
+}
+
+#[cfg(feature = "net")]
+#[test]
+fn transport_crash_window_retry_ack2() {
+    use std::net::TcpListener;
+    use std::io::{Read, Write};
+
+    let p = tmp("t5c.jsonl"); let r = tmp("t5cr.jsonl");
+    let _ = std::fs::remove_file(&p);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let mut ch = Channel::open(ScopePolicy::new().allow("qallow.semantic.cert"), &p, &r).unwrap();
+        // Accept two connections: first writer crashes before reading ack; second is retry.
+        let mut accepted_total = 0usize;
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            let res = serve_connection(stream, &mut ch);
+            if let Ok(n) = res { accepted_total += n; }
+        }
+        let (envs, _) = ch.replay(0).unwrap();
+        (accepted_total, envs)
+    });
+
+    // First attempt: write frame then drop before reading ack (simulate crash).
+    let e = env("a", &["qallow.semantic.cert"], 1, 1);
+    let mut s1 = std::net::TcpStream::connect(addr).unwrap();
+    let body = serde_json::to_vec(&e).unwrap();
+    s1.write_all(&(body.len() as u32).to_le_bytes()).unwrap();
+    s1.write_all(&body).unwrap();
+    drop(s1); // crash before reading ack
+
+    // Retry after "restart": identical triple, expect ack=2 and no second apply.
+    let mut s2 = std::net::TcpStream::connect(addr).unwrap();
+    s2.write_all(&(body.len() as u32).to_le_bytes()).unwrap();
+    s2.write_all(&body).unwrap();
+    let mut ack = [0u8; 1];
+    s2.read_exact(&mut ack).unwrap();
+    assert_eq!(ack[0], 2);
+    drop(s2);
+
+    let (accepted_total, envs) = server.join().unwrap();
+    assert_eq!(accepted_total, 1);
+    assert_eq!(envs.len(), 1);
+    assert_eq!(envs[0].key, "a");
+}
+
+#[cfg(feature = "net")]
+#[test]
+fn transport_same_triple_stale_while_newer_lamport_applies() {
+    use std::net::TcpListener;
+    use std::io::{Read, Write};
+
+    let p = tmp("t5n.jsonl"); let r = tmp("t5nr.jsonl");
+    let _ = std::fs::remove_file(&p);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let mut ch = Channel::open(ScopePolicy::new().allow("qallow.semantic.cert"), &p, &r).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let _ = serve_connection(stream, &mut ch);
+        let (envs, _) = ch.replay(0).unwrap();
+        envs
+    });
+
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    // Send lamport=1
+    let e1 = env("k", &["qallow.semantic.cert"], 1, 1);
+    let b1 = serde_json::to_vec(&e1).unwrap();
+    s.write_all(&(b1.len() as u32).to_le_bytes()).unwrap();
+    s.write_all(&b1).unwrap();
+    let mut a = [0u8; 1]; s.read_exact(&mut a).unwrap(); assert_eq!(a[0], 1);
+    // Duplicate (stale)
+    s.write_all(&(b1.len() as u32).to_le_bytes()).unwrap();
+    s.write_all(&b1).unwrap();
+    s.read_exact(&mut a).unwrap(); assert_eq!(a[0], 2);
+    // Newer lamport applies
+    let e2 = env("k", &["qallow.semantic.cert"], 1, 2);
+    let b2 = serde_json::to_vec(&e2).unwrap();
+    s.write_all(&(b2.len() as u32).to_le_bytes()).unwrap();
+    s.write_all(&b2).unwrap();
+    s.read_exact(&mut a).unwrap(); assert_eq!(a[0], 1);
+    drop(s);
+
+    let envs = server.join().unwrap();
+    assert_eq!(envs.len(), 2);
+    assert_eq!(envs[0].lamport, 1);
+    assert_eq!(envs[1].lamport, 2);
+}
+
+#[cfg(feature = "net")]
+#[test]
+fn local_fallback_only_on_connect_failure() {
+    use std::net::TcpListener;
+    // Local channel to confirm no fallback append happens when connect succeeds
+    let p = tmp("t5lf.jsonl"); let r = tmp("t5lfr.jsonl");
+    let _ = std::fs::remove_file(&p);
+    let mut local = Channel::open(ScopePolicy::new().allow("qallow.semantic.cert"), &p, &r).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Server accepts then immediately drops the connection (no ack).
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        drop(stream); // close without reading/writing
+    });
+
+    let e = env("a", &["qallow.semantic.cert"], 1, 1);
+    let res = ductei_core::transport::send_local_first(addr, &e, &mut local);
+    assert!(res.is_err(), "must not LocalFallback after successful connect+I/O error");
+    server.join().unwrap();
+    let (envs, _) = local.replay(0).unwrap();
+    assert!(envs.is_empty(), "no local fallback append expected");
+}
+
+#[test]
+fn outbox_restart_recovery_of_intents_and_receipts() {
+    use ductei_core::outbox::Outbox;
+    let path = tmp("outbox.jsonl");
+    let _ = std::fs::remove_file(&path);
+    let e = env("o", &["qallow.semantic.cert"], 7, 42);
+    // Record intent, verify it's pending
+    {
+        let mut ob = Outbox::open(&path).unwrap();
+        ob.record_intent(&e).unwrap();
+        let pending = ob.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].key, "o");
+    }
+    // Record a successful receipt (ack 1), verify no pending after reopen
+    {
+        let mut ob = Outbox::open(&path).unwrap();
+        ob.record_receipt(&e.key, e.lamport, &e.node_id, 1).unwrap();
+    }
+    {
+        let ob = Outbox::open(&path).unwrap();
+        let pending = ob.pending().unwrap();
+        assert!(pending.is_empty());
+    }
 }
 
 // ---- Build 2: VEYN adapter end-to-end (synthetic OSC/EEG sample) ----
