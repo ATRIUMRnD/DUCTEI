@@ -739,6 +739,191 @@ fn grpc_stale_duplicate_is_success() {
     drop(server);
 }
 
+#[cfg(feature = "grpc")]
+#[test]
+fn grpc_default_client_records_intent_before_ack_without_opt_in() {
+    use ductei_core::grpc::proto::channel_service_server::{ChannelService, ChannelServiceServer};
+    use ductei_core::grpc::proto::{Ack, EnvelopeMsg};
+    use tonic::{Request, Response, Status};
+    use tonic::transport::Server;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    // Bind an ephemeral port and then drop the listener so the gRPC server can bind it.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let proceed = Arc::new(AtomicBool::new(false));
+    let frame_read = Arc::new(AtomicBool::new(false));
+    let proceed2 = proceed.clone();
+    let frame_read2 = frame_read.clone();
+
+    struct DelayService {
+        proceed: Arc<AtomicBool>,
+        frame_read: Arc<AtomicBool>,
+    }
+    #[tonic::async_trait]
+    impl ChannelService for DelayService {
+        async fn send_envelope(&self, request: Request<EnvelopeMsg>) -> Result<Response<Ack>, Status> {
+            let _ = request.into_inner(); // parse not needed for this test
+            self.frame_read.store(true, Ordering::SeqCst);
+            while !self.proceed.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            Ok(Response::new(Ack { code: 1 }))
+        }
+    }
+
+    // Start the gRPC server in a thread with its own runtime.
+    let server = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async move {
+            let svc = DelayService { proceed: proceed2, frame_read: frame_read2 };
+            Server::builder()
+                .add_service(ChannelServiceServer::new(svc))
+                .serve(addr)
+                .await
+                .unwrap();
+        });
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Use a stable, explicit outbox path for this test via env override.
+    let outbox_path = tmp("grpc-intent-outbox.jsonl");
+    let _ = std::fs::remove_file(&outbox_path);
+    std::env::set_var("DUCTEI_OUTBOX_PATH", &outbox_path);
+
+    // Kick off the client call in a separate thread; it will block until the server acks.
+    let addr_s = addr.to_string();
+    let e = env("gz", &["qallow.semantic.cert"], 1, 1);
+    let path_for_client = outbox_path.clone();
+    let handle = std::thread::spawn(move || {
+        let mut c = GrpcClient::connect(&addr_s).unwrap().with_outbox_path(&path_for_client);
+        c.send_envelope(&e).unwrap();
+    });
+
+    // Wait until the server has definitely received the request.
+    for _ in 0..100 {
+        if frame_read.load(Ordering::SeqCst) { break; }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    // Now verify the outbox intent is present before the ack is released.
+    let mut saw = false;
+    for _ in 0..100 {
+        if let Ok(meta) = std::fs::metadata(&outbox_path) {
+            if meta.len() > 0 {
+                saw = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(saw, "intent should be recorded before ack is observed");
+
+    // Allow the server to send the ack and finish.
+    proceed.store(true, Ordering::SeqCst);
+    handle.join().unwrap();
+    drop(server); // server runs forever; dropping thread handle detaches it
+}
+
+#[cfg(feature = "grpc")]
+#[test]
+fn grpc_outbox_kill_and_restart_retry_ack2_default_path() {
+    use ductei_core::grpc::proto::channel_service_server::{ChannelService, ChannelServiceServer};
+    use ductei_core::grpc::proto::{Ack, EnvelopeMsg};
+    use tonic::{Request, Response, Status};
+    use tonic::transport::Server;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let p = tmp("g-ob.jsonl");
+    let r = tmp("g-obr.jsonl");
+    let _ = std::fs::remove_file(&p);
+
+    // Bind ephemeral port and drop the listener so gRPC can bind.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls2 = calls.clone();
+    let (pp, rp) = (p.clone(), r.clone());
+
+    struct CrashThenStale {
+        ch: Arc<tokio::sync::Mutex<Channel>>,
+        calls: Arc<AtomicUsize>,
+    }
+    #[tonic::async_trait]
+    impl ChannelService for CrashThenStale {
+        async fn send_envelope(&self, request: Request<EnvelopeMsg>) -> Result<Response<Ack>, Status> {
+            let msg = request.into_inner();
+            let env: Envelope = serde_json::from_slice(&msg.json_envelope)
+                .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                // First call: persist successfully then simulate a crash before ack.
+                let mut ch = self.ch.lock().await;
+                let _ = ch.send(env);
+                return Err(Status::internal("crash"));
+            }
+            // Second call: same envelope — gate should map to stale=2.
+            let code = match self.ch.lock().await.send(env) {
+                Ok(()) => 1u32,
+                Err(crate::ChannelError::StaleDelta { .. }) => 2u32,
+                Err(_) => 0u32,
+            };
+            Ok(Response::new(Ack { code }))
+        }
+    }
+
+    // Start the gRPC server.
+    let server = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let ch = Channel::open(ScopePolicy::new().allow("qallow.semantic.cert"), &pp, &rp).unwrap();
+        let svc = CrashThenStale { ch: Arc::new(tokio::sync::Mutex::new(ch)), calls: calls2 };
+        rt.block_on(async move {
+            Server::builder()
+                .add_service(ChannelServiceServer::new(svc))
+                .serve(addr)
+                .await
+                .unwrap();
+        });
+    });
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Override outbox path to a stable, test-specific file.
+    let default_outbox = tmp("grpc-outbox-default.jsonl");
+    let _ = std::fs::remove_file(&default_outbox);
+    std::env::set_var("DUCTEI_OUTBOX_PATH", &default_outbox);
+
+    // First attempt: expect an error; outbox should record intent with unknown receipt later.
+    let e = env("gox", &["qallow.semantic.cert"], 1, 7);
+    {
+        let mut c = GrpcClient::connect(&addr.to_string()).unwrap().with_outbox_path(&default_outbox);
+        let res = c.send_envelope(&e);
+        assert!(res.is_err(), "RPC error must surface as error");
+    }
+    // "Restart": new process finds pending intent at the same default path
+    let ob = ductei_core::outbox::Outbox::open(&default_outbox).unwrap();
+    let pending = ob.pending().unwrap();
+    assert!(pending.iter().any(|pe| pe.key == "gox" && pe.lamport == 7));
+
+    // Retry identical envelope; server should respond with ack=2
+    let mut c2 = GrpcClient::connect(&addr.to_string()).unwrap().with_outbox_path(&default_outbox);
+    assert!(c2.send_envelope(&e).unwrap());
+
+    // Channel log should contain only one applied envelope.
+    let ch2 = Channel::open(ScopePolicy::new().allow("qallow.semantic.cert"), &p, &r).unwrap();
+    let (envs, _) = ch2.replay(0).unwrap();
+    assert_eq!(envs.len(), 1);
+    assert_eq!(envs[0].key, "gox");
+    assert_eq!(envs[0].lamport, 7);
+
+    drop(server);
+}
+
 #[cfg(feature = "quic")]
 #[test]
 fn quic_two_node_loopback() {
