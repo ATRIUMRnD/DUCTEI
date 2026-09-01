@@ -10,10 +10,21 @@
 use crate::{outbox::Outbox, Channel, ChannelError, Envelope};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
 
 pub trait Transport {
     fn send_envelope(&mut self, env: &Envelope) -> Result<bool, ChannelError>;
+}
+
+/// Default on-disk location for the outbound intent/receipt log.
+/// Per-process file under the temp directory, stable across retries in the
+/// same process lifetime.
+pub fn default_outbox_path() -> PathBuf {
+    let mut p = std::env::temp_dir();
+    let pid = std::process::id();
+    let tid = format!("{:?}", std::thread::current().id());
+    p.push(format!("ductei-outbox-{}-{}.jsonl", pid, tid));
+    p
 }
 
 fn write_frame(w: &mut impl Write, env: &Envelope) -> std::io::Result<()> {
@@ -37,16 +48,16 @@ fn read_frame(r: &mut impl Read) -> std::io::Result<Option<Envelope>> {
 
 pub struct TcpClient {
     stream: TcpStream,
-    outbox_path: Option<PathBuf>,
+    outbox_path: PathBuf,
 }
 impl TcpClient {
     pub fn connect(addr: impl ToSocketAddrs) -> std::io::Result<Self> {
-        Ok(Self { stream: TcpStream::connect(addr)?, outbox_path: None })
+        Ok(Self { stream: TcpStream::connect(addr)?, outbox_path: default_outbox_path() })
     }
     /// Attach a durable outbound intent/receipt log. When set, the client
     /// records intents before any network write and receipts before returning.
     pub fn with_outbox_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.outbox_path = Some(path.into());
+        self.outbox_path = path.into();
         self
     }
 }
@@ -54,29 +65,23 @@ impl Transport for TcpClient {
     /// Returns Ok(true) only after the remote has persisted the envelope.
     fn send_envelope(&mut self, env: &Envelope) -> Result<bool, ChannelError> {
         // Record outbound intent before any I/O.
-        if let Some(p) = &self.outbox_path {
-            // Best-effort: if outbox write fails, surface as I/O error.
-            let mut ob = Outbox::open(p).map_err(|e| ChannelError::Io(e.to_string()))?;
-            ob.record_intent(env).map_err(|e| ChannelError::Io(e.to_string()))?;
-        }
+        // Best-effort: if outbox write fails, surface as I/O error.
+        let mut ob = Outbox::open(&self.outbox_path).map_err(|e| ChannelError::Io(e.to_string()))?;
+        ob.record_intent(env).map_err(|e| ChannelError::Io(e.to_string()))?;
         write_frame(&mut self.stream, env).map_err(|e| ChannelError::Io(e.to_string()))?;
         let mut ack = [0u8; 1];
         if let Err(e) = self.stream.read_exact(&mut ack) {
             // Connect succeeded but read failed: receiver persistence unknown.
-            if let Some(p) = &self.outbox_path {
-                let mut ob = Outbox::open(p).map_err(|e2| ChannelError::Io(e2.to_string()))?;
-                // Mark as unknown-failed (distinct from 0/1/2).
-                let _ = ob.record_receipt(&env.key, env.lamport, &env.node_id, 0xFF);
-            }
+            // Mark as unknown-failed (distinct from 0/1/2).
+            let mut ob = Outbox::open(&self.outbox_path).map_err(|e2| ChannelError::Io(e2.to_string()))?;
+            let _ = ob.record_receipt(&env.key, env.lamport, &env.node_id, 0xFF);
             return Err(ChannelError::Io(e.to_string()));
         }
         let code = ack[0];
         // Persist the receipt outcome before returning to the caller.
-        if let Some(p) = &self.outbox_path {
-            let mut ob = Outbox::open(p).map_err(|e| ChannelError::Io(e.to_string()))?;
-            ob.record_receipt(&env.key, env.lamport, &env.node_id, code)
-                .map_err(|e| ChannelError::Io(e.to_string()))?;
-        }
+        let mut ob = Outbox::open(&self.outbox_path).map_err(|e| ChannelError::Io(e.to_string()))?;
+        ob.record_receipt(&env.key, env.lamport, &env.node_id, code)
+            .map_err(|e| ChannelError::Io(e.to_string()))?;
         match code {
             1 | 2 => Ok(true),
             0 => Ok(false),
@@ -129,9 +134,12 @@ pub fn send_local_first(
     addr: impl ToSocketAddrs,
     env: &Envelope,
     local: &mut Channel,
+    outbox_path: impl AsRef<Path>,
 ) -> Result<DeliveryPath, ChannelError> {
     match TcpClient::connect(addr) {
-        Ok(mut client) => match client.send_envelope(env) {
+        Ok(mut client) => {
+            let p: PathBuf = outbox_path.as_ref().to_path_buf();
+            match client.with_outbox_path(p).send_envelope(env) {
             Ok(accepted) => {
                 if accepted {
                     Ok(DeliveryPath::Network)
@@ -145,7 +153,7 @@ pub fn send_local_first(
                 // Receiver persistence is unknown — do NOT LocalFallback here.
                 Err(e)
             }
-        },
+        }},
         Err(_) => {
             local.send(env.clone())?;
             Ok(DeliveryPath::LocalFallback)

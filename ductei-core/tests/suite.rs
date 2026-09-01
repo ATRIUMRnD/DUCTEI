@@ -233,7 +233,8 @@ fn transport_degrades_to_local_when_network_unavailable() {
     drop(l);
 
     let e = env("a", &["qallow.semantic.cert"], 1, 1);
-    let path = ductei_core::transport::send_local_first(addr, &e, &mut local).unwrap();
+    let outbox_path = tmp("t5d-outbox.jsonl");
+    let path = ductei_core::transport::send_local_first(addr, &e, &mut local, &outbox_path).unwrap();
     assert_eq!(path, DeliveryPath::LocalFallback);
 
     let (envs, _) = local.replay(0).unwrap();
@@ -374,18 +375,74 @@ fn transport_outbox_intent_and_unknown_receipt_on_io_error() {
         let (s, _) = listener.accept().unwrap();
         drop(s);
     });
-    let outbox_path = tmp("outbox-ioerr.jsonl");
-    let _ = std::fs::remove_file(&outbox_path);
-    let mut c = ductei_core::transport::TcpClient::connect(addr).unwrap().with_outbox_path(&outbox_path);
+    // Do not pass a path: client must use default auto path.
+    let default_outbox = ductei_core::transport::default_outbox_path();
+    let _ = std::fs::remove_file(&default_outbox);
+    let mut c = ductei_core::transport::TcpClient::connect(addr).unwrap();
     let e = env("w", &["qallow.semantic.cert"], 1, 1);
     let res = c.send_envelope(&e);
     assert!(res.is_err(), "I/O error after connect must surface as error");
     server.join().unwrap();
-    let ob = ductei_core::outbox::Outbox::open(&outbox_path).unwrap();
+    let ob = ductei_core::outbox::Outbox::open(&default_outbox).unwrap();
     // Intent recorded
     let pending = ob.pending().unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].key, "w");
+}
+
+#[cfg(feature = "net")]
+#[test]
+fn transport_default_client_records_intent_before_ack_without_opt_in() {
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    // Server accepts but delays ack to keep client blocked.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let proceed = Arc::new(AtomicBool::new(false));
+    let proceed2 = proceed.clone();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        // Read the frame then wait before writing ack.
+        let mut len = [0u8; 4];
+        let _ = s.read_exact(&mut len);
+        let n = u32::from_le_bytes(len) as usize;
+        let mut body = vec![0u8; n];
+        let _ = s.read_exact(&mut body);
+        // Wait until test checked outbox intent
+        while !proceed2.load(Ordering::SeqCst) { std::thread::sleep(std::time::Duration::from_millis(5)); }
+        let _ = s.write_all(&[1u8]); // ack applied
+        let _ = s.flush();
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    let e = env("z", &["qallow.semantic.cert"], 1, 1);
+    let handle = std::thread::spawn(move || {
+        // Compute the default outbox path for THIS thread (client uses it).
+        let path = ductei_core::transport::default_outbox_path();
+        let _ = std::fs::remove_file(&path);
+        tx.send(path.clone()).ok();
+        let mut c = ductei_core::transport::TcpClient::connect(addr).unwrap();
+        let _ = c.send_envelope(&e); // will block until ack
+    });
+    // Receive the path chosen by the client thread
+    let default_outbox = rx.recv().unwrap();
+    // Wait for client to connect and write intent (poll up to 1s)
+    let mut saw = false;
+    for _ in 0..100 {
+        if let Ok(ob) = ductei_core::outbox::Outbox::open(&default_outbox) {
+            if let Ok(pending) = ob.pending() {
+                if pending.iter().any(|e| e.key == "z") {
+                    saw = true;
+                    break;
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(saw, "intent should be recorded before ack is observed");
+    proceed.store(true, std::sync::atomic::Ordering::SeqCst);
+    handle.join().unwrap();
+    server.join().unwrap();
 }
 
 #[cfg(feature = "net")]
@@ -406,7 +463,8 @@ fn local_fallback_only_on_connect_failure() {
     });
 
     let e = env("a", &["qallow.semantic.cert"], 1, 1);
-    let res = ductei_core::transport::send_local_first(addr, &e, &mut local);
+    let outbox_path = tmp("t5lf-outbox.jsonl");
+    let res = ductei_core::transport::send_local_first(addr, &e, &mut local, &outbox_path);
     assert!(res.is_err(), "must not LocalFallback after successful connect+I/O error");
     server.join().unwrap();
     let (envs, _) = local.replay(0).unwrap();
