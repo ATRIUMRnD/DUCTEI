@@ -3,14 +3,37 @@
 //! Every inbound envelope passes: scope policy → causal gate → JSONL
 //! persistence, and only THEN is acked (persistence-first). The transport
 //! trait is vendor-neutral so gRPC/QUIC can slot in later.
-//! Frame: u32 LE length | JSON bytes.  Ack: 1 byte (1=accepted, 0=rejected).
+//! Frame: u32 LE length | JSON bytes. Ack: 1 byte with tri-state:
+//!   1 = applied (new write persisted), 2 = stale/already-present (receipt),
+//!   0 = rejected (scope-denied/malformed/failed-to-apply).
 
-use crate::{Channel, ChannelError, Envelope};
+use crate::{outbox::Outbox, Channel, ChannelError, Envelope};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::path::{PathBuf, Path};
 
 pub trait Transport {
     fn send_envelope(&mut self, env: &Envelope) -> Result<bool, ChannelError>;
+}
+
+/// Default on-disk location for the outbound intent/receipt log.
+/// Per-process file under the temp directory, stable across retries in the
+/// same process lifetime.
+pub fn default_outbox_path() -> PathBuf {
+    // 1) Explicit override wins
+    if let Ok(p) = std::env::var("DUCTEI_OUTBOX_PATH") {
+        return PathBuf::from(p);
+    }
+    // 2) XDG state dir
+    if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
+        return PathBuf::from(xdg).join("ductei").join("outbox.jsonl");
+    }
+    // 3) HOME-based fallback
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".ductei").join("outbox.jsonl");
+    }
+    // 4) Last resort stable path
+    std::env::temp_dir().join("ductei-outbox.jsonl")
 }
 
 fn write_frame(w: &mut impl Write, env: &Envelope) -> std::io::Result<()> {
@@ -32,19 +55,47 @@ fn read_frame(r: &mut impl Read) -> std::io::Result<Option<Envelope>> {
     Ok(Some(serde_json::from_slice(&body)?))
 }
 
-pub struct TcpClient { stream: TcpStream }
+pub struct TcpClient {
+    stream: TcpStream,
+    outbox_path: PathBuf,
+}
 impl TcpClient {
     pub fn connect(addr: impl ToSocketAddrs) -> std::io::Result<Self> {
-        Ok(Self { stream: TcpStream::connect(addr)? })
+        Ok(Self { stream: TcpStream::connect(addr)?, outbox_path: default_outbox_path() })
+    }
+    /// Attach a durable outbound intent/receipt log. When set, the client
+    /// records intents before any network write and receipts before returning.
+    pub fn with_outbox_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.outbox_path = path.into();
+        self
     }
 }
 impl Transport for TcpClient {
     /// Returns Ok(true) only after the remote has persisted the envelope.
     fn send_envelope(&mut self, env: &Envelope) -> Result<bool, ChannelError> {
+        // Record outbound intent before any I/O.
+        // Best-effort: if outbox write fails, surface as I/O error.
+        let mut ob = Outbox::open(&self.outbox_path).map_err(|e| ChannelError::Io(e.to_string()))?;
+        ob.record_intent(env).map_err(|e| ChannelError::Io(e.to_string()))?;
         write_frame(&mut self.stream, env).map_err(|e| ChannelError::Io(e.to_string()))?;
         let mut ack = [0u8; 1];
-        self.stream.read_exact(&mut ack).map_err(|e| ChannelError::Io(e.to_string()))?;
-        Ok(ack[0] == 1)
+        if let Err(e) = self.stream.read_exact(&mut ack) {
+            // Connect succeeded but read failed: receiver persistence unknown.
+            // Mark as unknown-failed (distinct from 0/1/2).
+            let mut ob = Outbox::open(&self.outbox_path).map_err(|e2| ChannelError::Io(e2.to_string()))?;
+            let _ = ob.record_receipt(&env.key, env.lamport, &env.node_id, 0xFF);
+            return Err(ChannelError::Io(e.to_string()));
+        }
+        let code = ack[0];
+        // Persist the receipt outcome before returning to the caller.
+        let mut ob = Outbox::open(&self.outbox_path).map_err(|e| ChannelError::Io(e.to_string()))?;
+        ob.record_receipt(&env.key, env.lamport, &env.node_id, code)
+            .map_err(|e| ChannelError::Io(e.to_string()))?;
+        match code {
+            1 | 2 => Ok(true),
+            0 => Ok(false),
+            _ => Err(ChannelError::Io(format!("unknown ack value {}", code))),
+        }
     }
 }
 
@@ -53,11 +104,13 @@ impl Transport for TcpClient {
 pub fn serve_connection(mut stream: TcpStream, ch: &mut Channel) -> std::io::Result<usize> {
     let mut accepted = 0usize;
     while let Some(env) = read_frame(&mut stream)? {
-        let ok = match ch.send(env) {
+        let ack = match ch.send(env) {
             Ok(()) => { accepted += 1; 1u8 }
-            Err(_) => 0u8, // scope-denied or stale: logged channel-side, not applied
+            Err(ChannelError::StaleDelta { .. }) => 2u8,
+            Err(ChannelError::ScopeDenied(_)) => 0u8,
+            Err(_) => 0u8, // I/O or other error: not applied
         };
-        stream.write_all(&[ok])?;
+        stream.write_all(&[ack])?;
         stream.flush()?;
     }
     Ok(accepted)
@@ -90,21 +143,26 @@ pub fn send_local_first(
     addr: impl ToSocketAddrs,
     env: &Envelope,
     local: &mut Channel,
+    outbox_path: impl AsRef<Path>,
 ) -> Result<DeliveryPath, ChannelError> {
     match TcpClient::connect(addr) {
-        Ok(mut client) => match client.send_envelope(env) {
+        Ok(mut client) => {
+            let p: PathBuf = outbox_path.as_ref().to_path_buf();
+            match client.with_outbox_path(p).send_envelope(env) {
             Ok(accepted) => {
                 if accepted {
                     Ok(DeliveryPath::Network)
                 } else {
+                    // Ack=0 is an explicit rejection (scope-denied/malformed). Do not fallback.
                     Err(ChannelError::ScopeDenied(env.key.clone()))
                 }
             }
-            Err(_) => {
-                local.send(env.clone())?;
-                Ok(DeliveryPath::LocalFallback)
+            Err(e) => {
+                // Connect succeeded but a later I/O error occurred (write/read/ack).
+                // Receiver persistence is unknown — do NOT LocalFallback here.
+                Err(e)
             }
-        },
+        }},
         Err(_) => {
             local.send(env.clone())?;
             Ok(DeliveryPath::LocalFallback)

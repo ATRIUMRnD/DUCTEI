@@ -45,7 +45,12 @@ impl super::transport::Transport for GrpcClient {
             .rt
             .block_on(self.client.send_envelope(req))
             .map_err(|e| ChannelError::Io(e.to_string()))?;
-        Ok(resp.into_inner().accepted)
+        let code = resp.into_inner().code as u8;
+        match code {
+            1 | 2 => Ok(true),
+            0 => Err(ChannelError::ScopeDenied(env.key.clone())),
+            _ => Err(ChannelError::Io(format!("unknown ack value {}", code))),
+        }
     }
 }
 
@@ -59,8 +64,13 @@ impl ChannelService for Service {
         let msg = request.into_inner();
         let env: Envelope = serde_json::from_slice(&msg.json_envelope)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
-        let accepted = self.ch.lock().await.send(env).is_ok();
-        Ok(Response::new(Ack { accepted }))
+        let code = match self.ch.lock().await.send(env) {
+            Ok(()) => 1u32,
+            Err(crate::ChannelError::StaleDelta { .. }) => 2u32,
+            Err(crate::ChannelError::ScopeDenied(_)) => 0u32,
+            Err(_) => 0u32,
+        };
+        Ok(Response::new(Ack { code }))
     }
 }
 
