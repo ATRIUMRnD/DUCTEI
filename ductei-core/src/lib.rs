@@ -19,6 +19,8 @@ pub mod grpc;
 pub mod quic;
 #[cfg(feature = "pq")]
 pub mod pq;
+/// Durable outbound intent/receipt log (separate from accepted log).
+pub mod outbox;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Scope(pub String);

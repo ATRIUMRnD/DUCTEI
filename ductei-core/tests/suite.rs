@@ -6,6 +6,8 @@ use ductei_core::*;
 use std::io::{Read, Write};
 #[cfg(feature = "net")]
 use std::net::{TcpListener, TcpStream};
+#[cfg(feature = "grpc")]
+use ductei_core::grpc::{serve_grpc_blocking, GrpcClient};
 
 fn node(n: u8) -> [u8; 16] { [n; 16] }
 fn tmp(name: &str) -> String { format!("{}/{}-{}", std::env::temp_dir().display(), std::process::id(), name) }
@@ -124,7 +126,8 @@ fn transport_two_node_loopback() {
     });
     let mut c = TcpClient::connect(addr).unwrap();
     assert!(c.send_envelope(&env("a", &["qallow.semantic.cert"], 1, 1)).unwrap());
-    assert!(!c.send_envelope(&env("a", &["qallow.semantic.cert"], 1, 1)).unwrap());
+    // Duplicate (same triple) is a successful receipt (ack=2), not a rejection.
+    assert!(c.send_envelope(&env("a", &["qallow.semantic.cert"], 1, 1)).unwrap());
     assert!(!c.send_envelope(&env("b", &["limen.credentials"], 1, 2)).unwrap());
     assert!(c.send_envelope(&env("a", &["qallow.semantic.cert"], 1, 2)).unwrap());
     drop(c);
@@ -230,12 +233,332 @@ fn transport_degrades_to_local_when_network_unavailable() {
     drop(l);
 
     let e = env("a", &["qallow.semantic.cert"], 1, 1);
-    let path = ductei_core::transport::send_local_first(addr, &e, &mut local).unwrap();
+    let outbox_path = tmp("t5d-outbox.jsonl");
+    let path = ductei_core::transport::send_local_first(addr, &e, &mut local, &outbox_path).unwrap();
     assert_eq!(path, DeliveryPath::LocalFallback);
 
     let (envs, _) = local.replay(0).unwrap();
     assert_eq!(envs.len(), 1);
     assert_eq!(envs[0].key, "a");
+}
+
+#[cfg(feature = "net")]
+#[test]
+fn transport_crash_window_retry_ack2() {
+    use std::net::TcpListener;
+    use std::io::{Read, Write};
+
+    let p = tmp("t5c.jsonl"); let r = tmp("t5cr.jsonl");
+    let _ = std::fs::remove_file(&p);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let mut ch = Channel::open(ScopePolicy::new().allow("qallow.semantic.cert"), &p, &r).unwrap();
+        // Accept two connections: first writer crashes before reading ack; second is retry.
+        let mut accepted_total = 0usize;
+        for _ in 0..2 {
+            let (stream, _) = listener.accept().unwrap();
+            let res = serve_connection(stream, &mut ch);
+            if let Ok(n) = res { accepted_total += n; }
+        }
+        let (envs, _) = ch.replay(0).unwrap();
+        (accepted_total, envs)
+    });
+
+    // First attempt: write frame then drop before reading ack (simulate crash).
+    let e = env("a", &["qallow.semantic.cert"], 1, 1);
+    let mut s1 = std::net::TcpStream::connect(addr).unwrap();
+    let body = serde_json::to_vec(&e).unwrap();
+    s1.write_all(&(body.len() as u32).to_le_bytes()).unwrap();
+    s1.write_all(&body).unwrap();
+    drop(s1); // crash before reading ack
+
+    // Retry after "restart": identical triple, expect ack=2 and no second apply.
+    let mut s2 = std::net::TcpStream::connect(addr).unwrap();
+    s2.write_all(&(body.len() as u32).to_le_bytes()).unwrap();
+    s2.write_all(&body).unwrap();
+    let mut ack = [0u8; 1];
+    s2.read_exact(&mut ack).unwrap();
+    assert_eq!(ack[0], 2);
+    drop(s2);
+
+    let (accepted_total, envs) = server.join().unwrap();
+    assert_eq!(accepted_total, 1);
+    assert_eq!(envs.len(), 1);
+    assert_eq!(envs[0].key, "a");
+}
+
+#[cfg(feature = "net")]
+#[test]
+fn transport_same_triple_stale_while_newer_lamport_applies() {
+    use std::net::TcpListener;
+    use std::io::{Read, Write};
+
+    let p = tmp("t5n.jsonl"); let r = tmp("t5nr.jsonl");
+    let _ = std::fs::remove_file(&p);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let mut ch = Channel::open(ScopePolicy::new().allow("qallow.semantic.cert"), &p, &r).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        let _ = serve_connection(stream, &mut ch);
+        let (envs, _) = ch.replay(0).unwrap();
+        envs
+    });
+
+    let mut s = std::net::TcpStream::connect(addr).unwrap();
+    // Send lamport=1
+    let e1 = env("k", &["qallow.semantic.cert"], 1, 1);
+    let b1 = serde_json::to_vec(&e1).unwrap();
+    s.write_all(&(b1.len() as u32).to_le_bytes()).unwrap();
+    s.write_all(&b1).unwrap();
+    let mut a = [0u8; 1]; s.read_exact(&mut a).unwrap(); assert_eq!(a[0], 1);
+    // Duplicate (stale)
+    s.write_all(&(b1.len() as u32).to_le_bytes()).unwrap();
+    s.write_all(&b1).unwrap();
+    s.read_exact(&mut a).unwrap(); assert_eq!(a[0], 2);
+    // Newer lamport applies
+    let e2 = env("k", &["qallow.semantic.cert"], 1, 2);
+    let b2 = serde_json::to_vec(&e2).unwrap();
+    s.write_all(&(b2.len() as u32).to_le_bytes()).unwrap();
+    s.write_all(&b2).unwrap();
+    s.read_exact(&mut a).unwrap(); assert_eq!(a[0], 1);
+    drop(s);
+
+    let envs = server.join().unwrap();
+    assert_eq!(envs.len(), 2);
+    assert_eq!(envs[0].lamport, 1);
+    assert_eq!(envs[1].lamport, 2);
+}
+
+#[cfg(feature = "net")]
+#[test]
+fn transport_unknown_ack_is_error_and_outbox_keeps_pending() {
+    use std::net::TcpListener;
+    // Server that echoes a valid frame then replies with unknown ack=5.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        // Read one frame (length + body)
+        let mut len = [0u8; 4];
+        s.read_exact(&mut len).unwrap();
+        let n = u32::from_le_bytes(len) as usize;
+        let mut body = vec![0u8; n];
+        s.read_exact(&mut body).unwrap();
+        // Send unknown ack
+        s.write_all(&[5u8]).unwrap();
+        s.flush().unwrap();
+    });
+    let outbox_path = tmp("outbox-unknown.jsonl");
+    let _ = std::fs::remove_file(&outbox_path);
+    let mut c = ductei_core::transport::TcpClient::connect(addr).unwrap().with_outbox_path(&outbox_path);
+    let e = env("u", &["qallow.semantic.cert"], 1, 1);
+    let res = c.send_envelope(&e);
+    assert!(res.is_err(), "unknown ack must not be treated as success");
+    server.join().unwrap();
+    // Pending should include this envelope (unknown ack does not resolve)
+    let ob = ductei_core::outbox::Outbox::open(&outbox_path).unwrap();
+    let pending = ob.pending().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].key, "u");
+}
+
+#[cfg(feature = "net")]
+#[test]
+fn transport_outbox_intent_and_unknown_receipt_on_io_error() {
+    use std::net::TcpListener;
+    // Server accepts then drops immediately to force I/O error after connect.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (s, _) = listener.accept().unwrap();
+        drop(s);
+    });
+    // Do not pass a path: client must use default auto path.
+    let default_outbox = ductei_core::transport::default_outbox_path();
+    let _ = std::fs::remove_file(&default_outbox);
+    let mut c = ductei_core::transport::TcpClient::connect(addr).unwrap();
+    let e = env("w", &["qallow.semantic.cert"], 1, 1);
+    let res = c.send_envelope(&e);
+    assert!(res.is_err(), "I/O error after connect must surface as error");
+    server.join().unwrap();
+    let ob = ductei_core::outbox::Outbox::open(&default_outbox).unwrap();
+    // Intent recorded
+    let pending = ob.pending().unwrap();
+    assert!(pending.iter().any(|pe| pe.key == "w" && pe.lamport == 1));
+}
+
+#[cfg(feature = "net")]
+#[test]
+fn transport_default_client_records_intent_before_ack_without_opt_in() {
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    // Server accepts but delays ack to keep client blocked.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let proceed = Arc::new(AtomicBool::new(false));
+    let frame_read = Arc::new(AtomicBool::new(false));
+    let proceed2 = proceed.clone();
+    let frame_read2 = frame_read.clone();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        // Read the frame then wait before writing ack.
+        let mut len = [0u8; 4];
+        let _ = s.read_exact(&mut len);
+        let n = u32::from_le_bytes(len) as usize;
+        let mut body = vec![0u8; n];
+        let _ = s.read_exact(&mut body);
+        frame_read2.store(true, Ordering::SeqCst);
+        // Wait until test checked outbox intent
+        while !proceed2.load(Ordering::SeqCst) { std::thread::sleep(std::time::Duration::from_millis(5)); }
+        let _ = s.write_all(&[1u8]); // ack applied
+        let _ = s.flush();
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    let e = env("z", &["qallow.semantic.cert"], 1, 1);
+    let handle = std::thread::spawn(move || {
+        // Compute the default outbox path for THIS thread (client uses it).
+        let path = ductei_core::transport::default_outbox_path();
+        let _ = std::fs::remove_file(&path);
+        tx.send(path.clone()).ok();
+        let mut c = ductei_core::transport::TcpClient::connect(addr).unwrap();
+        let _ = c.send_envelope(&e); // will block until ack
+    });
+    // Receive the path chosen by the client thread
+    let default_outbox = rx.recv().unwrap();
+    // Wait until the server has read the frame (implies intent was recorded before write)
+    for _ in 0..100 {
+        if frame_read.load(Ordering::SeqCst) { break; }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Now check that intent is present (poll up to 1s) by verifying file is non-empty
+    let mut saw = false;
+    for _ in 0..100 {
+        if let Ok(meta) = std::fs::metadata(&default_outbox) {
+            if meta.len() > 0 {
+                saw = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(saw, "intent should be recorded before ack is observed");
+    proceed.store(true, std::sync::atomic::Ordering::SeqCst);
+    handle.join().unwrap();
+    server.join().unwrap();
+}
+
+#[cfg(feature = "net")]
+#[test]
+fn outbox_kill_and_restart_retry_ack2_default_path() {
+    use std::net::TcpListener;
+    use std::io::{Read, Write};
+    // Server: accept first, persist then drop without ack; accept second, ack stale=2.
+    let p = tmp("t5or.jsonl"); let r = tmp("t5orr.jsonl");
+    let _ = std::fs::remove_file(&p);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let mut ch = Channel::open(ScopePolicy::new().allow("qallow.semantic.cert"), &p, &r).unwrap();
+        // First connection: read frame, persist, drop without ack
+        let (mut s1, _) = listener.accept().unwrap();
+        let mut len = [0u8; 4];
+        s1.read_exact(&mut len).unwrap();
+        let n = u32::from_le_bytes(len) as usize;
+        let mut body = vec![0u8; n];
+        s1.read_exact(&mut body).unwrap();
+        let env1: Envelope = serde_json::from_slice(&body).unwrap();
+        assert!(ch.send(env1).is_ok());
+        drop(s1);
+        // Second connection: read same frame, map to stale=2, write ack=2
+        let (mut s2, _) = listener.accept().unwrap();
+        let mut len2 = [0u8; 4];
+        s2.read_exact(&mut len2).unwrap();
+        let n2 = u32::from_le_bytes(len2) as usize;
+        let mut body2 = vec![0u8; n2];
+        s2.read_exact(&mut body2).unwrap();
+        let env2: Envelope = serde_json::from_slice(&body2).unwrap();
+        match ch.send(env2) {
+            Ok(()) => panic!("expected stale on retry"),
+            Err(ChannelError::StaleDelta{..}) => (),
+            Err(e) => panic!("unexpected error {e:?}"),
+        }
+        s2.write_all(&[2u8]).unwrap();
+        s2.flush().unwrap();
+        let (envs, _) = ch.replay(0).unwrap();
+        envs
+    });
+    // Client attempt 1: default outbox path, will error after server drops
+    let e = env("ox", &["qallow.semantic.cert"], 1, 7);
+    {
+        let mut c = ductei_core::transport::TcpClient::connect(addr).unwrap();
+        let _ = c.send_envelope(&e); // returns Err after read error
+    }
+    // "Restart": new process finds pending intent at the same default path
+    let ob = ductei_core::outbox::Outbox::open(ductei_core::transport::default_outbox_path()).unwrap();
+    let pending = ob.pending().unwrap();
+    assert!(pending.iter().any(|pe| pe.key == "ox" && pe.lamport == 7));
+    // Retry identical envelope; server should respond with ack=2
+    let mut c2 = ductei_core::transport::TcpClient::connect(addr).unwrap();
+    assert!(c2.send_envelope(&e).unwrap());
+    let envs = server.join().unwrap();
+    assert_eq!(envs.len(), 1);
+    assert_eq!(envs[0].key, "ox");
+    assert_eq!(envs[0].lamport, 7);
+}
+
+#[cfg(feature = "net")]
+#[test]
+fn local_fallback_only_on_connect_failure() {
+    use std::net::TcpListener;
+    // Local channel to confirm no fallback append happens when connect succeeds
+    let p = tmp("t5lf.jsonl"); let r = tmp("t5lfr.jsonl");
+    let _ = std::fs::remove_file(&p);
+    let mut local = Channel::open(ScopePolicy::new().allow("qallow.semantic.cert"), &p, &r).unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    // Server accepts then immediately drops the connection (no ack).
+    let server = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        drop(stream); // close without reading/writing
+    });
+
+    let e = env("a", &["qallow.semantic.cert"], 1, 1);
+    let outbox_path = tmp("t5lf-outbox.jsonl");
+    let res = ductei_core::transport::send_local_first(addr, &e, &mut local, &outbox_path);
+    assert!(res.is_err(), "must not LocalFallback after successful connect+I/O error");
+    server.join().unwrap();
+    let (envs, _) = local.replay(0).unwrap();
+    assert!(envs.is_empty(), "no local fallback append expected");
+}
+
+#[test]
+fn outbox_restart_recovery_of_intents_and_receipts() {
+    use ductei_core::outbox::Outbox;
+    let path = tmp("outbox.jsonl");
+    let _ = std::fs::remove_file(&path);
+    let e = env("o", &["qallow.semantic.cert"], 7, 42);
+    // Record intent, verify it's pending
+    {
+        let mut ob = Outbox::open(&path).unwrap();
+        ob.record_intent(&e).unwrap();
+        let pending = ob.pending().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].key, "o");
+    }
+    // Record a successful receipt (ack 1), verify no pending after reopen
+    {
+        let mut ob = Outbox::open(&path).unwrap();
+        ob.record_receipt(&e.key, e.lamport, &e.node_id, 1).unwrap();
+    }
+    {
+        let ob = Outbox::open(&path).unwrap();
+        let pending = ob.pending().unwrap();
+        assert!(pending.is_empty());
+    }
 }
 
 // ---- Build 2: VEYN adapter end-to-end (synthetic OSC/EEG sample) ----
@@ -368,9 +691,7 @@ fn veyn_hrv_coalesced_to_one_per_minute() {
 #[cfg(feature = "grpc")]
 #[test]
 fn grpc_two_node_loopback() {
-    use ductei_core::grpc::{serve_grpc_blocking, GrpcClient};
     use ductei_core::transport::Transport;
-
     let p = tmp("g0.jsonl");
     let r = tmp("g0r.jsonl");
     let _ = std::fs::remove_file(&p);
@@ -387,9 +708,35 @@ fn grpc_two_node_loopback() {
 
     let mut c = GrpcClient::connect(&addr.to_string()).unwrap();
     assert!(c.send_envelope(&env("a", &["qallow.semantic.cert"], 1, 1)).unwrap());
+    // Scope-denied must be a rejection (false)
     assert!(!c.send_envelope(&env("b", &["limen.credentials"], 1, 2)).unwrap());
     drop(c);
     drop(server); // detach; serve_grpc_blocking runs until the process exits
+}
+
+#[cfg(feature = "grpc")]
+#[test]
+fn grpc_stale_duplicate_is_success() {
+    use ductei_core::transport::Transport;
+    let p = tmp("g1.jsonl");
+    let r = tmp("g1r.jsonl");
+    let _ = std::fs::remove_file(&p);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let server = std::thread::spawn(move || {
+        let ch = Channel::open(ScopePolicy::new().allow("qallow.semantic.cert"), &p, &r).unwrap();
+        serve_grpc_blocking(addr, ch)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let mut c = GrpcClient::connect(&addr.to_string()).unwrap();
+    // First apply
+    assert!(c.send_envelope(&env("a", &["qallow.semantic.cert"], 1, 1)).unwrap());
+    // Duplicate should be treated as successful receipt (ack 2)
+    assert!(c.send_envelope(&env("a", &["qallow.semantic.cert"], 1, 1)).unwrap());
+    drop(c);
+    drop(server);
 }
 
 #[cfg(feature = "quic")]

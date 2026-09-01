@@ -43,9 +43,18 @@ TCP, length-prefixed frames (u32 LE len | JSON envelope), matching the
 incremental-decoder pattern, on by default. Vendor-neutral `Transport`
 trait so other transports can slot in behind it. Inbound path per frame:
 scope policy -> causal gate -> fsynced JSONL append -> ack byte.
-Ack=1 means the remote has persisted; ack=0 means denied/stale
-(logged channel-side, never applied). QSW wire translation for
+Ack is tri-state: 1=applied (new write persisted), 2=stale/already-present
+(receipt success), 0=rejected (scope-denied/malformed; never applied).
+QSW wire translation for
 Qallow ingestion lives in `ductei-qallow` unchanged.
+
+Local-first behavior: if a peer is unreachable (connect fails), delivery
+degrades to the local `Channel` (`LocalFallback`). If connect succeeds but a
+later write/read/ack I/O error occurs, there is no LocalFallback (receiver
+persistence is unknown). Record a durable outbound intent and retry the
+identical envelope triple after restart; see `ductei_core::outbox::Outbox`.
+Default Outbox path: `DUCTEI_OUTBOX_PATH` when set, else `$XDG_STATE_HOME/ductei/outbox.jsonl`,
+else `$HOME/.ductei/outbox.jsonl` (created on first use).
 
 Two more `Transport` impls exist behind opt-in Cargo features, same
 persistence-first ack contract, same `Channel` on the receiving side:
