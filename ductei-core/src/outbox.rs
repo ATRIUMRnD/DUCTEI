@@ -61,10 +61,12 @@ impl Outbox {
                     last_intent.insert((env.key.clone(), env.lamport, env.node_id), env);
                 }
                 OutboundRecord::Receipt { key, lamport, node_id, ack } => {
-                    // Any receipt resolves the intent for retry purposes:
-                    // 1/2 are successful receipts; 0 is a definitive rejection.
-                    let _ = ack;
-                    resolved.insert((key, lamport, node_id), true);
+                    // Receipt resolves the intent if it is one of the known terminal codes:
+                    // 1/2 (success) or 0 (definitive rejection). Unknown codes (e.g., 0xFF)
+                    // do not resolve and remain pending for retry after restart.
+                    if ack == 1 || ack == 2 || ack == 0 {
+                        resolved.insert((key, lamport, node_id), true);
+                    }
                 }
             }
         }

@@ -7,9 +7,10 @@
 //!   1 = applied (new write persisted), 2 = stale/already-present (receipt),
 //!   0 = rejected (scope-denied/malformed/failed-to-apply).
 
-use crate::{Channel, ChannelError, Envelope};
+use crate::{outbox::Outbox, Channel, ChannelError, Envelope};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
 
 pub trait Transport {
     fn send_envelope(&mut self, env: &Envelope) -> Result<bool, ChannelError>;
@@ -34,20 +35,53 @@ fn read_frame(r: &mut impl Read) -> std::io::Result<Option<Envelope>> {
     Ok(Some(serde_json::from_slice(&body)?))
 }
 
-pub struct TcpClient { stream: TcpStream }
+pub struct TcpClient {
+    stream: TcpStream,
+    outbox_path: Option<PathBuf>,
+}
 impl TcpClient {
     pub fn connect(addr: impl ToSocketAddrs) -> std::io::Result<Self> {
-        Ok(Self { stream: TcpStream::connect(addr)? })
+        Ok(Self { stream: TcpStream::connect(addr)?, outbox_path: None })
+    }
+    /// Attach a durable outbound intent/receipt log. When set, the client
+    /// records intents before any network write and receipts before returning.
+    pub fn with_outbox_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.outbox_path = Some(path.into());
+        self
     }
 }
 impl Transport for TcpClient {
     /// Returns Ok(true) only after the remote has persisted the envelope.
     fn send_envelope(&mut self, env: &Envelope) -> Result<bool, ChannelError> {
+        // Record outbound intent before any I/O.
+        if let Some(p) = &self.outbox_path {
+            // Best-effort: if outbox write fails, surface as I/O error.
+            let mut ob = Outbox::open(p).map_err(|e| ChannelError::Io(e.to_string()))?;
+            ob.record_intent(env).map_err(|e| ChannelError::Io(e.to_string()))?;
+        }
         write_frame(&mut self.stream, env).map_err(|e| ChannelError::Io(e.to_string()))?;
         let mut ack = [0u8; 1];
-        self.stream.read_exact(&mut ack).map_err(|e| ChannelError::Io(e.to_string()))?;
-        // Success on applied (1) or already-present (2). Only 0 is rejection.
-        Ok(ack[0] != 0)
+        if let Err(e) = self.stream.read_exact(&mut ack) {
+            // Connect succeeded but read failed: receiver persistence unknown.
+            if let Some(p) = &self.outbox_path {
+                let mut ob = Outbox::open(p).map_err(|e2| ChannelError::Io(e2.to_string()))?;
+                // Mark as unknown-failed (distinct from 0/1/2).
+                let _ = ob.record_receipt(&env.key, env.lamport, &env.node_id, 0xFF);
+            }
+            return Err(ChannelError::Io(e.to_string()));
+        }
+        let code = ack[0];
+        // Persist the receipt outcome before returning to the caller.
+        if let Some(p) = &self.outbox_path {
+            let mut ob = Outbox::open(p).map_err(|e| ChannelError::Io(e.to_string()))?;
+            ob.record_receipt(&env.key, env.lamport, &env.node_id, code)
+                .map_err(|e| ChannelError::Io(e.to_string()))?;
+        }
+        match code {
+            1 | 2 => Ok(true),
+            0 => Ok(false),
+            _ => Err(ChannelError::Io(format!("unknown ack value {}", code))),
+        }
     }
 }
 

@@ -9,7 +9,7 @@
 //! self-signed cert (`generate_self_signed`) and clients pin it by DER
 //! bytes out-of-band (matching how peers are provisioned today: config,
 //! not a PKI).
-use crate::{Channel, ChannelError, Envelope};
+use crate::{outbox::Outbox, Channel, ChannelError, Envelope};
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use std::io::{Error as IoError, ErrorKind};
@@ -68,6 +68,7 @@ pub struct QuicClient {
     rt: tokio::runtime::Runtime,
     endpoint: Endpoint,
     connection: quinn::Connection,
+    outbox_path: Option<std::path::PathBuf>,
 }
 
 impl QuicClient {
@@ -105,7 +106,13 @@ impl QuicClient {
                 connecting.await.map_err(|e| ChannelError::Io(e.to_string()))
             })?;
 
-        Ok(Self { rt, endpoint, connection })
+        Ok(Self { rt, endpoint, connection, outbox_path: None })
+    }
+    /// Attach a durable outbound intent/receipt log. When set, the client
+    /// records intents before any network write and receipts before returning.
+    pub fn with_outbox_path(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.outbox_path = Some(path.into());
+        self
     }
 }
 
@@ -114,13 +121,33 @@ impl super::transport::Transport for QuicClient {
         let mut buf = Vec::new();
         write_frame_sync(&mut buf, env).map_err(|e| ChannelError::Io(e.to_string()))?;
         self.rt.block_on(async {
+            // Record outbound intent before any I/O.
+            if let Some(p) = &self.outbox_path {
+                let mut ob = Outbox::open(p).map_err(|e| ChannelError::Io(e.to_string()))?;
+                ob.record_intent(env).map_err(|e| ChannelError::Io(e.to_string()))?;
+            }
             let (mut send, mut recv) = self.connection.open_bi().await.map_err(|e| ChannelError::Io(e.to_string()))?;
             send.write_all(&buf).await.map_err(|e| ChannelError::Io(e.to_string()))?;
             send.finish().map_err(|e| ChannelError::Io(e.to_string()))?;
             let mut ack = [0u8; 1];
-            recv.read_exact(&mut ack).await.map_err(|e| ChannelError::Io(e.to_string()))?;
-            // Success on applied (1) or already-present (2). Only 0 is rejection.
-            Ok(ack[0] != 0)
+            if let Err(e) = recv.read_exact(&mut ack).await {
+                if let Some(p) = &self.outbox_path {
+                    let mut ob = Outbox::open(p).map_err(|e2| ChannelError::Io(e2.to_string()))?;
+                    let _ = ob.record_receipt(&env.key, env.lamport, &env.node_id, 0xFF);
+                }
+                return Err(ChannelError::Io(e.to_string()));
+            }
+            let code = ack[0];
+            if let Some(p) = &self.outbox_path {
+                let mut ob = Outbox::open(p).map_err(|e| ChannelError::Io(e.to_string()))?;
+                ob.record_receipt(&env.key, env.lamport, &env.node_id, code)
+                    .map_err(|e| ChannelError::Io(e.to_string()))?;
+            }
+            match code {
+                1 | 2 => Ok(true),
+                0 => Ok(false),
+                _ => Err(ChannelError::Io(format!("unknown ack value {}", code))),
+            }
         })
     }
 }

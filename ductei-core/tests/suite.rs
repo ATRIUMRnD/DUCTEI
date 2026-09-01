@@ -6,6 +6,8 @@ use ductei_core::*;
 use std::io::{Read, Write};
 #[cfg(feature = "net")]
 use std::net::{TcpListener, TcpStream};
+#[cfg(feature = "grpc")]
+use ductei_core::grpc::{serve_grpc_blocking, GrpcClient};
 
 fn node(n: u8) -> [u8; 16] { [n; 16] }
 fn tmp(name: &str) -> String { format!("{}/{}-{}", std::env::temp_dir().display(), std::process::id(), name) }
@@ -330,6 +332,64 @@ fn transport_same_triple_stale_while_newer_lamport_applies() {
 
 #[cfg(feature = "net")]
 #[test]
+fn transport_unknown_ack_is_error_and_outbox_keeps_pending() {
+    use std::net::TcpListener;
+    // Server that echoes a valid frame then replies with unknown ack=5.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        // Read one frame (length + body)
+        let mut len = [0u8; 4];
+        s.read_exact(&mut len).unwrap();
+        let n = u32::from_le_bytes(len) as usize;
+        let mut body = vec![0u8; n];
+        s.read_exact(&mut body).unwrap();
+        // Send unknown ack
+        s.write_all(&[5u8]).unwrap();
+        s.flush().unwrap();
+    });
+    let outbox_path = tmp("outbox-unknown.jsonl");
+    let _ = std::fs::remove_file(&outbox_path);
+    let mut c = ductei_core::transport::TcpClient::connect(addr).unwrap().with_outbox_path(&outbox_path);
+    let e = env("u", &["qallow.semantic.cert"], 1, 1);
+    let res = c.send_envelope(&e);
+    assert!(res.is_err(), "unknown ack must not be treated as success");
+    server.join().unwrap();
+    // Pending should include this envelope (unknown ack does not resolve)
+    let ob = ductei_core::outbox::Outbox::open(&outbox_path).unwrap();
+    let pending = ob.pending().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].key, "u");
+}
+
+#[cfg(feature = "net")]
+#[test]
+fn transport_outbox_intent_and_unknown_receipt_on_io_error() {
+    use std::net::TcpListener;
+    // Server accepts then drops immediately to force I/O error after connect.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let (s, _) = listener.accept().unwrap();
+        drop(s);
+    });
+    let outbox_path = tmp("outbox-ioerr.jsonl");
+    let _ = std::fs::remove_file(&outbox_path);
+    let mut c = ductei_core::transport::TcpClient::connect(addr).unwrap().with_outbox_path(&outbox_path);
+    let e = env("w", &["qallow.semantic.cert"], 1, 1);
+    let res = c.send_envelope(&e);
+    assert!(res.is_err(), "I/O error after connect must surface as error");
+    server.join().unwrap();
+    let ob = ductei_core::outbox::Outbox::open(&outbox_path).unwrap();
+    // Intent recorded
+    let pending = ob.pending().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].key, "w");
+}
+
+#[cfg(feature = "net")]
+#[test]
 fn local_fallback_only_on_connect_failure() {
     use std::net::TcpListener;
     // Local channel to confirm no fallback append happens when connect succeeds
@@ -509,9 +569,7 @@ fn veyn_hrv_coalesced_to_one_per_minute() {
 #[cfg(feature = "grpc")]
 #[test]
 fn grpc_two_node_loopback() {
-    use ductei_core::grpc::{serve_grpc_blocking, GrpcClient};
     use ductei_core::transport::Transport;
-
     let p = tmp("g0.jsonl");
     let r = tmp("g0r.jsonl");
     let _ = std::fs::remove_file(&p);
@@ -528,9 +586,35 @@ fn grpc_two_node_loopback() {
 
     let mut c = GrpcClient::connect(&addr.to_string()).unwrap();
     assert!(c.send_envelope(&env("a", &["qallow.semantic.cert"], 1, 1)).unwrap());
+    // Scope-denied must be a rejection (false)
     assert!(!c.send_envelope(&env("b", &["limen.credentials"], 1, 2)).unwrap());
     drop(c);
     drop(server); // detach; serve_grpc_blocking runs until the process exits
+}
+
+#[cfg(feature = "grpc")]
+#[test]
+fn grpc_stale_duplicate_is_success() {
+    use ductei_core::transport::Transport;
+    let p = tmp("g1.jsonl");
+    let r = tmp("g1r.jsonl");
+    let _ = std::fs::remove_file(&p);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+
+    let server = std::thread::spawn(move || {
+        let ch = Channel::open(ScopePolicy::new().allow("qallow.semantic.cert"), &p, &r).unwrap();
+        serve_grpc_blocking(addr, ch)
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let mut c = GrpcClient::connect(&addr.to_string()).unwrap();
+    // First apply
+    assert!(c.send_envelope(&env("a", &["qallow.semantic.cert"], 1, 1)).unwrap());
+    // Duplicate should be treated as successful receipt (ack 2)
+    assert!(c.send_envelope(&env("a", &["qallow.semantic.cert"], 1, 1)).unwrap());
+    drop(c);
+    drop(server);
 }
 
 #[cfg(feature = "quic")]

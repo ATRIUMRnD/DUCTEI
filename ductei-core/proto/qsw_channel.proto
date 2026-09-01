@@ -9,10 +9,11 @@ message EnvelopeMsg {
 }
 
 message Ack {
-  bool accepted = 1;
+  // Transport ack: 1=applied, 2=stale/already-present, 0=rejected.
+  uint32 code = 1;
 }
 
-// Persistence-first ack: accepted=true iff the remote has run the
+// Persistence-first ack: code=1 or 2 iff the remote has run the
 // envelope through scope policy -> causal gate -> fsynced JSONL log.
 service ChannelService {
   rpc SendEnvelope(EnvelopeMsg) returns (Ack);
