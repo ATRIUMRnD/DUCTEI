@@ -16,8 +16,8 @@ pq = ["dep:pqcrypto-mlkem", "dep:pqcrypto-traits"]
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tonic = { version = "0.12", optional = true }
-prost = { version = "0.13", optional = true }
+tonic = { version = "0.11", optional = true }
+prost = { version = "0.12", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros", "time"], optional = true }
 quinn = { version = "0.11", optional = true }
 rustls = { version = "0.23", features = ["ring"], optional = true }
@@ -26,7 +26,7 @@ pqcrypto-mlkem = { version = "0.1", optional = true }
 pqcrypto-traits = { version = "0.3", optional = true }
 
 [build-dependencies]
-tonic-build = { version = "0.12", optional = true }
+tonic-build = { version = "0.11", optional = true }
 protoc-bin-vendored = { version = "3", optional = true }
 
 [dev-dependencies]
