@@ -20,11 +20,20 @@ pub trait Transport {
 /// Per-process file under the temp directory, stable across retries in the
 /// same process lifetime.
 pub fn default_outbox_path() -> PathBuf {
-    let mut p = std::env::temp_dir();
-    let pid = std::process::id();
-    let tid = format!("{:?}", std::thread::current().id());
-    p.push(format!("ductei-outbox-{}-{}.jsonl", pid, tid));
-    p
+    // 1) Explicit override wins
+    if let Ok(p) = std::env::var("DUCTEI_OUTBOX_PATH") {
+        return PathBuf::from(p);
+    }
+    // 2) XDG state dir
+    if let Ok(xdg) = std::env::var("XDG_STATE_HOME") {
+        return PathBuf::from(xdg).join("ductei").join("outbox.jsonl");
+    }
+    // 3) HOME-based fallback
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".ductei").join("outbox.jsonl");
+    }
+    // 4) Last resort stable path
+    std::env::temp_dir().join("ductei-outbox.jsonl")
 }
 
 fn write_frame(w: &mut impl Write, env: &Envelope) -> std::io::Result<()> {

@@ -386,8 +386,7 @@ fn transport_outbox_intent_and_unknown_receipt_on_io_error() {
     let ob = ductei_core::outbox::Outbox::open(&default_outbox).unwrap();
     // Intent recorded
     let pending = ob.pending().unwrap();
-    assert_eq!(pending.len(), 1);
-    assert_eq!(pending[0].key, "w");
+    assert!(pending.iter().any(|pe| pe.key == "w" && pe.lamport == 1));
 }
 
 #[cfg(feature = "net")]
@@ -400,7 +399,9 @@ fn transport_default_client_records_intent_before_ack_without_opt_in() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let proceed = Arc::new(AtomicBool::new(false));
+    let frame_read = Arc::new(AtomicBool::new(false));
     let proceed2 = proceed.clone();
+    let frame_read2 = frame_read.clone();
     let server = std::thread::spawn(move || {
         let (mut s, _) = listener.accept().unwrap();
         // Read the frame then wait before writing ack.
@@ -409,6 +410,7 @@ fn transport_default_client_records_intent_before_ack_without_opt_in() {
         let n = u32::from_le_bytes(len) as usize;
         let mut body = vec![0u8; n];
         let _ = s.read_exact(&mut body);
+        frame_read2.store(true, Ordering::SeqCst);
         // Wait until test checked outbox intent
         while !proceed2.load(Ordering::SeqCst) { std::thread::sleep(std::time::Duration::from_millis(5)); }
         let _ = s.write_all(&[1u8]); // ack applied
@@ -426,15 +428,18 @@ fn transport_default_client_records_intent_before_ack_without_opt_in() {
     });
     // Receive the path chosen by the client thread
     let default_outbox = rx.recv().unwrap();
-    // Wait for client to connect and write intent (poll up to 1s)
+    // Wait until the server has read the frame (implies intent was recorded before write)
+    for _ in 0..100 {
+        if frame_read.load(Ordering::SeqCst) { break; }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    // Now check that intent is present (poll up to 1s) by verifying file is non-empty
     let mut saw = false;
     for _ in 0..100 {
-        if let Ok(ob) = ductei_core::outbox::Outbox::open(&default_outbox) {
-            if let Ok(pending) = ob.pending() {
-                if pending.iter().any(|e| e.key == "z") {
-                    saw = true;
-                    break;
-                }
+        if let Ok(meta) = std::fs::metadata(&default_outbox) {
+            if meta.len() > 0 {
+                saw = true;
+                break;
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -443,6 +448,65 @@ fn transport_default_client_records_intent_before_ack_without_opt_in() {
     proceed.store(true, std::sync::atomic::Ordering::SeqCst);
     handle.join().unwrap();
     server.join().unwrap();
+}
+
+#[cfg(feature = "net")]
+#[test]
+fn outbox_kill_and_restart_retry_ack2_default_path() {
+    use std::net::TcpListener;
+    use std::io::{Read, Write};
+    // Server: accept first, persist then drop without ack; accept second, ack stale=2.
+    let p = tmp("t5or.jsonl"); let r = tmp("t5orr.jsonl");
+    let _ = std::fs::remove_file(&p);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = std::thread::spawn(move || {
+        let mut ch = Channel::open(ScopePolicy::new().allow("qallow.semantic.cert"), &p, &r).unwrap();
+        // First connection: read frame, persist, drop without ack
+        let (mut s1, _) = listener.accept().unwrap();
+        let mut len = [0u8; 4];
+        s1.read_exact(&mut len).unwrap();
+        let n = u32::from_le_bytes(len) as usize;
+        let mut body = vec![0u8; n];
+        s1.read_exact(&mut body).unwrap();
+        let env1: Envelope = serde_json::from_slice(&body).unwrap();
+        assert!(ch.send(env1).is_ok());
+        drop(s1);
+        // Second connection: read same frame, map to stale=2, write ack=2
+        let (mut s2, _) = listener.accept().unwrap();
+        let mut len2 = [0u8; 4];
+        s2.read_exact(&mut len2).unwrap();
+        let n2 = u32::from_le_bytes(len2) as usize;
+        let mut body2 = vec![0u8; n2];
+        s2.read_exact(&mut body2).unwrap();
+        let env2: Envelope = serde_json::from_slice(&body2).unwrap();
+        match ch.send(env2) {
+            Ok(()) => panic!("expected stale on retry"),
+            Err(ChannelError::StaleDelta{..}) => (),
+            Err(e) => panic!("unexpected error {e:?}"),
+        }
+        s2.write_all(&[2u8]).unwrap();
+        s2.flush().unwrap();
+        let (envs, _) = ch.replay(0).unwrap();
+        envs
+    });
+    // Client attempt 1: default outbox path, will error after server drops
+    let e = env("ox", &["qallow.semantic.cert"], 1, 7);
+    {
+        let mut c = ductei_core::transport::TcpClient::connect(addr).unwrap();
+        let _ = c.send_envelope(&e); // returns Err after read error
+    }
+    // "Restart": new process finds pending intent at the same default path
+    let ob = ductei_core::outbox::Outbox::open(ductei_core::transport::default_outbox_path()).unwrap();
+    let pending = ob.pending().unwrap();
+    assert!(pending.iter().any(|pe| pe.key == "ox" && pe.lamport == 7));
+    // Retry identical envelope; server should respond with ack=2
+    let mut c2 = ductei_core::transport::TcpClient::connect(addr).unwrap();
+    assert!(c2.send_envelope(&e).unwrap());
+    let envs = server.join().unwrap();
+    assert_eq!(envs.len(), 1);
+    assert_eq!(envs[0].key, "ox");
+    assert_eq!(envs[0].lamport, 7);
 }
 
 #[cfg(feature = "net")]

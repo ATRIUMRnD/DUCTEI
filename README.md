@@ -53,6 +53,8 @@ degrades to the local `Channel` (`LocalFallback`). If connect succeeds but a
 later write/read/ack I/O error occurs, there is no LocalFallback (receiver
 persistence is unknown). Record a durable outbound intent and retry the
 identical envelope triple after restart; see `ductei_core::outbox::Outbox`.
+Default Outbox path: `DUCTEI_OUTBOX_PATH` when set, else `$XDG_STATE_HOME/ductei/outbox.jsonl`,
+else `$HOME/.ductei/outbox.jsonl` (created on first use).
 
 Two more `Transport` impls exist behind opt-in Cargo features, same
 persistence-first ack contract, same `Channel` on the receiving side:

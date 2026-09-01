@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::fs;
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind")]
@@ -23,6 +24,11 @@ pub struct Outbox {
 impl Outbox {
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                let _ = fs::create_dir_all(parent);
+            }
+        }
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         Ok(Self { path, file })
     }
