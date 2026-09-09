@@ -31,6 +31,9 @@ use std::process::Command;
 use std::time::Duration;
 
 pub const QALLOW_FORWARD_SCOPE: &str = "qallow.ingest.forwarded";
+/// Envelope budget of the bounded session that carries one delivery;
+/// also the session_bound recorded in Qallow's LMDB record.
+pub const SESSION_BOUND: u32 = 1;
 
 fn to_hex(bytes: &[u8; 16]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
@@ -131,11 +134,18 @@ fn process_one(
     store_dir: &Path,
 ) {
     let file_name = format!("{}-{}.qsw", env.lamport, sanitize_key(&env.key));
-    let frame = ductei_qallow::encode_envelope(env);
+    // Qallow's persist gate (Qallow@2b0009e, ATRIUM Task 4) refuses any
+    // envelope that does not carry a bounded session and a non-open
+    // scope inside the blob. The bounded session used below
+    // (max_envelopes = 1) is exactly what gets written on disk: one
+    // bounded session per delivery, unbounded unrepresentable (I5).
+    let session_id = ductei_qallow::persist::session_id_for(&node, &env.key, env.lamport);
+    let persist_env = ductei_qallow::persist::for_persist(env, session_id, SESSION_BOUND as u64);
+    let frame = ductei_qallow::encode_envelope(&persist_env);
 
     let forward_env = scoped(&env.key, &[QALLOW_FORWARD_SCOPE], node, env.lamport, &frame);
     let mut session = channel.session(
-        SessionBound::new(Some(1), None).expect("max_envelopes=Some(1) is a valid bound"),
+        SessionBound::new(Some(SESSION_BOUND), None).expect("max_envelopes=Some(1) is a valid bound"),
     );
     if let Err(err) = session.send(forward_env, 1) {
         session.close();

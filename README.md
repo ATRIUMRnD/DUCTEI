@@ -77,15 +77,43 @@ instead of only classical TLS.
 of v1's comma-joined key-prefix shim (which corrupts a scope name
 containing a comma). Lives alongside v1 unchanged — v1 stays byte-compatible
 with Qallow's real `sync_wire.c` and keeps passing the conformance oracle;
-v2 has no C-side counterpart yet.
+the C-side counterpart (`qsw_decode_v2` / `qsw_decode_v2_envelope_body`,
+`QSW_PROTO_VER_V2 = 2`) now exists in Qallow's `sync_wire.c` (ATRIUM
+harness-roadmap/05). The conformance job verifies a Rust-emitted v2 stream
+through the real C decoder, including a comma inside a scope name.
+`qallow ingest` auto-negotiates the version and rebuilds the v1 shim key
+(`scopes.join(",") + "|" + key`) for merge, so a record lands under the
+same LMDB key regardless of proto version.
 
-## Qallow-side ingestion seam
-`ductei_qallow::ingest`: a `QallowSink` trait shaped exactly like the real
-`ql_persist_merge_blob(key, blob)` call, plus `ingest_envelope()` as the one
-call site that will point at it. `ql_persist_merge_blob()` itself lives in
-the Qallow repo (C) and doesn't exist yet — this is the seam, not the fix.
-A `MemorySink` stand-in lets DUCTEI's own tests exercise "envelope decoded
--> merge called" end-to-end without linking Qallow.
+## Qallow-side ingestion (real, and gated)
+`ductei-qallow-relay` hands QSW v1 frames to a real `qallow ingest`
+process, which calls Qallow's `ql_persist_merge_blob()` into LMDB
+(Qallow@0a546b3 onward). Since Qallow@2b0009e (ATRIUM Task 4) that gate
+is kernel-level: it refuses, before any write, an envelope with
+`schema_ver < 2`, an open/broadcast scope, a zero session id or bound,
+a reserved key prefix (`env/ cred/ secret/ token/ password/`), or a
+malformed payload. `ductei_qallow::persist` is DUCTEI's side of that
+contract: `for_persist()` re-frames an accepted envelope with
+`schema_ver = 2` and wraps its blob in the persist-v2 header
+(`u16 ver=2 | u16 scope_code | u64 session_id | u64 session_bound |
+u32 data_len | data`). The relay's bounded session
+(`max_envelopes = 1`) is what gets written as `session_bound`, so
+invariant 5 is an on-disk fact, not a relay promise. `qallow get`
+returns only `data`, so readers see the producer's bytes unchanged.
+The QSW v1 wire frame itself is untouched and still passes the
+conformance oracle. `ductei_qallow::ingest` (the `QallowSink` seam and
+`MemorySink`) remains for DUCTEI's own tests.
+
+## One app: the closed loop
+`scripts/smoke_loop.py` runs the whole ecosystem as one loop with one
+shared LMDB store: VEYN REM cue -> `DucteiBridge` -> ductei-qallow-relay
+-> LMDB -> `qallow propose` (Qallow reads the cue from durable state and
+writes a LIMEN route request) -> limend -> ductei-limen-relay ->
+ductei-qallow-relay -> the same LMDB. Four scenarios, 41 checks, five
+invariants asserted inline; CI job `e2e-smoke-loop`.
+`scripts/atrium_up.py` runs the same loop as long-lived processes from
+one command (optionally booting the real VEYN daemon and firing an
+�neiro-shaped `/oneiro/watch` OSC cue).
 
 ## Test status (2026-07-13)
 - `cargo test --workspace`: 16/16 pass (default features: TCP transport only)
@@ -121,23 +149,15 @@ gcc -I<qallow>/include -o conformance/verify conformance/verify.c <qallow>/src/m
 ./conformance/verify /tmp/stream.bin
 ```
 
-## Known gaps (v0.1.0)
-- **The real Qallow LMDB merge is still outside this repo.**
-  `ductei_qallow::ingest` gives DUCTEI's side a `QallowSink` seam and
-  proves "envelope decoded -> merge called" against a local stand-in, but
-  the actual `ql_persist_merge_blob()` call lives in the Qallow repo (C)
-  and doesn't exist yet. VEYN -> DUCTEI -> Qallow is proven at the wire
-  level and at the ingestion-seam level, not yet against Qallow's real
-  store.
+## Known gaps
 - Outside DUCTEI, blocking the full loop: the LIMEN README patch is
   unapplied, and ML-KEM has no evaluated LIMEN-side counterpart yet
   (DUCTEI's own `pq` feature adds ML-KEM-768 for transport key exchange,
   independent of that).
 
 ## Roadmap
-- Real Qallow ingestion daemon: an impl of `QallowSink` backed by an FFI
-  or cxx bridge into Qallow's `ql_persist_merge_blob()` (lives in the
-  Qallow repo, not here)
-- QSW proto v2 adoption on the Qallow side once a C decoder exists for it
+- QSW proto v2 adoption on the Qallow side — DONE locally (C decoder +
+  ingest negotiation + merge-key parity; ATRIUM harness-roadmap/05);
+  CI step lands with this repo's commit, after Qallow's
 - gRPC/QUIC used as the default transport for cross-network peers once a
   peer-provisioning story (cert distribution, service discovery) exists

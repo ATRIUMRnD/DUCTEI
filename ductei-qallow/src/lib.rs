@@ -6,6 +6,7 @@
 use ductei_core::{Envelope, Scope};
 
 pub mod ingest;
+pub mod persist;
 pub mod v2;
 
 pub const QSW_MAGIC: u32 = 0x4E595351;

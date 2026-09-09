@@ -16,6 +16,10 @@ jobs:
           ./target/debug/emit /tmp/stream.bin
           gcc -I/tmp/Qallow/include -o conformance/verify conformance/verify.c /tmp/Qallow/src/mind/sync_wire.c
           ./conformance/verify /tmp/stream.bin
+          # v2 conformance (Task 5): requires Qallow main to carry the
+          # v2 decoder, so this commit lands only after Qallow's.
+          ./target/debug/emit /tmp/stream_v2.bin v2
+          ./conformance/verify /tmp/stream_v2.bin v2
 
   # End-to-end smoke: limend -> ductei-limen-relay, four scenarios
   # (good job, restart replicability, malformed request, malformed cert)
@@ -47,8 +51,13 @@ jobs:
   e2e-smoke-qallow:
     runs-on: ubuntu-latest
     env:
+      # Qallow pin >= 2b0009e (ATRIUM Task 4): the persist gate now
+      # requires schema_ver 2 + persist-v2 payloads, which
+      # ductei_qallow::persist supplies. An older pin would pass for the
+      # wrong reason (no gate); a newer relay against an older Qallow is
+      # also fine (the v2 header is just data to a pre-Task-4 store).
       LIMEN_REV: fd3f505d01be871d3b547221f384666b1d013326
-      QALLOW_REV: 42ce93f17092d3124e238de69f160a18de09b5db
+      QALLOW_REV: a05392e88002134d331e80b76a3a92b9036b1c16
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -78,7 +87,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       VEYN_REV: 06cb9eaa4b1f970ac20c596d4da0c4e19c2a3ede
-      QALLOW_REV: 42ce93f17092d3124e238de69f160a18de09b5db
+      QALLOW_REV: a05392e88002134d331e80b76a3a92b9036b1c16
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -109,3 +118,52 @@ jobs:
         run: |
           python scripts/smoke_veyn.py --veyn /tmp/VEYN \
             --qallow-cli /tmp/Qallow/target/debug/qallow
+
+  # One app: VEYN cue -> DUCTEI -> shared Qallow LMDB -> `qallow propose`
+  # -> limend -> DUCTEI -> the same LMDB. See scripts/smoke_loop.py and
+  # ATRIUM harness-roadmap/07-one-app-integration.md.
+  e2e-smoke-loop:
+    runs-on: ubuntu-latest
+    env:
+      LIMEN_REV: fd3f505d01be871d3b547221f384666b1d013326
+      VEYN_REV: 06cb9eaa4b1f970ac20c596d4da0c4e19c2a3ede
+      # Must point at a Qallow rev that carries `qallow propose`
+      # (qallow_cli/src/propose.rs). Bump in a separate, auditable
+      # commit once that lands on Qallow main; until then this job is
+      # expected red and must not be a required check.
+      QALLOW_REV: a05392e88002134d331e80b76a3a92b9036b1c16
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: checkout LIMEN at pinned rev
+        run: |
+          git clone https://github.com/xingxerx/LIMEN.git /tmp/LIMEN
+          git -C /tmp/LIMEN checkout "$LIMEN_REV"
+      - name: install LIMEN (simulator path only, no QPU extras)
+        run: pip install /tmp/LIMEN
+      - name: checkout VEYN at pinned rev
+        uses: actions/checkout@v4
+        with:
+          repository: CGXDevTeam/VEYN
+          ref: ${{ env.VEYN_REV }}
+          path: veyn-checkout
+          token: ${{ secrets.VEYN_READ_TOKEN }}
+      - name: place VEYN at /tmp/VEYN
+        run: |
+          rm -rf /tmp/VEYN
+          cp -a veyn-checkout /tmp/VEYN
+      - name: install VEYN's system deps (BLE/dbus, ALSA, HID/udev)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev libasound2-dev libudev-dev pkg-config
+      - name: checkout and build Qallow at pinned rev
+        run: |
+          git clone https://github.com/xingxerx/Qallow.git /tmp/Qallow
+          git -C /tmp/Qallow checkout "$QALLOW_REV"
+          cargo build --manifest-path /tmp/Qallow/Cargo.toml -p qallow_cli
+      - name: run the one-app loop
+        run: |
+          python scripts/smoke_loop.py --limen /tmp/LIMEN --veyn /tmp/VEYN             --qallow-cli /tmp/Qallow/target/debug/qallow
