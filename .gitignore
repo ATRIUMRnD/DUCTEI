@@ -1,3 +1,26 @@
+# Rust
 target/
-*.jsonl
+**/*.rs.bk
+
+# MSVC / C build output (conformance/verify.c, sync_wire)
+*.obj
+*.exe
+*.pdb
+*.ilk
+*.lib
+*.exp
+*.dll
 conformance/verify
+
+# Python smoke harness
+__pycache__/
+*.py[cod]
+
+# Smoke-run artifacts (scripts default to a temp dir, but --workdir may land here)
+*.jsonl
+ductei-smoke-*/
+
+# Editor / OS
+.DS_Store
+Thumbs.db
+desktop.ini
