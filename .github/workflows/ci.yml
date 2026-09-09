@@ -57,7 +57,7 @@ jobs:
       # wrong reason (no gate); a newer relay against an older Qallow is
       # also fine (the v2 header is just data to a pre-Task-4 store).
       LIMEN_REV: fd3f505d01be871d3b547221f384666b1d013326
-      QALLOW_REV: a05392e88002134d331e80b76a3a92b9036b1c16
+      QALLOW_REV: e69ebd0acaa005916e9207537b34aabe8ce25a01
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -87,7 +87,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       VEYN_REV: 06cb9eaa4b1f970ac20c596d4da0c4e19c2a3ede
-      QALLOW_REV: a05392e88002134d331e80b76a3a92b9036b1c16
+      QALLOW_REV: e69ebd0acaa005916e9207537b34aabe8ce25a01
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -131,7 +131,7 @@ jobs:
       # (qallow_cli/src/propose.rs). Bump in a separate, auditable
       # commit once that lands on Qallow main; until then this job is
       # expected red and must not be a required check.
-      QALLOW_REV: a05392e88002134d331e80b76a3a92b9036b1c16
+      QALLOW_REV: e69ebd0acaa005916e9207537b34aabe8ce25a01
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
