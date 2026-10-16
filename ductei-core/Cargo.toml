@@ -33,3 +33,7 @@ protoc-bin-vendored = { version = "3", optional = true }
 ductei-limen = { path = "../ductei-limen" }
 ductei-qallow = { path = "../ductei-qallow" }
 ductei-veyn = { path = "../ductei-veyn" }
+
+[lints.rust]
+# `cargo kani` sets cfg(kani); see src/proofs.rs
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

@@ -21,6 +21,10 @@ pub mod quic;
 pub mod pq;
 /// Durable outbound intent/receipt log (separate from accepted log).
 pub mod outbox;
+/// Kani proof harnesses for the hard invariants (`cargo kani`); the same
+/// bodies run as sampled tests under `cargo test` via `proof_shim.rs`.
+#[cfg(any(kani, test))]
+mod proofs;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Scope(pub String);
@@ -38,8 +42,15 @@ impl ScopePolicy {
         self
     }
     pub fn permits(&self, env: &Envelope) -> bool {
-        !env.scopes.is_empty() && env.scopes.iter().all(|s| self.allowed.contains(s))
+        permits_with(&env.scopes, |s| self.allowed.contains(s))
     }
+}
+
+/// The deny-by-default rule itself, independent of how the allow-list is
+/// stored. Split out of `ScopePolicy::permits` so it can be model-checked
+/// without a `HashSet` (see proofs.rs).
+fn permits_with(scopes: &[Scope], allowed: impl Fn(&Scope) -> bool) -> bool {
+    !scopes.is_empty() && scopes.iter().all(allowed)
 }
 
 /// The one struct that crosses the channel. Scopes are first-class fields.
@@ -174,34 +185,65 @@ impl Channel {
     }
     pub fn replay(&self, cursor: usize) -> std::io::Result<(Vec<Envelope>, usize)> { self.log.replay(cursor) }
     pub fn session(&mut self, bound: SessionBound) -> Session<'_> {
-        Session { ch: self, bound, sent: 0, cost: 0, closed: false }
+        Session { ch: self, budget: SessionBudget::new(bound) }
     }
 }
 
-pub struct Session<'a> {
-    ch: &'a mut Channel,
+/// I/O-free session accounting, split out of `Session` so the
+/// bounded-session invariant can be model-checked (see proofs.rs).
+///
+/// Overflow-safe by construction: a cost that would overflow the running
+/// total is denied, never wrapped. (Before this split, `cost + spent`
+/// wrapped in release builds, so a `u64::MAX` cost slipped past any
+/// deadline and reset the reported total to 0.)
+#[derive(Debug, Clone, Copy)]
+struct SessionBudget {
     bound: SessionBound,
     sent: u32,
     cost: u64,
     closed: bool,
 }
-impl<'a> Session<'a> {
-    pub fn send(&mut self, env: Envelope, cost: u64) -> Result<(), ChannelError> {
+impl SessionBudget {
+    fn new(bound: SessionBound) -> Self {
+        Self { bound, sent: 0, cost: 0, closed: false }
+    }
+    /// May one more envelope of `cost` go out? A denial closes the budget
+    /// for good.
+    fn admit(&mut self, cost: u64) -> Result<(), ChannelError> {
         if self.closed { return Err(ChannelError::BoundReached); }
         if let Some(m) = self.bound.max_envelopes {
             if self.sent >= m { self.closed = true; return Err(ChannelError::BoundReached); }
         }
         if let Some(d) = self.bound.cost_deadline {
-            if self.cost + cost > d { self.closed = true; return Err(ChannelError::BoundReached); }
+            match self.cost.checked_add(cost) {
+                Some(total) if total <= d => {}
+                _ => { self.closed = true; return Err(ChannelError::BoundReached); }
+            }
         }
-        self.ch.send(env)?;
-        self.sent += 1;
-        self.cost += cost;
         Ok(())
     }
-    pub fn is_closed(&self) -> bool { self.closed }
+    /// Record a send the channel actually accepted. Saturating so a session
+    /// with only one bound set can't panic or wrap on the other counter.
+    fn commit(&mut self, cost: u64) {
+        self.sent = self.sent.saturating_add(1);
+        self.cost = self.cost.saturating_add(cost);
+    }
+}
+
+pub struct Session<'a> {
+    ch: &'a mut Channel,
+    budget: SessionBudget,
+}
+impl<'a> Session<'a> {
+    pub fn send(&mut self, env: Envelope, cost: u64) -> Result<(), ChannelError> {
+        self.budget.admit(cost)?;
+        self.ch.send(env)?;
+        self.budget.commit(cost);
+        Ok(())
+    }
+    pub fn is_closed(&self) -> bool { self.budget.closed }
     /// Orderly exit, idempotent, reports cost paid.
-    pub fn close(&mut self) -> u64 { self.closed = true; self.cost }
+    pub fn close(&mut self) -> u64 { self.budget.closed = true; self.budget.cost }
 }
 
 pub fn scoped(key: &str, scopes: &[&str], node: [u8; 16], lamport: u64, blob: &[u8]) -> Envelope {

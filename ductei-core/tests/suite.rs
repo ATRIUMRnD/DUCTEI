@@ -17,6 +17,20 @@ fn chan(name: &str) -> Channel {
         tmp(&format!("{name}.jsonl")), tmp(&format!("{name}-rej.jsonl"))).unwrap()
 }
 
+/// Tests that use a client's DEFAULT outbox file share one file per process
+/// (and the grpc ones also mutate DUCTEI_OUTBOX_PATH). Cargo runs tests in
+/// parallel, so one test deleting or redirecting that file can erase another
+/// test's records mid-run. On Windows a deleted-while-open file even refuses
+/// new opens. Holding this lock for the whole test keeps them one at a time.
+#[cfg(feature = "net")]
+static DEFAULT_OUTBOX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(feature = "net")]
+fn default_outbox_guard() -> std::sync::MutexGuard<'static, ()> {
+    // A test that failed while holding the lock poisons it; the next test
+    // should still run, not fail with a confusing PoisonError.
+    DEFAULT_OUTBOX_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 #[test]
 fn scope_deny_by_default() {
     let mut ch = chan("t0");
@@ -113,6 +127,7 @@ fn gate_replay_after_restart_consistent() {
 #[cfg(feature = "net")]
 #[test]
 fn transport_two_node_loopback() {
+    let _outbox_guard = default_outbox_guard();
     let p = tmp("t5.jsonl"); let r = tmp("t5r.jsonl");
     let _ = std::fs::remove_file(&p);
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -180,6 +195,7 @@ fn transport_malformed_frame_rejected_without_corrupting_log() {
 #[cfg(feature = "net")]
 #[test]
 fn transport_restart_replay_over_network() {
+    let _outbox_guard = default_outbox_guard();
     let p = tmp("t5s.jsonl");
     let r = tmp("t5sr.jsonl");
     let _ = std::fs::remove_file(&p);
@@ -367,6 +383,7 @@ fn transport_unknown_ack_is_error_and_outbox_keeps_pending() {
 #[cfg(feature = "net")]
 #[test]
 fn transport_outbox_intent_and_unknown_receipt_on_io_error() {
+    let _outbox_guard = default_outbox_guard();
     use std::net::TcpListener;
     // Server accepts then drops immediately to force I/O error after connect.
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -392,6 +409,7 @@ fn transport_outbox_intent_and_unknown_receipt_on_io_error() {
 #[cfg(feature = "net")]
 #[test]
 fn transport_default_client_records_intent_before_ack_without_opt_in() {
+    let _outbox_guard = default_outbox_guard();
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
@@ -453,6 +471,7 @@ fn transport_default_client_records_intent_before_ack_without_opt_in() {
 #[cfg(feature = "net")]
 #[test]
 fn outbox_kill_and_restart_retry_ack2_default_path() {
+    let _outbox_guard = default_outbox_guard();
     use std::net::TcpListener;
     use std::io::{Read, Write};
     // Server: accept first, persist then drop without ack; accept second, ack stale=2.
@@ -566,6 +585,7 @@ fn outbox_restart_recovery_of_intents_and_receipts() {
 #[cfg(feature = "net")]
 #[test]
 fn veyn_event_flows_gate_transport_qallow() {
+    let _outbox_guard = default_outbox_guard();
     let p = tmp("t6.jsonl"); let r = tmp("t6r.jsonl");
     let _ = std::fs::remove_file(&p);
     let json = r#"{"source":"osc.eeg","kind":"eeg.sample","node_hex":"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
@@ -691,6 +711,7 @@ fn veyn_hrv_coalesced_to_one_per_minute() {
 #[cfg(feature = "grpc")]
 #[test]
 fn grpc_two_node_loopback() {
+    let _outbox_guard = default_outbox_guard();
     use ductei_core::transport::Transport;
     let p = tmp("g0.jsonl");
     let r = tmp("g0r.jsonl");
@@ -717,6 +738,7 @@ fn grpc_two_node_loopback() {
 #[cfg(feature = "grpc")]
 #[test]
 fn grpc_stale_duplicate_is_success() {
+    let _outbox_guard = default_outbox_guard();
     use ductei_core::transport::Transport;
     let p = tmp("g1.jsonl");
     let r = tmp("g1r.jsonl");
@@ -742,6 +764,7 @@ fn grpc_stale_duplicate_is_success() {
 #[cfg(feature = "grpc")]
 #[test]
 fn grpc_default_client_records_intent_before_ack_without_opt_in() {
+    let _outbox_guard = default_outbox_guard();
     use ductei_core::grpc::proto::channel_service_server::{ChannelService, ChannelServiceServer};
     use ductei_core::grpc::proto::{Ack, EnvelopeMsg};
     use tonic::{Request, Response, Status};
@@ -831,6 +854,7 @@ fn grpc_default_client_records_intent_before_ack_without_opt_in() {
 #[cfg(feature = "grpc")]
 #[test]
 fn grpc_outbox_kill_and_restart_retry_ack2_default_path() {
+    let _outbox_guard = default_outbox_guard();
     use ductei_core::grpc::proto::channel_service_server::{ChannelService, ChannelServiceServer};
     use ductei_core::grpc::proto::{Ack, EnvelopeMsg};
     use tonic::{Request, Response, Status};

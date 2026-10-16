@@ -8,6 +8,10 @@ use ductei_core::{Envelope, Scope};
 pub mod ingest;
 pub mod persist;
 pub mod v2;
+/// Kani proof harnesses for the wire codecs (`cargo kani`); the same
+/// bodies run as sampled tests under `cargo test`.
+#[cfg(any(kani, test))]
+mod proofs;
 
 pub const QSW_MAGIC: u32 = 0x4E595351;
 pub const QSW_PROTO_VER: u16 = 1;

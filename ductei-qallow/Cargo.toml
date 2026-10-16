@@ -11,3 +11,7 @@ ductei-core = { path = "../ductei-core" }
 [[bin]]
 name = "ductei-qallow-relay"
 path = "src/bin/relay.rs"
+
+[lints.rust]
+# `cargo kani` sets cfg(kani); see src/proofs.rs
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

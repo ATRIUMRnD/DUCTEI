@@ -101,19 +101,58 @@ impl Transport for TcpClient {
 
 /// Serve one peer connection: every inbound frame goes through the channel
 /// (scope check → gate → fsynced log) before the ack byte is written.
-pub fn serve_connection(mut stream: TcpStream, ch: &mut Channel) -> std::io::Result<usize> {
+pub fn serve_connection(stream: TcpStream, ch: &mut Channel) -> std::io::Result<usize> {
+    serve_stream(stream, ch)
+}
+
+/// True when an I/O error just means the peer went away (it crashed, was
+/// killed, or closed without reading our ack). Linux usually reports that
+/// as a clean EOF, but Windows reports a TCP reset as an error, so both
+/// have to end the connection the same way.
+fn peer_gone(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind::{BrokenPipe, ConnectionAborted, ConnectionReset};
+    matches!(e.kind(), ConnectionReset | ConnectionAborted | BrokenPipe)
+}
+
+/// `serve_connection` over any byte stream, so the reset/abort paths can be
+/// tested deterministically instead of depending on OS socket timing.
+///
+/// A vanished peer ends the connection normally and returns the count of
+/// envelopes accepted so far. That count is the truth about what was
+/// persisted: an envelope is only counted after `Channel::send` returned
+/// Ok (fsynced), and the ack is written after that, so losing the ack never
+/// loses data. Every other I/O error is still returned to the caller.
+pub(crate) fn serve_stream<S: Read + Write>(mut stream: S, ch: &mut Channel) -> std::io::Result<usize> {
     let mut accepted = 0usize;
-    while let Some(env) = read_frame(&mut stream)? {
-        let ack = match ch.send(env) {
-            Ok(()) => { accepted += 1; 1u8 }
-            Err(ChannelError::StaleDelta { .. }) => 2u8,
-            Err(ChannelError::ScopeDenied(_)) => 0u8,
-            Err(_) => 0u8, // I/O or other error: not applied
+    loop {
+        let env = match read_frame(&mut stream) {
+            Ok(Some(env)) => env,
+            Ok(None) => break,
+            Err(e) if peer_gone(&e) => break,
+            Err(e) => return Err(e),
         };
-        stream.write_all(&[ack])?;
-        stream.flush()?;
+        let result = ch.send(env);
+        if result.is_ok() { accepted += 1; }
+        let ack = ack_code(&result);
+        if let Err(e) = stream.write_all(&[ack]).and_then(|_| stream.flush()) {
+            if peer_gone(&e) { break; }
+            return Err(e);
+        }
     }
     Ok(accepted)
+}
+
+/// Map a channel verdict to the wire ack byte. `1` (applied) is produced
+/// only for `Ok(())`, and `Channel::send` returns `Ok(())` only after
+/// `LogStore::append` has fsynced, so an applied-ack never precedes
+/// persistence. Model-checked in proofs.rs.
+pub(crate) fn ack_code(result: &Result<(), ChannelError>) -> u8 {
+    match result {
+        Ok(()) => 1,
+        Err(ChannelError::StaleDelta { .. }) => 2,
+        Err(ChannelError::ScopeDenied(_)) => 0,
+        Err(_) => 0, // I/O or other error: not applied
+    }
 }
 
 pub fn listen_once(addr: impl ToSocketAddrs, ch: &mut Channel) -> std::io::Result<(std::net::SocketAddr, TcpListener)> {
@@ -167,5 +206,119 @@ pub fn send_local_first(
             local.send(env.clone())?;
             Ok(DeliveryPath::LocalFallback)
         }
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    use crate::{scoped, ScopePolicy};
+    use std::io::{Error, ErrorKind};
+
+    /// Reads `input`, then fails with `read_end` (None = clean EOF).
+    /// Every write fails with `write_err` when set, else is recorded.
+    struct Script {
+        input: std::io::Cursor<Vec<u8>>,
+        read_end: Option<ErrorKind>,
+        write_err: Option<ErrorKind>,
+        written: Vec<u8>,
+    }
+    impl Read for Script {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.input.read(buf)?;
+            match (n, self.read_end) {
+                (0, Some(kind)) if !buf.is_empty() => Err(Error::from(kind)),
+                _ => Ok(n),
+            }
+        }
+    }
+    impl Write for Script {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Some(kind) = self.write_err { return Err(Error::from(kind)); }
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    fn frame_bytes(key: &str, lamport: u64) -> Vec<u8> {
+        let env = scoped(key, &["s"], [1; 16], lamport, b"x");
+        let mut v = Vec::new();
+        write_frame(&mut v, &env).unwrap();
+        v
+    }
+
+    fn channel(tag: &str) -> Channel {
+        let dir = std::env::temp_dir();
+        let id = std::process::id();
+        let log = dir.join(format!("{id}-stream-{tag}.jsonl"));
+        let rej = dir.join(format!("{id}-stream-{tag}-rej.jsonl"));
+        let _ = std::fs::remove_file(&log);
+        Channel::open(ScopePolicy::new().allow("s"), log, rej).unwrap()
+    }
+
+    fn run(tag: &str, input: Vec<u8>, read_end: Option<ErrorKind>, write_err: Option<ErrorKind>)
+        -> (std::io::Result<usize>, usize, Vec<u8>)
+    {
+        let mut ch = channel(tag);
+        let s = Script { input: std::io::Cursor::new(input), read_end, write_err, written: Vec::new() };
+        // serve_stream consumes the stream; recover `written` through a shared cell.
+        let cell = std::cell::RefCell::new(s);
+        struct Ref<'a>(&'a std::cell::RefCell<Script>);
+        impl Read for Ref<'_> { fn read(&mut self, b: &mut [u8]) -> std::io::Result<usize> { self.0.borrow_mut().read(b) } }
+        impl Write for Ref<'_> {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> { self.0.borrow_mut().write(b) }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let res = serve_stream(Ref(&cell), &mut ch);
+        let persisted = ch.replay(0).unwrap().0.len();
+        (res, persisted, cell.into_inner().written)
+    }
+
+    #[test]
+    fn clean_eof_ends_connection() {
+        let (res, persisted, acks) = run("eof", frame_bytes("a", 1), None, None);
+        assert_eq!(res.unwrap(), 1);
+        assert_eq!((persisted, acks), (1, vec![1]));
+    }
+
+    /// Windows reports a client that vanished as a reset on the next read.
+    #[test]
+    fn reset_after_frame_is_a_normal_end_and_keeps_the_count() {
+        for kind in [ErrorKind::ConnectionReset, ErrorKind::ConnectionAborted, ErrorKind::BrokenPipe] {
+            let (res, persisted, _) = run(&format!("rd-{kind:?}"), frame_bytes("a", 1), Some(kind), None);
+            assert_eq!(res.unwrap(), 1, "{kind:?}");
+            assert_eq!(persisted, 1, "{kind:?}");
+        }
+    }
+
+    /// The ack write can fail because the client already left.
+    #[test]
+    fn failed_ack_write_to_a_gone_peer_keeps_the_count() {
+        for kind in [ErrorKind::ConnectionReset, ErrorKind::ConnectionAborted, ErrorKind::BrokenPipe] {
+            let (res, persisted, _) = run(&format!("wr-{kind:?}"), frame_bytes("a", 1), None, Some(kind));
+            assert_eq!(res.unwrap(), 1, "{kind:?}");
+            assert_eq!(persisted, 1, "{kind:?}");
+        }
+    }
+
+    /// Only a vanished peer is swallowed; real errors still surface.
+    #[test]
+    fn other_io_errors_still_propagate() {
+        let (res, persisted, _) = run("perm-rd", frame_bytes("a", 1), Some(ErrorKind::PermissionDenied), None);
+        assert_eq!(res.unwrap_err().kind(), ErrorKind::PermissionDenied);
+        assert_eq!(persisted, 1, "data persisted before the error is still durable");
+        let (res, _, _) = run("perm-wr", frame_bytes("a", 1), None, Some(ErrorKind::PermissionDenied));
+        assert_eq!(res.unwrap_err().kind(), ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn nothing_is_acked_applied_before_it_is_persisted() {
+        let mut input = frame_bytes("a", 1);
+        input.extend(frame_bytes("a", 1)); // same triple again: stale
+        let (res, persisted, acks) = run("order", input, None, None);
+        assert_eq!(res.unwrap(), 1);
+        assert_eq!(persisted, 1);
+        assert_eq!(acks, vec![1, 2]);
     }
 }
