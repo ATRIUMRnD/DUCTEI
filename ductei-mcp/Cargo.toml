@@ -23,7 +23,7 @@ pqcrypto-traits = { version = "0.3", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 # DPAPI (Data Protection API) wrapping of the signing key, user-scoped.
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Threading"] }
 
 [[bin]]
 name = "ductei-mcp-gate"

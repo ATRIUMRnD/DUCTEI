@@ -44,6 +44,11 @@ scheme = "ml-dsa-65"                     # "none" | "ml-dsa-65" | "ml-dsa-87" (C
 # key_store = "auto"                     # "auto" (DPAPI on Windows) | "dpapi" | "plaintext"
 # insecure_plaintext_key = false         # must be true to allow key_store = "plaintext"
 # pubkey_fingerprint = "<sha256 hex>"    # printed on first run; once set, a different key refuses to start
+
+[anchor]
+every = 10                               # sign the chain head every N receipts (0 = off); also on exit
+peers = ["100.x.y.z:7421"]               # DUCTEI TCP peers; each must allow scope mcp:{server}:anchor
+connect_timeout_ms = 2000
 ```
 
 Point the client at the gate instead of the server, e.g. in `claude_desktop_config.json`:
@@ -78,8 +83,36 @@ history); `--allow-unpinned` checks integrity and order only.
 `verify` checks: seq and `prev` chain, body hash, receipt version, `kid` equals
 the trusted key, ML-DSA signature over `"ductei-mcp-receipt-v1\0" || hash`,
 and that every accepted call/result hash exists in `channel.jsonl` and every
-denied call hash in `denied.jsonl`. It cannot detect tail truncation from the
-file alone; compare the last `hash` against an anchor you hold elsewhere.
+denied call hash in `denied.jsonl`.
+
+A hash chain cannot see a cut tail, so the gate also **anchors**: every
+`anchor.every` receipts (and on exit) it signs `(seq, head)` and pushes that as
+a DUCTEI envelope to each peer, with a local copy in `anchors.jsonl`. Hand the
+peer's `channel.jsonl` to verify, or type the head you copied down:
+
+```powershell
+.\target\release\ductei-mcp-gate.exe verify D:\dev\video-watch\ductei --fingerprint <sha256 hex> --anchor-file \\xing-pc\...\channel.jsonl
+```
+
+```powershell
+.\target\release\ductei-mcp-gate.exe verify D:\dev\video-watch\ductei --fingerprint <sha256 hex> --anchor 41:<hash>
+```
+
+The highest anchor signed by the trusted key must be present with the same
+hash; if the file ends before it, verify reports `TRUNCATED`. Anchors from the
+log dir itself prove nothing (same writer), which is why they go to a peer.
+The pusher runs on its own thread, keeps only the newest unsent anchor, and
+retries it on the next anchor and at exit; an unreachable peer never stalls
+the relay.
+
+## Launch nonce
+
+The gate starts the server with `DUCTEI_GATE_NONCE=<64 hex>` and
+`DUCTEI_GATE_DIR=<log dir>`, and writes `gate-launch.json` (`gate_pid`,
+`node_id`, `nonce_sha256`, `server`) to the log dir for the life of the
+session. A server built to be gate-only refuses stdio unless the env nonce is
+present and hashes to the record. That stops a client configured straight at
+the server by mistake; it does not stop a deliberate same-user bypass.
 
 ## Files in the log dir
 
@@ -90,6 +123,9 @@ file alone; compare the last `hash` against an anchor you hold elsewhere.
 | `rejected.jsonl` | ductei-core causal-gate stale rejections |
 | `receipts.jsonl` | one receipt per closed loop; `prev` links to the previous `hash` |
 | `gate-node-id` | this gate's persisted 16-byte node id (one per install) |
+| `anchors.jsonl` | local copy of every anchor pushed (same writer as the receipts, so not proof on its own) |
+| `outbox.jsonl` | ductei-core outbox: anchor push intents and acks |
+| `gate-launch.json` | pid + nonce hash for the running session (removed on exit) |
 | `gate-ml-dsa-*.pk` | signing public key (also keep a copy, or its fingerprint, off this machine) |
 | `gate-ml-dsa-*.sk.dpapi` | secret key wrapped with DPAPI (user scope); `.sk` plaintext only with `key_store = "plaintext"` |
 
@@ -111,7 +147,7 @@ session bound reached, `-32003` stale delta, `-32004` persistence failed.
 - A result that fails to persist is dropped, not returned (invariant 4). The
   client sees a timeout for that id. Logged to stderr.
 - DPAPI protects the key file from being copied off the machine; it does not
-  protect against code running as the same Windows user. Nothing stops a
-  client from launching the real server directly; that is a server-side change
-  (launch nonce) and is not in v1.
+  protect against code running as the same Windows user.
+- The launch nonce needs the server to check it; a server that ignores
+  `DUCTEI_GATE_NONCE` can still be launched directly.
 - Policy is by tool name only; no argument-level rules yet.

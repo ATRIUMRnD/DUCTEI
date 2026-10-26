@@ -391,6 +391,9 @@ pub struct VerifyTrust {
     /// export, or `seq:hash` typed by hand). The highest valid one must be
     /// present in receipts.jsonl, which catches tail truncation.
     pub anchors: Vec<Anchor>,
+    /// `(seq, hash)` the operator copied by hand (`--anchor seq:hash`). Trusted
+    /// as-is, since it came from the operator, not from a file.
+    pub pinned_head: Option<(u64, String)>,
 }
 
 #[derive(Debug, Default)]
@@ -499,14 +502,17 @@ pub fn verify_receipts(dir: &Path, trust: &VerifyTrust) -> Result<VerifyReport, 
     // Anchors: the highest one that verifies against the trusted key must be
     // present in the file with the same hash. A valid anchor beyond the end
     // of the file is proof of truncation.
-    let valid: Vec<&Anchor> = trust.anchors.iter().filter(|a| a.v == RECEIPT_VERSION && a.verify(pk.as_ref())).collect();
+    let mut valid: Vec<(u64, String)> = trust.anchors.iter()
+        .filter(|a| a.v == RECEIPT_VERSION && a.verify(pk.as_ref()))
+        .map(|a| (a.seq, a.head.clone())).collect();
     let rejected = trust.anchors.len() - valid.len();
     if rejected > 0 { rep.warnings.push(format!("{rejected} anchor(s) ignored: not signed by the trusted key")); }
-    if let Some(a) = valid.iter().max_by_key(|a| a.seq) {
-        match hashes.get(&a.seq) {
-            Some(h) if *h == a.head => rep.warnings.push(format!("anchor seq {} matches; receipts after it ({}) are not covered by an anchor", a.seq, rep.receipts.saturating_sub(a.seq + 1))),
-            Some(_) => rep.errors.push(format!("seq {}: hash differs from anchor (history rewritten)", a.seq)),
-            None => rep.errors.push(format!("TRUNCATED: anchor proves receipt seq {} existed (head {}), file ends at seq {}", a.seq, &a.head[..16], expect_seq.saturating_sub(1))),
+    if let Some((s, h)) = &trust.pinned_head { valid.push((*s, h.to_lowercase())); }
+    if let Some((seq, head)) = valid.iter().max_by_key(|(s, _)| *s) {
+        match hashes.get(seq) {
+            Some(h) if h == head => rep.warnings.push(format!("anchor seq {seq} matches; receipts after it ({}) are not covered by an anchor", rep.receipts.saturating_sub(seq + 1))),
+            Some(_) => rep.errors.push(format!("seq {seq}: hash differs from anchor (history rewritten)")),
+            None => rep.errors.push(format!("TRUNCATED: anchor proves receipt seq {seq} existed (head {}), file ends at seq {}", head.get(..16).unwrap_or(head), expect_seq.saturating_sub(1))),
         }
     } else {
         rep.warnings.push("no anchor: tail truncation is not detectable; pass --anchor seq:hash or --anchor-file <peer channel.jsonl>".into());
