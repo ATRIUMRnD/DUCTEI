@@ -1,0 +1,15 @@
+# Example: gate the stub server. Only `echo` is allowed; `secret` is denied by policy.
+[server]
+name = "stub"
+command = "python3"
+args = ["ductei-mcp/examples/stub_server.py"]
+
+[policy]
+allow = ["echo"]
+max_calls_per_session = 100
+
+[log]
+dir = "/tmp/gate-e2e/ductei"
+
+[sign]
+scheme = "ml-dsa-65"   # or "ml-dsa-87" (CNSA 2.0), or "none"
