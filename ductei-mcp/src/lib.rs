@@ -54,10 +54,13 @@ pub struct AnchorCfg {
     pub peers: Vec<String>,
     #[serde(default = "default_connect_timeout_ms")]
     pub connect_timeout_ms: u64,
+    /// Peers must resolve to tailnet or loopback addresses unless this is true.
+    #[serde(default)]
+    pub allow_public_peers: bool,
 }
 fn default_connect_timeout_ms() -> u64 { 2000 }
 impl Default for AnchorCfg {
-    fn default() -> Self { Self { every: 0, peers: vec![], connect_timeout_ms: default_connect_timeout_ms() } }
+    fn default() -> Self { Self { every: 0, peers: vec![], connect_timeout_ms: default_connect_timeout_ms(), allow_public_peers: false } }
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,14 +79,26 @@ pub struct PolicyCfg {
     pub allow: Vec<String>,
     /// Bounded session: calls (accepted or denied) per gate process lifetime.
     pub max_calls_per_session: u32,
+    /// Client methods allowed besides initialize, ping, tools/list, tools/call
+    /// and notifications/*, e.g. ["resources/list", "resources/read"]. Default: none.
+    #[serde(default)]
+    pub allow_methods: Vec<String>,
+    /// Requests the server may make of the client, e.g. "sampling/createMessage",
+    /// "elicitation/create", "roots/list". Default: none. Server notifications always pass.
+    #[serde(default)]
+    pub allow_server_methods: Vec<String>,
 }
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize)]
 pub struct LogCfg {
     /// Directory for channel.jsonl, denied.jsonl, rejected.jsonl, receipts.jsonl,
     /// gate-node-id and the signing key. Default: ./ductei next to the config.
     pub dir: Option<PathBuf>,
+    /// Windows: on every start, reset the dir's ACL to this user + SYSTEM only.
+    #[serde(default = "yes")]
+    pub restrict_acl: bool,
 }
+fn yes() -> bool { true }
 
 #[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
@@ -153,6 +168,10 @@ impl Config {
             config_path.parent().unwrap_or(Path::new(".")).join("ductei")
         })
     }
+}
+
+impl Default for LogCfg {
+    fn default() -> Self { Self { dir: None, restrict_acl: true } }
 }
 
 pub fn scope_for(server: &str, tool: &str) -> String {
@@ -262,14 +281,19 @@ impl ReceiptLog {
         let path = dir.join("receipts.jsonl");
         let (seq, head) = match File::open(&path) {
             Ok(f) => {
+                // Refuse to extend a chain that is already damaged (torn write,
+                // edit, foreign lines): appending would bury the break.
                 let mut seq = 0u64;
                 let mut head = GENESIS.to_string();
-                for line in BufReader::new(f).lines() {
+                let refuse = |n: usize, why: String| format!("{}: line {n}: {why}; refusing to extend a damaged chain. Run `ductei-mcp-gate verify`, then move the file aside to start a new chain", path.display());
+                for (i, line) in BufReader::new(f).lines().enumerate() {
                     let line = line.map_err(|e| e.to_string())?;
-                    if let Ok(r) = serde_json::from_str::<Receipt>(&line) {
-                        seq = r.body.seq + 1;
-                        head = r.hash;
+                    let r: Receipt = serde_json::from_str(&line).map_err(|e| refuse(i + 1, format!("unparsable ({e})")))?;
+                    if r.body.seq != seq || r.body.prev != head || r.body.hash() != r.hash {
+                        return Err(refuse(i + 1, "chain broken".into()));
                     }
+                    seq += 1;
+                    head = r.hash;
                 }
                 (seq, head)
             }
@@ -346,10 +370,13 @@ impl Anchor {
 /// Push one envelope to a DUCTEI TCP peer with timeouts and record intent and
 /// ack in an outbox. Same frame format as ductei-core transport
 /// (u32 LE length + JSON, 1 ack byte: 1 applied, 2 stale, 0 rejected).
-pub fn push_envelope(peer: &str, env: &Envelope, timeout: std::time::Duration, outbox: &Path) -> Result<u8, String> {
+pub fn push_envelope(peer: &str, env: &Envelope, timeout: std::time::Duration, outbox: &Path, allow_public: bool) -> Result<u8, String> {
     use std::io::Read;
     use std::net::{TcpStream, ToSocketAddrs};
     let addr = peer.to_socket_addrs().map_err(|e| format!("{peer}: {e}"))?.next().ok_or_else(|| format!("{peer}: no address"))?;
+    if !allow_public && !peer_allowed(&addr) {
+        return Err(format!("{peer} resolves to {addr}, not a tailnet or loopback address (set anchor.allow_public_peers to override)"));
+    }
     let mut ob = ductei_core::outbox::Outbox::open(outbox).map_err(|e| e.to_string())?;
     ob.record_intent(env).map_err(|e| e.to_string())?;
     let mut s = TcpStream::connect_timeout(&addr, timeout).map_err(|e| format!("{peer}: connect: {e}"))?;
@@ -449,6 +476,7 @@ pub fn verify_receipts(dir: &Path, trust: &VerifyTrust) -> Result<VerifyReport, 
     let calls = blob_hashes(&dir.join("channel.jsonl"), 0);
     let results = blob_hashes(&dir.join("channel.jsonl"), 1);
     let denied = blob_hashes(&dir.join("denied.jsonl"), 0);
+    let sessions = blob_hashes(&dir.join("sessions.jsonl"), 0);
 
     let mut expect_seq = 0u64;
     let mut prev = GENESIS.to_string();
@@ -485,6 +513,9 @@ pub fn verify_receipts(dir: &Path, trust: &VerifyTrust) -> Result<VerifyReport, 
             }
             "denied" => {
                 if !denied.contains(&r.body.call_sha256) { rep.errors.push(format!("seq {s}: denied call not found in denied.jsonl")); }
+            }
+            "session" => {
+                if !sessions.contains(&r.body.call_sha256) { rep.errors.push(format!("seq {s}: session policy not found in sessions.jsonl")); }
             }
             v => rep.errors.push(format!("seq {s}: unknown verdict {v}")),
         }
@@ -731,6 +762,10 @@ pub struct PendingCall {
     pub call_sha256: String,
 }
 
+/// Client methods that pass without being listed in `policy.allow_methods`.
+/// Everything else is denied: same deny-by-default rule as tools.
+const BASE_CLIENT_METHODS: &[&str] = &["initialize", "ping", "tools/list", "tools/call"];
+
 /// Everything the two relay threads share. Lives behind one Mutex.
 pub struct Gate {
     pub server: String,
@@ -738,11 +773,14 @@ pub struct Gate {
     pub lamport: u64,
     pub channel: Channel,
     pub denied: LogStore,
+    pub sessions: LogStore,
     pub receipts: ReceiptLog,
     pub pending: HashMap<String, PendingCall>,
     /// `tools/list` request ids awaiting a server answer to filter.
     pub pending_lists: HashSet<String>,
     pub allow: HashSet<String>,
+    pub allow_methods: HashSet<String>,
+    pub allow_server_methods: HashSet<String>,
     pub max_calls: u32,
     pub calls: u32,
     pub closed: bool,
@@ -751,43 +789,75 @@ pub struct Gate {
     pub anchors: LogStore,
     /// Where anchor envelopes go to be pushed to peers (gate binary owns the thread).
     pub anchor_tx: Option<std::sync::mpsc::Sender<Envelope>>,
+    /// Held for the gate's lifetime; the OS drops it if the process dies.
+    _lock: File,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum Decision {
-    /// Forward the line to the server unchanged.
-    Forward,
-    /// Do not forward; send this JSON-RPC error line back to the client instead.
+    /// Send this canonical line on to the other side.
+    Forward(String),
+    /// Do not forward; send this line back to whoever sent the original.
     Reply(String),
+    /// Do not forward and do not answer (a denied notification, a junk line).
+    Drop,
+}
+
+fn rpc_error(id: serde_json::Value, code: i64, message: &str) -> String {
+    serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}).to_string()
+}
+
+/// One gate per log dir: two gates appending to one receipts.jsonl would fork
+/// the chain. The OS releases the lock when the process exits or dies, so
+/// there is no stale-lock cleanup to get wrong.
+fn lock_dir(dir: &Path) -> Result<File, String> {
+    let f = OpenOptions::new().create(true).truncate(false).write(true).open(dir.join("gate.lock")).map_err(|e| e.to_string())?;
+    match f.try_lock() {
+        Ok(()) => Ok(f),
+        Err(fs::TryLockError::WouldBlock) => Err(format!("another ductei-mcp-gate is already using {}; one gate per log dir", dir.display())),
+        Err(fs::TryLockError::Error(e)) => Err(format!("lock {}: {e}", dir.display())),
+    }
 }
 
 impl Gate {
     pub fn open(cfg: &Config, dir: &Path) -> Result<Self, String> {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        let lock = lock_dir(dir)?;
         let mut policy = ScopePolicy::new();
         for t in &cfg.policy.allow { policy = policy.allow(&scope_for(&cfg.server.name, t)); }
         let channel = Channel::open(policy, dir.join("channel.jsonl"), dir.join("rejected.jsonl"))
             .map_err(|e| e.to_string())?;
         let node = load_or_create_node_id(dir).map_err(|e| e.to_string())?;
-        // Resume our lamport clock from what this node already persisted.
-        let (past, _) = channel.replay(0).map_err(|e| e.to_string())?;
-        let lamport = past.iter().filter(|e| e.node_id == node).map(|e| e.lamport).max().map_or(0, |l| l + 1);
+        let denied = LogStore::open(dir.join("denied.jsonl")).map_err(|e| e.to_string())?;
+        let sessions = LogStore::open(dir.join("sessions.jsonl")).map_err(|e| e.to_string())?;
+        let anchors = LogStore::open(dir.join("anchors.jsonl")).map_err(|e| e.to_string())?;
+        // Resume the lamport clock past everything this node ever wrote, in every log.
+        let mut max: Option<u64> = None;
+        for envs in [channel.replay(0), denied.replay(0), sessions.replay(0), anchors.replay(0)] {
+            for e in envs.map_err(|e| e.to_string())?.0.iter().filter(|e| e.node_id == node) {
+                max = Some(max.map_or(e.lamport, |m| m.max(e.lamport)));
+            }
+        }
         Ok(Self {
             server: cfg.server.name.clone(),
             node,
-            lamport,
+            lamport: max.map_or(0, |l| l + 1),
             channel,
-            denied: LogStore::open(dir.join("denied.jsonl")).map_err(|e| e.to_string())?,
+            denied,
+            sessions,
             receipts: ReceiptLog::open(dir, &cfg.sign)?,
             pending: HashMap::new(),
             pending_lists: HashSet::new(),
             allow: cfg.policy.allow.iter().cloned().collect(),
+            allow_methods: cfg.policy.allow_methods.iter().cloned().collect(),
+            allow_server_methods: cfg.policy.allow_server_methods.iter().cloned().collect(),
             max_calls: cfg.policy.max_calls_per_session,
             calls: 0,
             closed: false,
             anchor_every: cfg.anchor.every,
-            anchors: LogStore::open(dir.join("anchors.jsonl")).map_err(|e| e.to_string())?,
+            anchors,
             anchor_tx: None,
+            _lock: lock,
         })
     }
 
@@ -798,22 +868,33 @@ impl Gate {
     /// anchor is never in flight without a record of it.
     fn maybe_anchor(&mut self) {
         if self.anchor_every == 0 || self.receipts.seq % self.anchor_every != 0 { return; }
-        let Some(a) = self.receipts.anchor() else { return };
-        let blob = serde_json::to_vec(&a).unwrap_or_default();
-        let key = format!("mcp/{}/anchor/{}", self.server, a.seq);
-        let lamport = self.next_lamport();
-        let env = scoped(&key, &[&anchor_scope(&self.server)], self.node, lamport, &blob);
+        let Some(env) = self.anchor_now() else { return };
         if let Err(e) = self.anchors.append(&env) { eprintln!("ductei-mcp-gate: anchors.jsonl append failed: {e}"); return; }
         if let Some(tx) = &self.anchor_tx { let _ = tx.send(env); }
     }
 
-    /// Build an anchor envelope by hand (used by the binary on exit).
+    /// Build an anchor envelope for the current head.
     pub fn anchor_now(&mut self) -> Option<Envelope> {
         let a = self.receipts.anchor()?;
         let blob = serde_json::to_vec(&a).unwrap_or_default();
         let key = format!("mcp/{}/anchor/{}", self.server, a.seq);
         let lamport = self.next_lamport();
         Some(scoped(&key, &[&anchor_scope(&self.server)], self.node, lamport, &blob))
+    }
+
+    /// Start-of-session receipt: the exact rules and server binary in force.
+    /// Widening the allowlist or swapping the server exe shows up in the
+    /// signed timeline as a new policy hash, not as a silent config edit.
+    pub fn record_session(&mut self, policy: &str, launch: &str) -> Result<(), String> {
+        let lamport = self.next_lamport();
+        let key = format!("mcp/{}/session/{}", self.server, self.receipts.seq);
+        let scope = format!("mcp:{}:session", self.server);
+        let env = scoped(&key, &[&scope], self.node, lamport, policy.as_bytes());
+        self.sessions.append(&env).map_err(|e| format!("sessions.jsonl: {e}"))?;
+        self.receipts.record(ReceiptBody::new(key, scope, "session", lamport, lamport, sha256_hex(policy.as_bytes()), sha256_hex(launch.as_bytes())))
+            .map_err(|e| format!("receipts.jsonl: {e}"))?;
+        self.maybe_anchor();
+        Ok(())
     }
 
     /// Mirrors ductei_core::SessionBudget (which is private and borrows the
@@ -825,20 +906,76 @@ impl Gate {
         Ok(())
     }
 
-    /// A line from the client. `tools/call` is gated, `tools/list` is noted
-    /// so its answer can be filtered, everything else is forwarded.
-    pub fn on_client_line(&mut self, line: &str) -> Decision {
-        let Ok(msg) = serde_json::from_str::<serde_json::Value>(line) else { return Decision::Forward };
-        let method = msg.get("method").and_then(|m| m.as_str()).unwrap_or("");
-        if method == "tools/list" {
-            if let Some(id) = msg.get("id") { self.pending_lists.insert(id.to_string()); }
-            return Decision::Forward;
+    /// A refusal goes on the timeline like anything else: denied.jsonl gets
+    /// the envelope, receipts.jsonl gets a signed "denied" receipt.
+    fn record_denied(&mut self, env: Envelope, call_sha256: String, reply: &str) {
+        if let Err(e) = self.denied.append(&env) { eprintln!("ductei-mcp-gate: denied.jsonl append failed: {e}"); }
+        let scope = env.scopes.first().map(|s| s.0.clone()).unwrap_or_default();
+        let lamport_result = self.next_lamport();
+        if let Err(e) = self.receipts.record(ReceiptBody::new(env.key.clone(), scope, "denied", env.lamport, lamport_result, call_sha256, sha256_hex(reply.as_bytes()))) {
+            eprintln!("ductei-mcp-gate: denied receipt failed: {e}");
         }
-        if method != "tools/call" { return Decision::Forward; }
-        let id = msg.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        self.maybe_anchor();
+    }
+
+    /// Deny a non-tool method from either side (`kind` = "method" for the
+    /// client, "server" for server-initiated requests).
+    fn deny_method(&mut self, msg: &serde_json::Value, kind: &str, method: &str) -> Decision {
+        let blob = serde_json::to_vec(msg).unwrap_or_default();
+        let key = format!("mcp/{}/{kind}/{method}", self.server);
+        let scope = format!("mcp:{}:{kind}:{method}", self.server);
+        let lamport = self.next_lamport();
+        let env = scoped(&key, &[&scope], self.node, lamport, &blob);
+        let reply = msg.get("id").filter(|i| !i.is_null()).cloned()
+            .map(|id| rpc_error(id, -32001, &format!("ductei: method {method} denied by policy")));
+        self.record_denied(env, sha256_hex(&blob), reply.as_deref().unwrap_or(""));
+        eprintln!("ductei-mcp-gate: denied {kind} {method}");
+        reply.map_or(Decision::Drop, Decision::Reply)
+    }
+
+    /// A line from the client. Only JSON objects are relayed, and what is
+    /// relayed is the gate's own re-serialization, never the raw bytes: a
+    /// server whose parser reads duplicate keys or odd encodings differently
+    /// must see exactly what the gate judged.
+    pub fn on_client_line(&mut self, line: &str) -> Decision {
+        let msg: serde_json::Value = match serde_json::from_str(line) {
+            Ok(v) => v,
+            Err(_) => return Decision::Reply(rpc_error(serde_json::Value::Null, -32700, "ductei: parse error, line not relayed")),
+        };
+        // JSON-RPC batches were removed from MCP (2025-06-18); relaying an array would skip the gate.
+        if !msg.is_object() {
+            return Decision::Reply(rpc_error(serde_json::Value::Null, -32600, "ductei: batches and non-object messages are not relayed"));
+        }
+        let Some(method) = msg.get("method").and_then(|m| m.as_str()).map(String::from) else {
+            // Our answer to a request the server was allowed to make.
+            let is_response = msg.get("id").is_some() && (msg.get("result").is_some() || msg.get("error").is_some());
+            return if is_response { Decision::Forward(msg.to_string()) }
+                   else { Decision::Reply(rpc_error(serde_json::Value::Null, -32600, "ductei: invalid request")) };
+        };
+        if method.starts_with("notifications/") { return Decision::Forward(msg.to_string()); }
+        match method.as_str() {
+            "tools/call" => self.gate_call(msg),
+            "tools/list" => {
+                if let Some(id) = msg.get("id") { self.pending_lists.insert(id.to_string()); }
+                Decision::Forward(msg.to_string())
+            }
+            m if BASE_CLIENT_METHODS.contains(&m) || self.allow_methods.contains(m) => Decision::Forward(msg.to_string()),
+            m => { let m = m.to_string(); self.deny_method(&msg, "method", &m) }
+        }
+    }
+
+    fn gate_call(&mut self, msg: serde_json::Value) -> Decision {
+        // A call with no id would run on the server with no result to receipt.
+        let Some(id) = msg.get("id").filter(|i| !i.is_null()).cloned() else {
+            return Decision::Reply(rpc_error(serde_json::Value::Null, -32600, "ductei: tools/call needs an id"));
+        };
+        let id_str = id.to_string();
+        // Reusing an in-flight id would pair the wrong result with the wrong receipt.
+        if self.pending.contains_key(&id_str) {
+            return Decision::Reply(rpc_error(id, -32600, "ductei: id already in flight"));
+        }
         let tool = msg.pointer("/params/name").and_then(|t| t.as_str()).unwrap_or("").to_string();
         let scope = scope_for(&self.server, &tool);
-        let id_str = id.to_string();
         let key = format!("mcp/{}/{}/{}", self.server, tool, id_str.trim_matches('"'));
         let params = msg.get("params").cloned().unwrap_or(serde_json::Value::Null);
         let blob = serde_json::to_vec(&params).unwrap_or_default();
@@ -846,11 +983,10 @@ impl Gate {
         let lamport_call = self.next_lamport();
         let env = scoped(&key, &[&scope], self.node, lamport_call, &blob);
 
-        let outcome = self.admit_call().and_then(|_| self.channel.send(env.clone()));
-        match outcome {
+        match self.admit_call().and_then(|_| self.channel.send(env.clone())) {
             Ok(()) => {
                 self.pending.insert(id_str, PendingCall { key, scope, lamport_call, call_sha256 });
-                Decision::Forward
+                Decision::Forward(msg.to_string())
             }
             Err(e) => {
                 let (code, text) = match &e {
@@ -859,40 +995,46 @@ impl Gate {
                     ChannelError::StaleDelta { .. } => (-32003, "ductei: stale delta rejected".to_string()),
                     ChannelError::Io(m) => (-32004, format!("ductei: persistence failed: {m}")),
                 };
-                let reply = serde_json::json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":text}}).to_string();
-                let _ = self.denied.append(&env);
-                let lamport_result = self.next_lamport();
-                let _ = self.receipts.record(ReceiptBody::new(key, scope, "denied", lamport_call, lamport_result, call_sha256, sha256_hex(reply.as_bytes())));
-                self.maybe_anchor();
+                let reply = rpc_error(id, code, &text);
+                self.record_denied(env, call_sha256, &reply);
                 Decision::Reply(reply)
             }
         }
     }
 
-    /// A line from the server. If it answers a gated call, persist the result
-    /// and write the receipt *before* the caller forwards it to the client.
-    /// Returns `Some(line)` when the line to forward differs from the input
-    /// (a filtered `tools/list` answer), `None` to forward it unchanged.
-    pub fn on_server_line(&mut self, line: &str) -> Result<Option<String>, ChannelError> {
-        let Ok(mut msg) = serde_json::from_str::<serde_json::Value>(line) else { return Ok(None) };
-        let Some(id) = msg.get("id").cloned() else { return Ok(None) };
+    /// A line from the server. Results of gated calls are persisted and
+    /// receipted *before* the caller forwards them (persistence-before-ack).
+    /// Server-initiated requests (sampling, elicitation, roots) are denied
+    /// unless listed in `policy.allow_server_methods`.
+    pub fn on_server_line(&mut self, line: &str) -> Result<Decision, ChannelError> {
+        let Ok(mut msg) = serde_json::from_str::<serde_json::Value>(line) else {
+            eprintln!("ductei-mcp-gate: dropped non-JSON line from server");
+            return Ok(Decision::Drop);
+        };
+        if !msg.is_object() {
+            eprintln!("ductei-mcp-gate: dropped non-object message from server");
+            return Ok(Decision::Drop);
+        }
+        if let Some(method) = msg.get("method").and_then(|m| m.as_str()).map(String::from) {
+            if method.starts_with("notifications/") || self.allow_server_methods.contains(&method) {
+                return Ok(Decision::Forward(msg.to_string()));
+            }
+            return Ok(self.deny_method(&msg, "server", &method));
+        }
+        let Some(id) = msg.get("id").cloned() else { return Ok(Decision::Forward(msg.to_string())) };
         let id_str = id.to_string();
 
         if self.pending_lists.remove(&id_str) {
-            let allow = self.allow.clone();
-            let Some(tools) = msg.pointer_mut("/result/tools").and_then(|t| t.as_array_mut()) else { return Ok(None) };
-            let before = tools.len();
-            let hidden: Vec<String> = tools.iter()
-                .filter_map(|t| t.get("name").and_then(|n| n.as_str()))
-                .filter(|n| !allow.contains(*n)).map(String::from).collect();
-            tools.retain(|t| t.get("name").and_then(|n| n.as_str()).map_or(false, |n| allow.contains(n)));
-            if tools.len() != before {
-                eprintln!("ductei-mcp-gate: tools/list filtered {} -> {} (hidden: {})", before, tools.len(), hidden.join(", "));
+            let allow = &self.allow;
+            if let Some(tools) = msg.pointer_mut("/result/tools").and_then(|t| t.as_array_mut()) {
+                let before = tools.len();
+                tools.retain(|t| t.get("name").and_then(|n| n.as_str()).is_some_and(|n| allow.contains(n)));
+                if tools.len() != before { eprintln!("ductei-mcp-gate: tools/list filtered {} -> {}", before, tools.len()); }
             }
-            return Ok(Some(msg.to_string()));
+            return Ok(Decision::Forward(msg.to_string()));
         }
 
-        let Some(p) = self.pending.remove(&id_str) else { return Ok(None) };
+        let Some(p) = self.pending.remove(&id_str) else { return Ok(Decision::Forward(msg.to_string())) };
         let body = msg.get("result").or_else(|| msg.get("error")).cloned().unwrap_or(serde_json::Value::Null);
         let blob = serde_json::to_vec(&body).unwrap_or_default();
         let lamport_result = self.next_lamport();
@@ -902,7 +1044,39 @@ impl Gate {
         self.receipts.record(ReceiptBody::new(p.key, p.scope, "accepted", p.lamport_call, lamport_result, p.call_sha256, sha256_hex(&blob)))
             .map_err(|e| ChannelError::Io(e.to_string()))?;
         self.maybe_anchor();
-        Ok(None)
+        Ok(Decision::Forward(msg.to_string()))
+    }
+}
+
+/// Canonical JSON of the rules in force, recorded at the start of every
+/// session. Lists are sorted so the same policy always hashes the same.
+pub fn policy_json(cfg: &Config) -> String {
+    let sorted = |v: &Vec<String>| { let mut v = v.clone(); v.sort(); v.dedup(); v };
+    let exe = Path::new(&cfg.server.command);
+    let server_sha256 = fs::read(exe).ok().map(|b| sha256_hex(&b));
+    serde_json::json!({
+        "v": 1,
+        "server": cfg.server.name,
+        "command": cfg.server.command,
+        "args": cfg.server.args,
+        "server_sha256": server_sha256,
+        "allow": sorted(&cfg.policy.allow),
+        "allow_methods": sorted(&cfg.policy.allow_methods),
+        "allow_server_methods": sorted(&cfg.policy.allow_server_methods),
+        "max_calls_per_session": cfg.policy.max_calls_per_session,
+        "scheme": cfg.sign.scheme.as_str(),
+        "pubkey_fingerprint": cfg.sign.pubkey_fingerprint,
+        "anchor_peers": sorted(&cfg.anchor.peers),
+    }).to_string()
+}
+
+/// Anchor peers must be on the tailnet (100.64.0.0/10, fd7a:115c:a1e0::/48)
+/// or loopback unless explicitly allowed: the head hash and its timing are
+/// nobody else's business.
+pub fn peer_allowed(addr: &std::net::SocketAddr) -> bool {
+    match addr.ip() {
+        std::net::IpAddr::V4(v4) => v4.is_loopback() || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xC0) == 64),
+        std::net::IpAddr::V6(v6) => v6.is_loopback() || v6.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
     }
 }
 
@@ -946,7 +1120,7 @@ mod tests {
     fn cfg(allow: &[&str], max: u32) -> Config {
         Config {
             server: ServerCfg { name: "t".into(), command: "true".into(), args: vec![] },
-            policy: PolicyCfg { allow: allow.iter().map(|s| s.to_string()).collect(), max_calls_per_session: max },
+            policy: PolicyCfg { allow: allow.iter().map(|s| s.to_string()).collect(), max_calls_per_session: max, allow_methods: vec![], allow_server_methods: vec![] },
             log: LogCfg::default(),
             sign: SignCfg::default(),
             anchor: AnchorCfg::default(),
@@ -975,7 +1149,7 @@ mod tests {
         let (peer, peer_dir) = anchor_peer();
         let d = tmp();
         let mut c = cfg(&["echo"], 10);
-        c.anchor = AnchorCfg { every: 1, peers: vec![peer.clone()], connect_timeout_ms: 2000 };
+        c.anchor = AnchorCfg { every: 1, peers: vec![peer.clone()], connect_timeout_ms: 2000, allow_public_peers: false };
         let (tx, rx) = std::sync::mpsc::channel();
         let mut g = Gate::open(&c, &d).unwrap();
         g.anchor_tx = Some(tx);
@@ -988,7 +1162,7 @@ mod tests {
         let outbox = d.join("outbox.jsonl");
         let mut pushed = 0;
         while let Ok(env) = rx.try_recv() {
-            assert_eq!(push_envelope(&peer, &env, std::time::Duration::from_secs(2), &outbox).unwrap(), 1);
+            assert_eq!(push_envelope(&peer, &env, std::time::Duration::from_secs(2), &outbox, false).unwrap(), 1);
             pushed += 1;
         }
         assert_eq!(pushed, 3);
@@ -1012,13 +1186,13 @@ mod tests {
     fn unreachable_peer_does_not_block_or_lose_the_local_anchor() {
         let d = tmp();
         let mut c = cfg(&["echo"], 10);
-        c.anchor = AnchorCfg { every: 1, peers: vec!["127.0.0.1:9".into()], connect_timeout_ms: 300 };
+        c.anchor = AnchorCfg { every: 1, peers: vec!["127.0.0.1:9".into()], connect_timeout_ms: 300, allow_public_peers: false };
         let mut g = Gate::open(&c, &d).unwrap();
         g.on_client_line(&call(1, "echo"));
         g.on_server_line(r#"{"jsonrpc":"2.0","id":1,"result":1}"#).unwrap();
         let env = g.anchor_now().unwrap();
         let t = std::time::Instant::now();
-        assert!(push_envelope("127.0.0.1:9", &env, std::time::Duration::from_millis(300), &d.join("outbox.jsonl")).is_err());
+        assert!(push_envelope("127.0.0.1:9", &env, std::time::Duration::from_millis(300), &d.join("outbox.jsonl"), false).is_err());
         assert!(t.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(g.anchors.replay(0).unwrap().0.len(), 1);
     }
@@ -1049,9 +1223,9 @@ mod tests {
     fn allowed_tool_is_forwarded_then_receipted() {
         let d = tmp();
         let mut g = Gate::open(&cfg(&["echo"], 10), &d).unwrap();
-        assert_eq!(g.on_client_line(&call(1, "echo")), Decision::Forward);
+        assert!(matches!(g.on_client_line(&call(1, "echo")), Decision::Forward(_)));
         assert_eq!(g.pending.len(), 1);
-        assert_eq!(g.on_server_line(r#"{"jsonrpc":"2.0","id":1,"result":{"content":[]}}"#).unwrap(), None);
+        assert!(matches!(g.on_server_line(r#"{"jsonrpc":"2.0","id":1,"result":{"content":[]}}"#).unwrap(), Decision::Forward(_)));
         assert!(g.pending.is_empty());
         let (log, _) = g.channel.replay(0).unwrap();
         assert_eq!(log.len(), 2);
@@ -1066,7 +1240,7 @@ mod tests {
         let mut g = Gate::open(&cfg(&["echo"], 10), &d).unwrap();
         match g.on_client_line(&call(7, "rm_rf")) {
             Decision::Reply(r) => assert!(r.contains("-32001") && r.contains("\"id\":7")),
-            Decision::Forward => panic!("denied call was forwarded"),
+            d => panic!("denied call was not refused: {d:?}"),
         }
         assert!(g.pending.is_empty());
         assert_eq!(g.channel.replay(0).unwrap().0.len(), 0, "denied call must not enter channel log");
@@ -1080,7 +1254,7 @@ mod tests {
     fn session_bound_closes_for_good() {
         let d = tmp();
         let mut g = Gate::open(&cfg(&["echo"], 1), &d).unwrap();
-        assert_eq!(g.on_client_line(&call(1, "echo")), Decision::Forward);
+        assert!(matches!(g.on_client_line(&call(1, "echo")), Decision::Forward(_)));
         assert!(matches!(g.on_client_line(&call(2, "echo")), Decision::Reply(r) if r.contains("-32002")));
         assert!(matches!(g.on_client_line(&call(3, "echo")), Decision::Reply(r) if r.contains("-32002")));
     }
@@ -1089,23 +1263,139 @@ mod tests {
     fn non_call_methods_pass_through() {
         let d = tmp();
         let mut g = Gate::open(&cfg(&[], 10), &d).unwrap();
-        assert_eq!(g.on_client_line(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#), Decision::Forward);
-        assert_eq!(g.on_client_line("not json"), Decision::Forward);
+        assert!(matches!(g.on_client_line(r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#), Decision::Forward(_)));
+        assert!(matches!(g.on_client_line(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#), Decision::Forward(_)));
     }
 
     #[test]
     fn tools_list_is_filtered_to_allowlist() {
         let d = tmp();
         let mut g = Gate::open(&cfg(&["latest_frame", "events"], 10), &d).unwrap();
-        assert_eq!(g.on_client_line(r#"{"jsonrpc":"2.0","id":5,"method":"tools/list"}"#), Decision::Forward);
+        assert!(matches!(g.on_client_line(r#"{"jsonrpc":"2.0","id":5,"method":"tools/list"}"#), Decision::Forward(_)));
         let answer = r#"{"jsonrpc":"2.0","id":5,"result":{"tools":[{"name":"latest_frame"},{"name":"delete_all"},{"name":"events"}],"nextCursor":null}}"#;
-        let out = g.on_server_line(answer).unwrap().expect("list answer is rewritten");
+        let Decision::Forward(out) = g.on_server_line(answer).unwrap() else { panic!("list answer not forwarded") };
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         let names: Vec<&str> = v["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert_eq!(names, ["latest_frame", "events"]);
         assert!(v["result"].get("nextCursor").is_some(), "other result fields are kept");
-        // A second answer with the same id is not a list answer any more.
-        assert_eq!(g.on_server_line(answer).unwrap(), None);
+        // A second answer with the same id is not a list answer any more: passed through whole.
+        assert!(matches!(g.on_server_line(answer).unwrap(), Decision::Forward(s) if s.contains("delete_all")));
+    }
+
+    fn reply_code(d: Decision) -> i64 {
+        let Decision::Reply(r) = d else { panic!("expected a reply, got {d:?}") };
+        serde_json::from_str::<serde_json::Value>(&r).unwrap()["error"]["code"].as_i64().unwrap()
+    }
+
+    #[test]
+    fn junk_batches_and_bad_ids_never_reach_the_server() {
+        let d = tmp();
+        let mut g = Gate::open(&cfg(&["echo"], 10), &d).unwrap();
+        assert_eq!(reply_code(g.on_client_line("not json")), -32700);
+        // A batch would smuggle a denied call past the per-message gate.
+        assert_eq!(reply_code(g.on_client_line(&format!("[{}]", call(1, "rm_rf")))), -32600);
+        assert_eq!(reply_code(g.on_client_line(r#"{"jsonrpc":"2.0","method":"tools/call","params":{"name":"echo"}}"#)), -32600);
+        assert!(matches!(g.on_client_line(&call(4, "echo")), Decision::Forward(_)));
+        assert_eq!(reply_code(g.on_client_line(&call(4, "echo"))), -32600, "in-flight id reused");
+        assert_eq!(g.pending.len(), 1);
+    }
+
+    #[test]
+    fn forwarded_line_is_what_the_gate_judged() {
+        let d = tmp();
+        let mut g = Gate::open(&cfg(&["echo"], 10), &d).unwrap();
+        // Duplicate "name": the gate's parser keeps one; the server must get that same one, once.
+        let line = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"rm_rf","name":"echo"}}"#;
+        let judged = serde_json::from_str::<serde_json::Value>(line).unwrap()["params"]["name"].as_str().unwrap().to_string();
+        match g.on_client_line(line) {
+            Decision::Forward(out) => {
+                assert_eq!(out.matches("\"name\"").count(), 1);
+                assert!(out.contains(&format!("\"name\":\"{judged}\"")));
+            }
+            Decision::Reply(_) => assert_ne!(judged, "echo"),
+            Decision::Drop => panic!("dropped"),
+        }
+    }
+
+    #[test]
+    fn non_tool_methods_are_deny_by_default_both_ways() {
+        let d = tmp();
+        let mut c = cfg(&["echo"], 10);
+        c.policy.allow_methods = vec!["resources/list".into()];
+        let mut g = Gate::open(&c, &d).unwrap();
+        assert_eq!(reply_code(g.on_client_line(r#"{"jsonrpc":"2.0","id":1,"method":"resources/read","params":{"uri":"file:///etc"}}"#)), -32001);
+        assert!(matches!(g.on_client_line(r#"{"jsonrpc":"2.0","id":2,"method":"resources/list"}"#), Decision::Forward(_)));
+        assert_eq!(g.on_client_line(r#"{"jsonrpc":"2.0","method":"secret/notify"}"#), Decision::Drop);
+        // Server asks the client's model to do something: refused, answered back to the server.
+        assert_eq!(reply_code(g.on_server_line(r#"{"jsonrpc":"2.0","id":"s1","method":"sampling/createMessage","params":{}}"#).unwrap()), -32001);
+        assert!(matches!(g.on_server_line(r#"{"jsonrpc":"2.0","method":"notifications/tools/list_changed"}"#).unwrap(), Decision::Forward(_)));
+        // Every refusal is on the signed timeline.
+        let rep = verify_receipts(&d, &unpinned()).unwrap();
+        assert!(rep.ok(), "{:?}", rep.errors);
+        assert_eq!(rep.receipts, 3);
+    }
+
+    #[test]
+    fn second_gate_on_same_dir_is_refused() {
+        let d = tmp();
+        let _g = Gate::open(&cfg(&["echo"], 10), &d).unwrap();
+        assert!(Gate::open(&cfg(&["echo"], 10), &d).err().unwrap().contains("already using"));
+    }
+
+    #[test]
+    fn damaged_chain_is_not_extended() {
+        let d = tmp();
+        {
+            let mut g = Gate::open(&cfg(&["echo"], 10), &d).unwrap();
+            g.on_client_line(&call(1, "echo"));
+            g.on_server_line(r#"{"jsonrpc":"2.0","id":1,"result":1}"#).unwrap();
+        }
+        let p = d.join("receipts.jsonl");
+        let mut text = fs::read_to_string(&p).unwrap();
+        text.push_str("{\"torn\":"); // a crash mid-write
+        fs::write(&p, text).unwrap();
+        assert!(Gate::open(&cfg(&["echo"], 10), &d).err().unwrap().contains("refusing to extend"));
+    }
+
+    #[test]
+    fn lamport_resumes_past_denied_and_anchor_writes() {
+        let d = tmp();
+        let mut c = cfg(&["echo"], 10);
+        c.anchor.every = 1;
+        let l1 = {
+            let mut g = Gate::open(&c, &d).unwrap();
+            g.on_client_line(&call(1, "nope")); // denied.jsonl + anchors.jsonl only
+            g.lamport
+        };
+        assert!(Gate::open(&c, &d).unwrap().lamport >= l1);
+    }
+
+    #[test]
+    fn session_receipt_records_policy_and_verifies() {
+        let d = tmp();
+        let mut c = cfg(&["echo"], 10);
+        let mut g = Gate::open(&c, &d).unwrap();
+        let p1 = policy_json(&c);
+        g.record_session(&p1, "{}").unwrap();
+        drop(g);
+        c.policy.allow.push("delete_all".into());
+        let p2 = policy_json(&c);
+        assert_ne!(sha256_hex(p1.as_bytes()), sha256_hex(p2.as_bytes()), "widening the allowlist changes the recorded policy");
+        Gate::open(&c, &d).unwrap().record_session(&p2, "{}").unwrap();
+        let rep = verify_receipts(&d, &unpinned()).unwrap();
+        assert!(rep.ok(), "{:?}", rep.errors);
+        fs::write(d.join("sessions.jsonl"), "").unwrap();
+        assert!(!verify_receipts(&d, &unpinned()).unwrap().ok(), "policy record removed");
+    }
+
+    #[test]
+    fn anchor_peers_must_be_tailnet_or_loopback() {
+        let ok = ["127.0.0.1:1", "100.64.0.1:1", "100.127.255.254:1", "[::1]:1", "[fd7a:115c:a1e0::1]:1"];
+        let bad = ["100.128.0.1:1", "8.8.8.8:1", "192.168.1.5:1", "[2001:db8::1]:1"];
+        for a in ok { assert!(peer_allowed(&a.parse().unwrap()), "{a}"); }
+        for a in bad { assert!(!peer_allowed(&a.parse().unwrap()), "{a}"); }
+        let env = scoped("k", &["s"], [0; 16], 0, b"x");
+        assert!(push_envelope("8.8.8.8:1", &env, std::time::Duration::from_millis(100), &tmp().join("o.jsonl"), false).unwrap_err().contains("not a tailnet"));
     }
 
     #[test]
