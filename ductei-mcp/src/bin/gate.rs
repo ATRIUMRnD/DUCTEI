@@ -11,7 +11,7 @@
 //! spawns the real server from [server] in the config. MCP stdio framing is
 //! newline-delimited JSON-RPC, so the relay is line based. The gate's own
 //! diagnostics go to stderr (stdout is the protocol channel).
-use ductei_mcp::{anchors_in, new_launch, push_envelope, sha256_hex, verify_receipts, Config, Decision, Gate, Signer, VerifyTrust, GATE_NONCE_ENV};
+use ductei_mcp::{anchors_in, new_launch, policy_json, push_envelope, sha256_hex, verify_receipts, Config, Decision, Gate, Signer, VerifyTrust, GATE_NONCE_ENV};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -78,6 +78,12 @@ fn verify(dir: &Path, flags: &[String]) -> i32 {
 fn run(config_path: &Path) -> i32 {
     let cfg = match Config::load(config_path) { Ok(c) => c, Err(e) => { eprintln!("ductei-mcp-gate: {e}"); return 2; } };
     let dir = cfg.log_dir(config_path);
+    if let Err(e) = std::fs::create_dir_all(&dir) { eprintln!("ductei-mcp-gate: {}: {e}", dir.display()); return 2; }
+    // Lock the dir down before anything is written in it, so every file
+    // inherits "this user + SYSTEM only".
+    if cfg.log.restrict_acl {
+        if let Err(e) = restrict_acl(&dir) { eprintln!("ductei-mcp-gate: {e} (set log.restrict_acl = false to skip)"); return 2; }
+    }
     let gate = match Gate::open(&cfg, &dir) { Ok(g) => g, Err(e) => { eprintln!("ductei-mcp-gate: {e}"); return 2; } };
     eprintln!("ductei-mcp-gate: server={} allow={:?} dir={}", cfg.server.name, cfg.policy.allow, dir.display());
     if gate.receipts.signer.created {
@@ -88,7 +94,7 @@ fn run(config_path: &Path) -> i32 {
     }
 
     // Launch nonce: the child can prove it was started by this gate.
-    let (nonce, _launch) = match new_launch(&dir, &cfg.server.name, gate.node) {
+    let (nonce, launch) = match new_launch(&dir, &cfg.server.name, gate.node) {
         Ok(x) => x,
         Err(e) => { eprintln!("ductei-mcp-gate: launch record: {e}"); return 2; }
     };
@@ -96,6 +102,12 @@ fn run(config_path: &Path) -> i32 {
     // Anchor pusher: one thread, never blocks the relay. Only the newest
     // unsent anchor is kept; an older one is superseded by construction.
     let mut gate = gate;
+    // The rules and server binary in force go on the timeline before any call does.
+    let policy = policy_json(&cfg);
+    if let Err(e) = gate.record_session(&policy, &serde_json::to_string(&launch).unwrap_or_default()) {
+        eprintln!("ductei-mcp-gate: {e}"); return 2;
+    }
+    eprintln!("ductei-mcp-gate: policy {}", &sha256_hex(policy.as_bytes())[..16]);
     let anchor_rx = if cfg.anchor.every > 0 && !cfg.anchor.peers.is_empty() {
         let (tx, rx) = mpsc::channel();
         gate.anchor_tx = Some(tx);
@@ -105,6 +117,7 @@ fn run(config_path: &Path) -> i32 {
         let peers = cfg.anchor.peers.clone();
         let timeout = Duration::from_millis(cfg.anchor.connect_timeout_ms);
         let outbox = dir.join("outbox.jsonl");
+        let public = cfg.anchor.allow_public_peers;
         thread::spawn(move || {
             let mut pending = None;
             let mut sent = 0u64;
@@ -112,7 +125,7 @@ fn run(config_path: &Path) -> i32 {
             for env in rx {
                 let mut ok_any = false;
                 for p in &peers {
-                    match push_envelope(p, &env, timeout, &outbox) {
+                    match push_envelope(p, &env, timeout, &outbox, public) {
                         Ok(1) | Ok(2) => ok_any = true,
                         Ok(code) => eprintln!("ductei-mcp-gate: anchor rejected by {p} (ack {code}); does its policy allow the anchor scope?"),
                         Err(e) => eprintln!("ductei-mcp-gate: anchor push failed: {e}"),
@@ -123,7 +136,7 @@ fn run(config_path: &Path) -> i32 {
             }
             // Channel closed: last chance for whatever is still unsent.
             if let Some(env) = pending {
-                for p in &peers { if matches!(push_envelope(p, &env, timeout, &outbox), Ok(1) | Ok(2)) { sent += 1; failed = failed.saturating_sub(1); break; } }
+                for p in &peers { if matches!(push_envelope(p, &env, timeout, &outbox, public), Ok(1) | Ok(2)) { sent += 1; failed = failed.saturating_sub(1); break; } }
             }
             eprintln!("ductei-mcp-gate: anchors pushed={sent} unsent={failed}");
         })
@@ -141,15 +154,24 @@ fn run(config_path: &Path) -> i32 {
         Ok(c) => c,
         Err(e) => { eprintln!("ductei-mcp-gate: spawn {}: {e}", cfg.server.command); return 2; }
     };
-    let mut child_in = child.stdin.take().expect("piped stdin");
+    // Both relay threads may write to the server (the server thread answers
+    // refused server-initiated requests), so its stdin is shared.
+    let child_in = Arc::new(Mutex::new(Some(child.stdin.take().expect("piped stdin"))));
     let child_out = child.stdout.take().expect("piped stdout");
 
     let gate = Arc::new(Mutex::new(gate));
     let client_out = Arc::new(Mutex::new(std::io::stdout()));
+    let send = |w: &Mutex<Option<std::process::ChildStdin>>, line: &str| -> bool {
+        let mut w = w.lock().unwrap();
+        match w.as_mut() { Some(s) => writeln!(s, "{line}").and_then(|_| s.flush()).is_ok(), None => false }
+    };
+    let emit = |o: &Mutex<std::io::Stdout>, line: &str| -> bool {
+        let mut o = o.lock().unwrap();
+        writeln!(o, "{line}").and_then(|_| o.flush()).is_ok()
+    };
 
     // client -> gate -> server
-    let g1 = Arc::clone(&gate);
-    let o1 = Arc::clone(&client_out);
+    let (g1, o1, i1) = (Arc::clone(&gate), Arc::clone(&client_out), Arc::clone(&child_in));
     let to_server = thread::spawn(move || {
         let stdin = std::io::stdin();
         for line in stdin.lock().lines() {
@@ -157,36 +179,29 @@ fn run(config_path: &Path) -> i32 {
             if line.trim().is_empty() { continue; }
             let decision = g1.lock().unwrap().on_client_line(&line);
             match decision {
-                Decision::Forward => {
-                    if writeln!(child_in, "{line}").and_then(|_| child_in.flush()).is_err() { break; }
-                }
-                Decision::Reply(reply) => {
-                    let mut o = o1.lock().unwrap();
-                    let _ = writeln!(o, "{reply}").and_then(|_| o.flush());
-                }
+                Decision::Forward(out) => { if !send(&i1, &out) { break; } }
+                Decision::Reply(reply) => { emit(&o1, &reply); }
+                Decision::Drop => {}
             }
         }
-        // client went away: closing child stdin tells the server to exit
+        // Client went away: closing the server's stdin tells it to exit.
+        i1.lock().unwrap().take();
     });
 
     // server -> gate -> client
-    let g2 = Arc::clone(&gate);
-    let o2 = Arc::clone(&client_out);
+    let (g2, o2, i2) = (Arc::clone(&gate), Arc::clone(&client_out), Arc::clone(&child_in));
     let to_client = thread::spawn(move || {
         for line in BufReader::new(child_out).lines() {
             let Ok(line) = line else { break };
             if line.trim().is_empty() { continue; }
-            let out = match g2.lock().unwrap().on_server_line(&line) {
-                Ok(Some(rewritten)) => rewritten,
-                Ok(None) => line,
-                Err(e) => {
-                    // persistence-before-ack: a result we could not persist is not returned
-                    eprintln!("ductei-mcp-gate: dropping result, persist failed: {e:?}");
-                    continue;
-                }
-            };
-            let mut o = o2.lock().unwrap();
-            if writeln!(o, "{out}").and_then(|_| o.flush()).is_err() { break; }
+            let decision = g2.lock().unwrap().on_server_line(&line);
+            match decision {
+                Ok(Decision::Forward(out)) => { if !emit(&o2, &out) { break; } }
+                Ok(Decision::Reply(reply)) => { send(&i2, &reply); }
+                Ok(Decision::Drop) => {}
+                // persistence-before-ack: a result we could not persist is not returned
+                Err(e) => eprintln!("ductei-mcp-gate: dropping result, persist failed: {e:?}"),
+            }
         }
     });
 
@@ -209,4 +224,28 @@ fn run(config_path: &Path) -> i32 {
     if let Some(t) = anchor_thread { let _ = t.join(); }
     let _ = std::fs::remove_file(dir.join(ductei_mcp::GATE_LAUNCH_FILE));
     status
+}
+
+/// Reset the log dir's ACL to the current user and SYSTEM, recursively.
+/// Inherited entries (Users, Authenticated Users, ...) are removed, so other
+/// accounts on this machine cannot read or edit the logs or the wrapped key.
+#[cfg(windows)]
+fn restrict_acl(dir: &Path) -> Result<(), String> {
+    let user = match (std::env::var("USERDOMAIN"), std::env::var("USERNAME")) {
+        (Ok(d), Ok(u)) => format!("{d}\\{u}"),
+        _ => return Err("restrict_acl: USERDOMAIN/USERNAME not set".into()),
+    };
+    let out = Command::new("icacls").arg(dir)
+        .args(["/inheritance:r", "/grant:r", &format!("{user}:(OI)(CI)F"), "*S-1-5-18:(OI)(CI)F", "/T", "/Q"])
+        .output().map_err(|e| format!("restrict_acl: icacls: {e}"))?;
+    if out.status.success() { Ok(()) } else {
+        Err(format!("restrict_acl: icacls failed: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+    }
+}
+
+/// Elsewhere: owner-only permissions on the dir.
+#[cfg(not(windows))]
+fn restrict_acl(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).map_err(|e| format!("restrict_acl: {e}"))
 }

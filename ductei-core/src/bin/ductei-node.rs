@@ -24,7 +24,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SCOPE_HB: &str = "ductei.heartbeat";
 const MAX_RESTARTS_PER_HOUR: usize = 3;
-const USAGE: &str = "usage: ductei-node run|supervise --name N --id ID --listen ADDR --peer NAME=ADDR --dir DIR [--beat-secs S --suspect-secs S --unreachable-secs S]";
+const USAGE: &str = "usage: ductei-node run|supervise --name N --id ID --listen ADDR --peer NAME=ADDR --dir DIR [--beat-secs S --suspect-secs S --unreachable-secs S] [--allow-scope SCOPE]...";
 
 #[derive(Clone)]
 struct Cfg {
@@ -37,6 +37,7 @@ struct Cfg {
     suspect: u64,
     unreachable: u64,
     html: Option<PathBuf>,
+    allow: Vec<String>,
 }
 
 type Seen = Arc<Mutex<HashMap<String, (Instant, u64)>>>;
@@ -78,6 +79,7 @@ fn parse(args: &[String]) -> Cfg {
         suspect: 90,
         unreachable: 300,
         html: None,
+        allow: vec![],
     };
     let mut i = 0;
     while i < args.len() {
@@ -99,6 +101,7 @@ fn parse(args: &[String]) -> Cfg {
             "--suspect-secs" => c.suspect = num(v()),
             "--unreachable-secs" => c.unreachable = num(v()),
             "--html" => c.html = Some(PathBuf::from(v())),
+            "--allow-scope" => c.allow.push(v()),
             other => die(&format!("unknown flag {other}\n{USAGE}")),
         }
         i += 2;
@@ -167,7 +170,7 @@ fn run(c: Cfg) {
         die("refusing to bind a wildcard address; use the Tailscale IP");
     }
     std::fs::create_dir_all(&c.dir).unwrap_or_else(|e| die(&format!("mkdir {}: {e}", c.dir.display())));
-    let policy = || ScopePolicy::new().allow(SCOPE_HB);
+    let policy = || c.allow.iter().fold(ScopePolicy::new().allow(SCOPE_HB), |p, s| p.allow(s));
     let open = |log: &str, rej: &str| -> Channel {
         Channel::open(policy(), c.dir.join(log), c.dir.join(rej)).unwrap_or_else(|e| die(&format!("open {log}: {e}")))
     };

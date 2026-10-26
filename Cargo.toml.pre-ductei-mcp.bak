@@ -1,0 +1,3 @@
+[workspace]
+resolver = "2"
+members = ["ductei-core","ductei-limen","ductei-qallow","ductei-veyn","conformance/emitter"]
