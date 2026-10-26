@@ -999,3 +999,25 @@ fn veyn_rem_events_pass_uncoalesced() {
     }
     assert_eq!(accepted, 50);
 }
+
+#[cfg(feature = "net")]
+#[test]
+fn transport_connect_is_bounded_when_peer_does_not_answer() {
+    use std::time::{Duration, Instant};
+    // 192.0.2.0/24 is reserved for documentation (RFC 5737): nothing answers there.
+    let addr = "192.0.2.1:7";
+    let t = Instant::now();
+    assert!(ductei_core::transport::TcpClient::connect_timeout(addr, Duration::from_millis(300)).is_err());
+    assert!(t.elapsed() < Duration::from_secs(3));
+
+    let p = tmp("t5b.jsonl");
+    let r = tmp("t5br.jsonl");
+    let _ = std::fs::remove_file(&p);
+    let mut local = Channel::open(ScopePolicy::new().allow("qallow.semantic.cert"), &p, &r).unwrap();
+    let t = Instant::now();
+    let path = ductei_core::transport::send_local_first(addr, &env("a", &["qallow.semantic.cert"], 1, 1), &mut local, tmp("t5b-outbox.jsonl")).unwrap();
+    assert_eq!(path, DeliveryPath::LocalFallback);
+    assert!(t.elapsed() < Duration::from_secs(4), "the default connect timeout must bound the send");
+    let (envs, _) = local.replay(0).unwrap();
+    assert_eq!(envs.len(), 1);
+}

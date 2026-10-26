@@ -1,0 +1,30 @@
+[package]
+name = "ductei-mcp"
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "ductei-mcp-gate: a scoped, persisted, receipt-signing stdio gateway in front of any MCP server"
+
+[features]
+# ML-DSA receipt signing (FIPS 204). Off by default so the gate builds with
+# no PQ crates; receipts are still hash-chained, just unsigned (scheme = "none").
+sign = ["dep:pqcrypto-mldsa", "dep:pqcrypto-traits"]
+
+[dependencies]
+ductei-core = { path = "../ductei-core", features = ["net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+sha2 = "0.10"
+getrandom = "0.2"
+zeroize = "1"
+pqcrypto-mldsa = { version = "0.1", optional = true }
+pqcrypto-traits = { version = "0.3", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# DPAPI (Data Protection API) wrapping of the signing key, user-scoped.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Memory"] }
+
+[[bin]]
+name = "ductei-mcp-gate"
+path = "src/bin/gate.rs"

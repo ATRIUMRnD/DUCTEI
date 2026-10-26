@@ -11,6 +11,14 @@ use crate::{outbox::Outbox, Channel, ChannelError, Envelope};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{PathBuf, Path};
+use std::time::Duration;
+
+/// How long a sender waits for a peer to accept a connection before it
+/// counts as unreachable. Without a bound, a peer that silently drops
+/// packets stalls the caller for a minute or more.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a sender waits for the ack byte once connected.
+pub const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub trait Transport {
     fn send_envelope(&mut self, env: &Envelope) -> Result<bool, ChannelError>;
@@ -61,13 +69,30 @@ pub struct TcpClient {
 }
 impl TcpClient {
     pub fn connect(addr: impl ToSocketAddrs) -> std::io::Result<Self> {
-        Ok(Self { stream: TcpStream::connect(addr)?, outbox_path: default_outbox_path() })
+        Self::connect_timeout(addr, CONNECT_TIMEOUT)
     }
     /// Attach a durable outbound intent/receipt log. When set, the client
     /// records intents before any network write and receipts before returning.
     pub fn with_outbox_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.outbox_path = path.into();
         self
+    }
+
+    /// Try each resolved address with a bounded wait; the stream also gets
+    /// bounded read and write waits so a stuck peer cannot hang the sender.
+    pub fn connect_timeout(addr: impl ToSocketAddrs, timeout: Duration) -> std::io::Result<Self> {
+        let mut last = std::io::Error::new(std::io::ErrorKind::InvalidInput, "no address resolved");
+        for a in addr.to_socket_addrs()? {
+            match TcpStream::connect_timeout(&a, timeout) {
+                Ok(stream) => {
+                    stream.set_read_timeout(Some(ACK_TIMEOUT))?;
+                    stream.set_write_timeout(Some(ACK_TIMEOUT))?;
+                    return Ok(Self { stream, outbox_path: default_outbox_path() });
+                }
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
     }
 }
 impl Transport for TcpClient {

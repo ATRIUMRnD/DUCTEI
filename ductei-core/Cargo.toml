@@ -25,6 +25,16 @@ rcgen = { version = "0.13", optional = true }
 pqcrypto-mlkem = { version = "0.1", optional = true }
 pqcrypto-traits = { version = "0.3", optional = true }
 
+[[bin]]
+name = "ductei-net-smoke"
+path = "src/bin/ductei-net-smoke.rs"
+required-features = ["net"]
+
+[[bin]]
+name = "ductei-node"
+path = "src/bin/ductei-node.rs"
+required-features = ["net"]
+
 [build-dependencies]
 tonic-build = { version = "0.11", optional = true }
 protoc-bin-vendored = { version = "3", optional = true }
