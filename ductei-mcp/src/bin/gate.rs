@@ -11,14 +11,15 @@
 //! spawns the real server from [server] in the config. MCP stdio framing is
 //! newline-delimited JSON-RPC, so the relay is line based. The gate's own
 //! diagnostics go to stderr (stdout is the protocol channel).
-use ductei_mcp::{sha256_hex, verify_receipts, Config, Decision, Gate, Signer, VerifyTrust};
+use ductei_mcp::{anchors_in, new_launch, push_envelope, sha256_hex, verify_receipts, Config, Decision, Gate, Signer, VerifyTrust, GATE_NONCE_ENV};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
-const USAGE: &str = "usage: ductei-mcp-gate run <config.toml>\n       ductei-mcp-gate verify <ductei_dir> [--pubkey <file> | --fingerprint <hex> | --allow-unpinned]\n       ductei-mcp-gate fingerprint <ductei_dir>";
+const USAGE: &str = "usage: ductei-mcp-gate run <config.toml>\n       ductei-mcp-gate verify <ductei_dir> [--pubkey <file> | --fingerprint <hex> | --allow-unpinned] [--anchor <seq>:<hash>] [--anchor-file <peer channel.jsonl>]\n       ductei-mcp-gate fingerprint <ductei_dir>";
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -50,6 +51,16 @@ fn verify(dir: &Path, flags: &[String]) -> i32 {
             }
             "--fingerprint" if i + 1 < flags.len() => { trust.fingerprint = Some(flags[i + 1].clone()); i += 2; }
             "--allow-unpinned" => { trust.allow_unpinned = true; i += 1; }
+            "--anchor" if i + 1 < flags.len() => {
+                let Some((seq, head)) = flags[i + 1].split_once(':') else { eprintln!("--anchor wants <seq>:<hash>"); return 2; };
+                let Ok(seq) = seq.parse::<u64>() else { eprintln!("--anchor: bad seq"); return 2; };
+                trust.pinned_head = Some((seq, head.to_string()));
+                i += 2;
+            }
+            "--anchor-file" if i + 1 < flags.len() => {
+                match anchors_in(Path::new(&flags[i + 1])) { Ok(a) => trust.anchors.extend(a), Err(e) => { eprintln!("--anchor-file: {e}"); return 2; } }
+                i += 2;
+            }
             _ => { eprintln!("{USAGE}"); return 2; }
         }
     }
@@ -76,8 +87,52 @@ fn run(config_path: &Path) -> i32 {
         eprintln!("ductei-mcp-gate: signing key {}{}", gate.receipts.signer.kid, if cfg.sign.pubkey_fingerprint.is_some() { " (pinned)" } else { " (NOT pinned)" });
     }
 
+    // Launch nonce: the child can prove it was started by this gate.
+    let (nonce, _launch) = match new_launch(&dir, &cfg.server.name, gate.node) {
+        Ok(x) => x,
+        Err(e) => { eprintln!("ductei-mcp-gate: launch record: {e}"); return 2; }
+    };
+
+    // Anchor pusher: one thread, never blocks the relay. Only the newest
+    // unsent anchor is kept; an older one is superseded by construction.
+    let mut gate = gate;
+    let anchor_rx = if cfg.anchor.every > 0 && !cfg.anchor.peers.is_empty() {
+        let (tx, rx) = mpsc::channel();
+        gate.anchor_tx = Some(tx);
+        Some(rx)
+    } else { None };
+    let anchor_thread = anchor_rx.map(|rx| {
+        let peers = cfg.anchor.peers.clone();
+        let timeout = Duration::from_millis(cfg.anchor.connect_timeout_ms);
+        let outbox = dir.join("outbox.jsonl");
+        thread::spawn(move || {
+            let mut pending = None;
+            let mut sent = 0u64;
+            let mut failed = 0u64;
+            for env in rx {
+                let mut ok_any = false;
+                for p in &peers {
+                    match push_envelope(p, &env, timeout, &outbox) {
+                        Ok(1) | Ok(2) => ok_any = true,
+                        Ok(code) => eprintln!("ductei-mcp-gate: anchor rejected by {p} (ack {code}); does its policy allow the anchor scope?"),
+                        Err(e) => eprintln!("ductei-mcp-gate: anchor push failed: {e}"),
+                    }
+                }
+                // Newest anchor always wins; an unsent older one is superseded.
+                pending = if ok_any { sent += 1; None } else { failed += 1; Some(env) };
+            }
+            // Channel closed: last chance for whatever is still unsent.
+            if let Some(env) = pending {
+                for p in &peers { if matches!(push_envelope(p, &env, timeout, &outbox), Ok(1) | Ok(2)) { sent += 1; failed = failed.saturating_sub(1); break; } }
+            }
+            eprintln!("ductei-mcp-gate: anchors pushed={sent} unsent={failed}");
+        })
+    });
+
     let mut child = match Command::new(&cfg.server.command)
         .args(&cfg.server.args)
+        .env(GATE_NONCE_ENV, &nonce)
+        .env("DUCTEI_GATE_DIR", &dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -138,7 +193,20 @@ fn run(config_path: &Path) -> i32 {
     let _ = to_client.join();
     let _ = to_server.join();
     let status = child.wait().map(|s| s.code().unwrap_or(1)).unwrap_or(1);
-    let g = gate.lock().unwrap();
-    eprintln!("ductei-mcp-gate: exit, calls={} receipts={} head={}", g.calls, g.receipts.seq, &g.receipts.head[..16]);
+    {
+        let mut g = gate.lock().unwrap();
+        // Anchor the final head on exit even if it is not on an `every` boundary,
+        // then close the channel so the pusher drains and stops.
+        if cfg.anchor.every > 0 {
+            if let Some(env) = g.anchor_now() {
+                let _ = g.anchors.append(&env);
+                if let Some(tx) = &g.anchor_tx { let _ = tx.send(env); }
+            }
+        }
+        g.anchor_tx = None;
+        eprintln!("ductei-mcp-gate: exit, calls={} receipts={} head={}", g.calls, g.receipts.seq, &g.receipts.head[..16]);
+    }
+    if let Some(t) = anchor_thread { let _ = t.join(); }
+    let _ = std::fs::remove_file(dir.join(ductei_mcp::GATE_LAUNCH_FILE));
     status
 }
