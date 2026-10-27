@@ -17,8 +17,6 @@ pub mod transport;
 pub mod grpc;
 #[cfg(feature = "quic")]
 pub mod quic;
-#[cfg(feature = "pq")]
-pub mod pq;
 /// Durable outbound intent/receipt log (separate from accepted log).
 pub mod outbox;
 /// Kani proof harnesses for the hard invariants (`cargo kani`); the same

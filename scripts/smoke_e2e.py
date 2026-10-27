@@ -141,7 +141,9 @@ def scenario_good_job(spool: Path, ductei: Path, limen_dir: Path, relay: Path) -
         # is "required fields present, nothing outside the known set", not an
         # exact match that breaks on every additive change.
         required = {"job_id", "backend", "tier", "success_probability", "lamport"}
-        allowed = required | {"fidelity_estimate", "fidelity_target", "target_met"}
+        # limend adds an optional human-readable "note" when a job misses its
+        # fidelity target (LIMEN limen/limend/daemon.py, tests/test_limend.py).
+        allowed = required | {"fidelity_estimate", "fidelity_target", "target_met", "note"}
         check(required <= set(cert) <= allowed,
               "cert carries the CertSummary fields and nothing outside the known set",
               f"required {sorted(required)}, allowed extras {sorted(allowed - required)}; "

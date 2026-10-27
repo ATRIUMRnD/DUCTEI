@@ -36,6 +36,7 @@ Channel, not merger. Per-repo adapters over shared structs.
 | `ductei-limen` | LIMEN cert JSON -> `qallow.semantic.cert` envelopes (closed type) |
 | `ductei-qallow` | Envelope <-> Qallow QSW proto v1/v2 bytes (pure Rust, byte-compatible); `ingest` (Qallow-side merge seam) |
 | `ductei-veyn` | VEYN sensor/actuator events -> scoped envelopes. Narrow deny-by-default scopes (`veyn.rem_event`, `veyn.hrv`, `veyn.sensor.*`, `veyn.actuator.watch`); `Adapter` applies a per-scope `CoalescePolicy` (HRV sampled to 1/min) before conversion so raw firehose stays inside VEYN |
+| `ductei-sync` | Peer sync agent (feature `net`, off by default): `serve` persists peers' envelopes into `inbound/`, `push` ships this node's own envelopes to every peer (full mesh, origin-only, persistence-first ack, IP allow-list). State-dir contract in `ductei-sync/src/lib.rs`. First producer: brain corrections (`scripts/smoke_brain_sync.py`) |
 | `conformance/` | Rust emitter + C verifier linking Qallow's real `sync_wire.c` |
 
 ## Transport
@@ -65,12 +66,8 @@ persistence-first ack contract, same `Channel` on the receiving side:
   so there's no CA here — the server presents a self-signed cert
   (`generate_self_signed`) that clients pin by DER bytes out-of-band.
 
-## Post-quantum key exchange (feature `pq`)
-`ductei_core::pq`: ML-KEM-768 (FIPS 203) via `pqcrypto-mlkem`, for
-establishing a session key ahead of the transport layer. This does not
-touch the `Envelope` wire format or scope model — it complements LIMEN's
-ML-DSA-65 signing with a matching post-quantum key-exchange primitive
-instead of only classical TLS.
+## Post-quantum transport crypto
+The ML-KEM-768 transport encryption lives in QFLTL's `qfltl-crypto` crate and is used by `ductei-sync --features qfltl` (mutually authenticated, forward-secret handshake; see `ductei-sync/src/qfltl_transport.rs`). The earlier unused `ductei_core::pq` wrapper was removed so the stack has one ML-KEM implementation.
 
 ## QSW proto v2
 `ductei_qallow::v2`: scopes as a length-prefixed native wire field instead

@@ -1,0 +1,42 @@
+[package]
+name = "ductei-sync"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Peer sync agent: pushes a node's own envelopes to peers over the DUCTEI TCP transport"
+
+[lib]
+name = "ductei_sync"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ductei-sync"
+path = "src/main.rs"
+required-features = ["net"]
+
+# Uses StateDir, which only exists with `net` (lib.rs is #![cfg(feature = "net")]);
+# without this, plain `cargo test --workspace` fails to build the example.
+[[example]]
+name = "emit_test_envelope"
+required-features = ["net"]
+
+[features]
+# Off by default on purpose. `cargo test --workspace` (the default CI path)
+# must keep ductei-core free of network code (GAP 4); turning this on would
+# unify `ductei-core/net` into every crate of a workspace build.
+net = ["ductei-core/net"]
+# QFLTL-encrypted transport (ATRIUM Task 6 scope, see lib.rs doc comment).
+# Off by default and implies `net`; pulls in the standalone qfltl-crypto
+# crate only (no GUI/CUDA/physics-engine surface from qfltl-core).
+# On Windows the identity seed is DPAPI-wrapped at rest (same pattern and
+# windows-sys version as ductei-mcp's signing-key store).
+qfltl = ["net", "dep:qfltl-crypto", "dep:zeroize", "dep:windows-sys"]
+
+[dependencies]
+serde_json = "1"
+ductei-core = { path = "../ductei-core" }
+qfltl-crypto = { path = "../../../QFLTL/crates/core/qfltl-crypto", optional = true }
+zeroize = { version = "1", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", optional = true, features = ["Win32_Foundation", "Win32_Security_Cryptography"] }

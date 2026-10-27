@@ -8,7 +8,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: cargo test --workspace
       - run: cargo test --workspace --features ductei-core/net
-      - run: cargo test --workspace --features ductei-core/pq
+      # ductei-sync is network-only, so it is opt-in (see its Cargo.toml).
+      - run: cargo test -p ductei-sync --features net
       - name: conformance vs Qallow C decoder
         run: |
           git clone --depth 1 https://github.com/xingxerx/Qallow.git /tmp/Qallow
@@ -20,6 +21,14 @@ jobs:
           # v2 decoder, so this commit lands only after Qallow's.
           ./target/debug/emit /tmp/stream_v2.bin v2
           ./conformance/verify /tmp/stream_v2.bin v2
+      # Field-level breakdown of the streams the C decoder just rejected,
+      # so a conformance failure names the frame and field in the log.
+      - name: qsw-inspect conformance streams (on failure only)
+        if: failure()
+        run: |
+          for s in /tmp/stream.bin /tmp/stream_v2.bin; do
+            [ -f "$s" ] && cargo run -q -p qsw-inspect -- decode "$s" || true
+          done
 
   # End-to-end smoke: limend -> ductei-limen-relay, four scenarios
   # (good job, restart replicability, malformed request, malformed cert)

@@ -11,7 +11,9 @@ license = "Apache-2.0"
 net = []
 grpc = ["net", "dep:tonic", "dep:prost", "dep:tokio", "dep:tonic-build", "dep:protoc-bin-vendored"]
 quic = ["net", "dep:quinn", "dep:rustls", "dep:rcgen", "dep:tokio"]
-pq = ["dep:pqcrypto-mlkem", "dep:pqcrypto-traits"]
+# Post-quantum transport crypto lives in QFLTL's qfltl-crypto (used by
+# ductei-sync --features qfltl); the unused `pq` wrapper was removed so the
+# stack has one ML-KEM implementation.
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -22,8 +24,6 @@ tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros",
 quinn = { version = "0.11", optional = true }
 rustls = { version = "0.23", features = ["ring"], optional = true }
 rcgen = { version = "0.13", optional = true }
-pqcrypto-mlkem = { version = "0.1", optional = true }
-pqcrypto-traits = { version = "0.3", optional = true }
 
 [[bin]]
 name = "ductei-net-smoke"
