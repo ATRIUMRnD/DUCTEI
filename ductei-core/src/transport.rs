@@ -63,19 +63,20 @@ fn read_frame(r: &mut impl Read) -> std::io::Result<Option<Envelope>> {
     Ok(Some(serde_json::from_slice(&body)?))
 }
 
-pub struct TcpClient {
-    stream: TcpStream,
+/// `S` defaults to `TcpStream` so every existing call site (`TcpClient`,
+/// unparameterized) is unaffected. A non-default `S` lets a caller plug in
+/// any `Read + Write` byte stream in place of the raw socket -- e.g. the
+/// `qfltl` feature's `EncryptedStream`, which wraps a `TcpStream` with
+/// post-quantum session crypto -- without this module needing to know
+/// encryption exists. The wire format (`write_frame`/`read_frame`/ack byte)
+/// is unchanged either way.
+pub struct TcpClient<S = TcpStream> {
+    stream: S,
     outbox_path: PathBuf,
 }
-impl TcpClient {
+impl TcpClient<TcpStream> {
     pub fn connect(addr: impl ToSocketAddrs) -> std::io::Result<Self> {
         Self::connect_timeout(addr, CONNECT_TIMEOUT)
-    }
-    /// Attach a durable outbound intent/receipt log. When set, the client
-    /// records intents before any network write and receipts before returning.
-    pub fn with_outbox_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.outbox_path = path.into();
-        self
     }
 
     /// Try each resolved address with a bounded wait; the stream also gets
@@ -95,7 +96,24 @@ impl TcpClient {
         Err(last)
     }
 }
-impl Transport for TcpClient {
+impl<S> TcpClient<S> {
+    /// Attach a durable outbound intent/receipt log. When set, the client
+    /// records intents before any network write and receipts before returning.
+    pub fn with_outbox_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.outbox_path = path.into();
+        self
+    }
+}
+impl<S: Read + Write> TcpClient<S> {
+    /// Build a client over an already-established stream (e.g. a `TcpStream`
+    /// already wrapped as an `EncryptedStream` after a QFLTL handshake),
+    /// instead of connecting one directly. The caller owns connect timeouts
+    /// and any handshake that has to happen before frames can flow.
+    pub fn from_stream(stream: S) -> Self {
+        Self { stream, outbox_path: default_outbox_path() }
+    }
+}
+impl<S: Read + Write> Transport for TcpClient<S> {
     /// Returns Ok(true) only after the remote has persisted the envelope.
     fn send_envelope(&mut self, env: &Envelope) -> Result<bool, ChannelError> {
         // Record outbound intent before any I/O.
@@ -140,14 +158,16 @@ fn peer_gone(e: &std::io::Error) -> bool {
 }
 
 /// `serve_connection` over any byte stream, so the reset/abort paths can be
-/// tested deterministically instead of depending on OS socket timing.
+/// tested deterministically instead of depending on OS socket timing, and so
+/// a caller (e.g. the `qfltl` feature) can serve an `EncryptedStream` the
+/// same way `serve_connection` serves a raw `TcpStream`.
 ///
 /// A vanished peer ends the connection normally and returns the count of
 /// envelopes accepted so far. That count is the truth about what was
 /// persisted: an envelope is only counted after `Channel::send` returned
 /// Ok (fsynced), and the ack is written after that, so losing the ack never
 /// loses data. Every other I/O error is still returned to the caller.
-pub(crate) fn serve_stream<S: Read + Write>(mut stream: S, ch: &mut Channel) -> std::io::Result<usize> {
+pub fn serve_stream<S: Read + Write>(mut stream: S, ch: &mut Channel) -> std::io::Result<usize> {
     let mut accepted = 0usize;
     loop {
         let env = match read_frame(&mut stream) {
@@ -210,7 +230,7 @@ pub fn send_local_first(
     outbox_path: impl AsRef<Path>,
 ) -> Result<DeliveryPath, ChannelError> {
     match TcpClient::connect(addr) {
-        Ok(mut client) => {
+        Ok(client) => {
             let p: PathBuf = outbox_path.as_ref().to_path_buf();
             match client.with_outbox_path(p).send_envelope(env) {
             Ok(accepted) => {

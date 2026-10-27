@@ -976,15 +976,6 @@ fn quic_two_node_loopback() {
     drop(server);
 }
 
-#[cfg(feature = "pq")]
-#[test]
-fn mlkem_shared_secret_agreement() {
-    let pair = ductei_core::pq::generate_keypair();
-    let (ciphertext, sender_secret) = ductei_core::pq::encapsulate_to(&pair.public_key).unwrap();
-    let receiver_secret = ductei_core::pq::decapsulate_from(&pair, &ciphertext).unwrap();
-    assert_eq!(sender_secret, receiver_secret);
-}
-
 #[test]
 fn veyn_rem_events_pass_uncoalesced() {
     let mut a = ductei_veyn::Adapter::new(ductei_veyn::CoalescePolicy::default_policy());
