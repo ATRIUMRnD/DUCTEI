@@ -1,11 +1,18 @@
 name: ci
 on: [push, pull_request]
+permissions:
+  contents: read
+
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
       - run: cargo test --workspace
       - run: cargo test --workspace --features ductei-core/net
       - run: cargo test --workspace --features ductei-core/pq
@@ -31,9 +38,13 @@ jobs:
       # deliberate, auditable commit, never an implicit float to main.
       LIMEN_REV: fd3f505d01be871d3b547221f384666b1d013326
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: checkout LIMEN at pinned rev
@@ -59,9 +70,13 @@ jobs:
       LIMEN_REV: fd3f505d01be871d3b547221f384666b1d013326
       QALLOW_REV: e69ebd0acaa005916e9207537b34aabe8ce25a01
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: checkout LIMEN at pinned rev
@@ -89,15 +104,20 @@ jobs:
       VEYN_REV: 06cb9eaa4b1f970ac20c596d4da0c4e19c2a3ede
       QALLOW_REV: e69ebd0acaa005916e9207537b34aabe8ce25a01
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: checkout VEYN at pinned rev
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: CGXDevTeam/VEYN
+          persist-credentials: false
+          repository: ATRIUMRnD/VEYN
           ref: ${{ env.VEYN_REV }}
           path: veyn-checkout
           token: ${{ secrets.VEYN_READ_TOKEN }}
@@ -133,9 +153,13 @@ jobs:
       # expected red and must not be a required check.
       QALLOW_REV: e69ebd0acaa005916e9207537b34aabe8ce25a01
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
       - name: checkout LIMEN at pinned rev
@@ -145,9 +169,10 @@ jobs:
       - name: install LIMEN (simulator path only, no QPU extras)
         run: pip install /tmp/LIMEN
       - name: checkout VEYN at pinned rev
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          repository: CGXDevTeam/VEYN
+          persist-credentials: false
+          repository: ATRIUMRnD/VEYN
           ref: ${{ env.VEYN_REV }}
           path: veyn-checkout
           token: ${{ secrets.VEYN_READ_TOKEN }}
