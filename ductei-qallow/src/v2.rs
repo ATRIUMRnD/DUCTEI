@@ -1,9 +1,11 @@
 //! QSW proto v2: scopes as a native wire field instead of the v1
 //! key-prefix shim. Frame layout unchanged (u8 type | u32 body_len | body);
-//! only the ENVELOPE body layout changes. Lives alongside v1 unchanged —
+//! only the ENVELOPE body layout changes. Lives alongside v1 unchanged:
 //! v1 stays byte-compatible with Qallow's real sync_wire.c and keeps
-//! passing the conformance oracle. v2 is opt-in via HELLO proto_ver=2 and
-//! has no C-side counterpart yet.
+//! passing the conformance oracle. v2 is opt-in via HELLO proto_ver=2.
+//! The C counterpart (`qsw_decode_v2`, `qsw_v2_merge_key`) landed in
+//! Qallow#17 (ATRIUM harness-roadmap/05). Merge-key parity rebuilds the
+//! v1 "scopes|key" shim so ingest lands under one LMDB key either way.
 use ductei_core::{Envelope, Scope};
 
 pub const QSW_PROTO_VER: u16 = 2;
@@ -84,4 +86,12 @@ pub fn decode_envelope_body(b: &[u8]) -> Option<Envelope> {
     let blob = b[pos + key_len..].to_vec();
 
     Some(Envelope { node_id, lamport, schema_ver, flags, key, scopes, blob })
+}
+
+/// Rebuild the v1 merge key from a v2 envelope: scopes sorted bytewise,
+/// joined with ",", then "|" + key. Delegates to `v1_shim_key` so the
+/// string is identical to what v1's encoder writes on the wire (the
+/// byte-level oracle) and to what Qallow's `qsw_v2_merge_key` produces.
+pub fn merge_key(env: &Envelope) -> String {
+    crate::v1_shim_key(env)
 }

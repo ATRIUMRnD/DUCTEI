@@ -6,6 +6,10 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # Qallow pin: merge of Qallow #17 (Task 5 QSW v2 C decoder).
+      # Bump in a separate, auditable commit. Never float to main.
+      QALLOW_REV: a88c1719205cf107fc547f574e5a918084629683
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -18,13 +22,12 @@ jobs:
       - run: cargo test --workspace --features ductei-core/pq
       - name: conformance vs Qallow C decoder
         run: |
-          git clone --depth 1 https://github.com/xingxerx/Qallow.git /tmp/Qallow
+          git clone https://github.com/xingxerx/Qallow.git /tmp/Qallow
+          git -C /tmp/Qallow checkout "$QALLOW_REV"
           cargo build -p conformance-emitter
           ./target/debug/emit /tmp/stream.bin
           gcc -I/tmp/Qallow/include -o conformance/verify conformance/verify.c /tmp/Qallow/src/mind/sync_wire.c
           ./conformance/verify /tmp/stream.bin
-          # v2 conformance (Task 5): requires Qallow main to carry the
-          # v2 decoder, so this commit lands only after Qallow's.
           ./target/debug/emit /tmp/stream_v2.bin v2
           ./conformance/verify /tmp/stream_v2.bin v2
 
@@ -62,13 +65,11 @@ jobs:
   e2e-smoke-qallow:
     runs-on: ubuntu-latest
     env:
-      # Qallow pin >= 2b0009e (ATRIUM Task 4): the persist gate now
-      # requires schema_ver 2 + persist-v2 payloads, which
-      # ductei_qallow::persist supplies. An older pin would pass for the
-      # wrong reason (no gate); a newer relay against an older Qallow is
-      # also fine (the v2 header is just data to a pre-Task-4 store).
+      # Qallow pin: merge of Qallow #17 (Task 5 QSW v2 C decoder).
+      # Still >= 2b0009e (Task 4 persist gate). Bump in a separate,
+      # auditable commit. Never float to main.
       LIMEN_REV: 7522a16d5f3b9ff96284c17008a612072d24a264
-      QALLOW_REV: e69ebd0acaa005916e9207537b34aabe8ce25a01
+      QALLOW_REV: a88c1719205cf107fc547f574e5a918084629683
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -102,7 +103,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       VEYN_REV: 06cb9eaa4b1f970ac20c596d4da0c4e19c2a3ede
-      QALLOW_REV: e69ebd0acaa005916e9207537b34aabe8ce25a01
+      QALLOW_REV: a88c1719205cf107fc547f574e5a918084629683
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -147,11 +148,10 @@ jobs:
     env:
       LIMEN_REV: 7522a16d5f3b9ff96284c17008a612072d24a264
       VEYN_REV: 06cb9eaa4b1f970ac20c596d4da0c4e19c2a3ede
-      # Must point at a Qallow rev that carries `qallow propose`
-      # (qallow_cli/src/propose.rs). Bump in a separate, auditable
-      # commit once that lands on Qallow main; until then this job is
-      # expected red and must not be a required check.
-      QALLOW_REV: e69ebd0acaa005916e9207537b34aabe8ce25a01
+      # Qallow pin: merge of Qallow #17 (Task 5 QSW v2 C decoder).
+      # This rev also carries `qallow propose` (qallow_cli/src/propose.rs).
+      # Bump in a separate, auditable commit. Never float to main.
+      QALLOW_REV: a88c1719205cf107fc547f574e5a918084629683
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
