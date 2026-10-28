@@ -134,9 +134,22 @@ def scenario_good_job(spool: Path, ductei: Path, limen_dir: Path, relay: Path) -
           f"{cert_path} to exist")
     if cert_path.exists():
         cert = json.loads(cert_path.read_text())
-        check(set(cert) == {"job_id", "backend", "tier", "fidelity_estimate", "lamport"},
-              "cert carries exactly the CertSummary fields, nothing extra",
-              "job_id/backend/tier/fidelity_estimate/lamport only")
+        # LIMEN #37 (2026-10-24) widened the cert summary: success_probability,
+        # fidelity_target, target_met were added and fidelity_estimate kept as
+        # a deprecated alias for one release. The relay's CertSummary is a
+        # closed type that drops unknown fields, so the contract to hold here
+        # is "required fields present, nothing outside the known set", not an
+        # exact match that breaks on every additive change.
+        required = {"job_id", "backend", "tier", "success_probability", "lamport"}
+        allowed = required | {"fidelity_estimate", "fidelity_target", "target_met"}
+        check(required <= set(cert) <= allowed,
+              "cert carries the CertSummary fields and nothing outside the known set",
+              f"required {sorted(required)}, allowed extras {sorted(allowed - required)}; "
+              f"got {sorted(cert)}")
+        check(not any("token" in k.lower() or "secret" in k.lower() or "crn" in k.lower()
+                      for k in cert),
+              "cert carries no credential-shaped field (I1)",
+              f"no token/secret/crn keys; got {sorted(cert)}")
         # I1, closed type: inject a credential-shaped field into the cert
         # before the relay sees it. serde must drop it on deserialize.
         cert["api_token"] = TOKEN_SENTINEL
