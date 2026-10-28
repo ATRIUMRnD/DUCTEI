@@ -643,6 +643,46 @@ fn qsw_v2_survives_comma_in_scope_name() {
     assert_eq!(back.scopes[0].0, "weird,scope");
 }
 
+#[test]
+fn qsw_v2_merge_key_rebuilds_v1_shim() {
+    // v1 remains the byte-level oracle: the wire key is scopes|key.
+    // v2 merge-key parity rebuilds that same string so ingest lands
+    // under one LMDB key regardless of proto version.
+    let e = env(
+        "limen.cert.j1",
+        &["veyn.sensor.eeg", "qallow.semantic.cert"],
+        7,
+        42,
+    );
+    let expected = "qallow.semantic.cert,veyn.sensor.eeg|limen.cert.j1";
+    assert_eq!(ductei_qallow::v1_shim_key(&e), expected);
+    assert_eq!(ductei_qallow::v2::merge_key(&e), expected);
+
+    let v1 = ductei_qallow::encode_envelope(&e);
+    let body = &v1[5..];
+    let key_len = u32::from_le_bytes(body[28..32].try_into().unwrap()) as usize;
+    assert_eq!(&body[36..36 + key_len], expected.as_bytes());
+}
+
+#[test]
+fn qsw_v2_merge_key_keeps_comma_scope_as_metadata() {
+    // Same envelope the C conformance stream carries. A comma inside a
+    // scope name is metadata; the rebuilt v1 shim still joins with ",".
+    let e = env("limen.cert.j1", &["veyn,x", "qallow.semantic.cert"], 7, 42);
+    assert_eq!(
+        ductei_qallow::v2::merge_key(&e),
+        "qallow.semantic.cert,veyn,x|limen.cert.j1"
+    );
+    let back = ductei_qallow::v2::decode_envelope_body(
+        &ductei_qallow::v2::encode_envelope(&e)[5..],
+    )
+    .unwrap();
+    assert_eq!(
+        ductei_qallow::v2::merge_key(&back),
+        ductei_qallow::v2::merge_key(&e)
+    );
+}
+
 // ---- Phase 3: VEYN adapter (narrow scopes, coalescing policy) ----
 
 fn veyn_json(source: &str, kind: &str, lamport: u64) -> String {

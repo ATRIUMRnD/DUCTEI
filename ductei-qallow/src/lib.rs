@@ -51,13 +51,21 @@ pub fn encode_batch_end(lamport: u64) -> Vec<u8> {
 
 pub fn encode_bye() -> Vec<u8> { frame(F_BYE, &[]) }
 
+/// Rebuilds the v1 merge key: scopes sorted bytewise, joined with ",",
+/// then "|" + key. This is the string v1's encoder writes into the wire
+/// key, and the string Qallow's `qsw_v2_merge_key` rebuilds from a v2
+/// envelope so LMDB records land under the same key in either proto.
+pub fn v1_shim_key(env: &Envelope) -> String {
+    let mut scopes: Vec<&str> = env.scopes.iter().map(|s| s.0.as_str()).collect();
+    scopes.sort_unstable();
+    format!("{}|{}", scopes.join(","), env.key)
+}
+
 /// Envelope -> QSW ENVELOPE frame. Body layout mirrors qsw_envelope:
 /// node_id[16] | u64 lamport | u16 schema_ver | u16 flags |
 /// u32 key_len | u32 blob_len | key | blob
 pub fn encode_envelope(env: &Envelope) -> Vec<u8> {
-    let mut scopes: Vec<&str> = env.scopes.iter().map(|s| s.0.as_str()).collect();
-    scopes.sort_unstable();
-    let key = format!("{}|{}", scopes.join(","), env.key);
+    let key = v1_shim_key(env);
     let mut b = Vec::new();
     b.extend_from_slice(&env.node_id);
     put_u64(&mut b, env.lamport);

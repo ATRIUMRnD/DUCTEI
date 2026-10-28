@@ -41,6 +41,15 @@ int main(int argc, char **argv) {
                 if (fr.u.env.scope_count != 2) return 1;
                 if (!scope_is(&fr.u.env.scopes[0], "qallow.semantic.cert")) return 1;
                 if (!scope_is(&fr.u.env.scopes[1], "veyn,x")) return 1;
+                /* v2 merge-key parity: rebuild the v1 "scopes|key" shim */
+                {
+                    uint8_t mk[QSW_MAX_KEY_LEN];
+                    const char *shim = "qallow.semantic.cert,veyn,x|limen.cert.j1";
+                    int32_t n = qsw_v2_merge_key(&fr.u.env, mk, sizeof mk);
+                    size_t expect_len = strlen(shim);
+                    if (n < 0 || (size_t)n != expect_len ||
+                        memcmp(mk, shim, expect_len) != 0) return 1;
+                }
             }
             if (fr.type == QSW_F_HELLO && qsw_hello_validate_v2(&fr.u.hello) != QSW_OK) return 1;
             off += used; win = 0; fi++;
