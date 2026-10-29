@@ -33,7 +33,7 @@ idempotent by job id anyway.
 Cues:
   --inject          push one REM cue through the exact production
                     DucteiBridge path (ductei_bridge_smoke) at startup
-  --osc-cue         send an Øneiro-shaped /oneiro/watch OSC packet
+  --osc-cue         send a watch-shaped /oneiro/watch OSC packet
                     (stage "REM") to the VEYN daemon's OSC port; needs
                     --veyn-daemon
 

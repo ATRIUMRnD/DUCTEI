@@ -109,8 +109,8 @@ writes a LIMEN route request) -> limend -> ductei-limen-relay ->
 ductei-qallow-relay -> the same LMDB. Four scenarios, 41 checks, five
 invariants asserted inline; CI job `e2e-smoke-loop`.
 `scripts/atrium_up.py` runs the same loop as long-lived processes from
-one command (optionally booting the real VEYN daemon and firing an
-�neiro-shaped `/oneiro/watch` OSC cue).
+one command (optionally booting the real VEYN daemon and firing a
+watch-shaped `/oneiro/watch` OSC cue).
 
 ## Test status (2026-07-13)
 - `cargo test --workspace`: 16/16 pass (default features: TCP transport only)
