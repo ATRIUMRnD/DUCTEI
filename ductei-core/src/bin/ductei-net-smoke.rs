@@ -171,6 +171,8 @@ fn check(fails: &mut u32, name: &str, ok: bool) {
 
 fn scenarios(addr: &str) {
     let dir = std::env::temp_dir().join(format!("ductei-net-smoke-{}", std::process::id()));
+    // A reused pid must not inherit an earlier run's channel files (they would read as stale).
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap_or_else(|e| die(&format!("mkdir: {e}")));
     let p = |n: &str| dir.join(n).to_string_lossy().into_owned();
     let (rl, rr) = (p("remote.jsonl"), p("remote-rej.jsonl"));
@@ -179,15 +181,17 @@ fn scenarios(addr: &str) {
     println!("ductei-net-smoke scenarios against {addr}");
     println!("work dir {}", dir.display());
 
-    println!("\n== S1 good session, S2 scope denial and stale rejection");
+    println!("\n== S1 good session, S2 scope denial and stale receipt");
     let out1 = dir.join("listener-1.txt");
     let l = start_listener(addr, &rl, &rr, &out1);
     let (o, c) = run(&["send", addr, &ll, &lr, "1", "a", SCOPE_OK, "1"]);
     check(&mut f, "good envelope delivered over the network", c == 0 && o == "DELIVERY Network");
     let (o, c) = run(&["send", addr, &ll, &lr, "1", "b", "limen.credentials", "2"]);
     check(&mut f, "out-of-scope envelope denied by the peer", c == 3 && o.starts_with("DENIED"));
-    let (_, c) = run(&["send", addr, &ll, &lr, "1", "a", SCOPE_OK, "1"]);
-    check(&mut f, "stale envelope denied by the peer", c == 3);
+    // A stale/duplicate delta is acked 2, a successful receipt (see the ack tri-state in
+    // transport.rs), not a denial. The dump below proves it was not applied a second time.
+    let (o, c) = run(&["send", addr, &ll, &lr, "1", "a", SCOPE_OK, "1"]);
+    check(&mut f, "already-held envelope receipted by the peer, not denied", c == 0 && o == "DELIVERY Network");
     stop_listener(l, &out1);
     let (o, _) = run(&["dump", &rl, &rr]);
     check(&mut f, "remote log holds exactly the one accepted envelope", o == "COUNT 1 KEYS a");
@@ -199,8 +203,8 @@ fn scenarios(addr: &str) {
     let l = start_listener(addr, &rl, &rr, &out2);
     let (o, c) = run(&["send", addr, &ll, &lr, "1", "c", SCOPE_OK, "3"]);
     check(&mut f, "new envelope accepted after restart", c == 0 && o == "DELIVERY Network");
-    let (_, c) = run(&["send", addr, &ll, &lr, "1", "a", SCOPE_OK, "1"]);
-    check(&mut f, "pre-restart envelope still rejected as stale (gate rebuilt from log)", c == 3);
+    let (o, c) = run(&["send", addr, &ll, &lr, "1", "a", SCOPE_OK, "1"]);
+    check(&mut f, "pre-restart envelope still receipted as already held (gate rebuilt from log)", c == 0 && o == "DELIVERY Network");
     stop_listener(l, &out2);
     let (o, _) = run(&["dump", &rl, &rr]);
     check(&mut f, "log holds a and c, nothing lost or duplicated", o == "COUNT 2 KEYS a,c");
