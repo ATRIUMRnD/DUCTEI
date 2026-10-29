@@ -23,7 +23,30 @@ use ductei_core::ScopePolicy;
 use ductei_sync::{check_bind, push_once, serve, to_hex, PushReport, StateDir};
 use std::net::{IpAddr, SocketAddr, TcpListener};
 use std::process::ExitCode;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+/// How long `serve` waits for its listen address to exist, and how often it retries.
+const BIND_WAIT: Duration = Duration::from_secs(300);
+const BIND_STEP: Duration = Duration::from_secs(5);
+
+/// A tailnet address may not exist yet at logon: Tailscale can come up after
+/// the task starts. Wait for it instead of exiting, because the scheduler's
+/// restart-on-failure never fires when the task is launched through
+/// `conhost --headless` (it always reports exit code 0). Only "address not
+/// available" is retried; "address in use" (a second instance) fails at once.
+fn bind_with_retry(addr: SocketAddr, wait: Duration, step: Duration) -> std::io::Result<TcpListener> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match TcpListener::bind(addr) {
+            Ok(l) => return Ok(l),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrNotAvailable && Instant::now() < deadline => {
+                eprintln!("ductei-sync serve: {addr} not available yet ({e}); retrying in {}s", step.as_secs());
+                std::thread::sleep(step);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 const USAGE: &str = "usage:
   ductei-sync node-id <state_dir>
@@ -175,7 +198,7 @@ fn run() -> Result<(), String> {
             } else {
                 None
             };
-            let listener = TcpListener::bind(addr).map_err(|e| format!("bind {addr}: {e}"))?;
+            let listener = bind_with_retry(addr, BIND_WAIT, BIND_STEP).map_err(|e| format!("bind {addr}: {e}"))?;
             println!(
                 "ductei-sync serve: node={} listen={} transport={mode} scopes={:?} allow_ip={:?} inbound={}",
                 to_hex(&node),
@@ -251,5 +274,37 @@ fn main() -> ExitCode {
             eprintln!("{e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bind_succeeds_at_once_on_a_real_address() {
+        let t0 = Instant::now();
+        let l = bind_with_retry("127.0.0.1:0".parse().unwrap(), Duration::from_secs(5), Duration::from_millis(50)).unwrap();
+        assert!(l.local_addr().unwrap().port() != 0);
+        assert!(t0.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn bind_waits_for_an_address_that_does_not_exist_then_gives_up() {
+        // 192.0.2.1 is TEST-NET-1 (RFC 5737): never assigned to a local interface.
+        let t0 = Instant::now();
+        let e = bind_with_retry("192.0.2.1:7420".parse().unwrap(), Duration::from_millis(400), Duration::from_millis(100)).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AddrNotAvailable);
+        assert!(t0.elapsed() >= Duration::from_millis(400), "must have retried until the deadline");
+    }
+
+    #[test]
+    fn bind_does_not_retry_when_the_port_is_taken() {
+        let held = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = held.local_addr().unwrap();
+        let t0 = Instant::now();
+        let e = bind_with_retry(addr, Duration::from_secs(5), Duration::from_millis(100)).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::AddrInUse);
+        assert!(t0.elapsed() < Duration::from_secs(1), "a second instance must fail fast, not wait");
     }
 }

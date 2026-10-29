@@ -230,7 +230,9 @@ def main() -> int:
     failed = list((a.state / "failed").glob("push-*.jsonl"))
     check("delivered=0" in out and "refused=0" not in out and failed and read_jsonl(failed[0]),
           "I2: scope B did not allow is refused (ack 0) and witnessed on A", out)
-    bad = subprocess.run([str(bins.ductei_sync), "serve", str(b.state), "--listen", "0.0.0.0:0", "--scope", SCOPE],
+    # --plaintext gets past the no-qfltl-build gate (which refuses first) so this
+    # exercises the --allow-ip deny-by-default rule it names.
+    bad = subprocess.run([str(bins.ductei_sync), "serve", str(b.state), "--listen", "0.0.0.0:0", "--scope", SCOPE, "--plaintext"],
                          capture_output=True, text=True, timeout=10)
     check(bad.returncode != 0 and "allow-ip" in bad.stderr, "non-loopback bind without --allow-ip is refused", bad.stderr)
     for n, me in ((a, na), (b, nb)):
