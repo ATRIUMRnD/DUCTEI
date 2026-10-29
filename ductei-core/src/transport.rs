@@ -220,9 +220,10 @@ pub enum DeliveryPath {
 /// is unreachable (connection refused, no route, DNS failure, timeout),
 /// the envelope is not dropped -- it goes through the same
 /// persistence-before-ack `Channel` used when there is no network at all.
-/// A remote peer that is reachable but rejects the envelope (scope denial
-/// or a stale causal delta) is a real, informative "no" and does NOT fall
-/// back to local delivery -- only *unreachability* degrades.
+/// A remote peer that is reachable but rejects the envelope (scope denial,
+/// ack 0) is a real, informative "no" and does NOT fall back to local
+/// delivery -- only *unreachability* degrades. A stale or duplicate delta is
+/// acked 2, a successful receipt, and counts as delivered.
 pub fn send_local_first(
     addr: impl ToSocketAddrs,
     env: &Envelope,

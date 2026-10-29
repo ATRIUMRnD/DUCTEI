@@ -10,7 +10,14 @@ use std::net::{TcpListener, TcpStream};
 use ductei_core::grpc::{serve_grpc_blocking, GrpcClient};
 
 fn node(n: u8) -> [u8; 16] { [n; 16] }
-fn tmp(name: &str) -> String { format!("{}/{}-{}", std::env::temp_dir().display(), std::process::id(), name) }
+// A pid alone repeats across runs (Windows reuses them), and these files outlive the process, so a
+// reused pid would reopen an earlier run's channel and see its keys as StaleDelta. The per-process
+// nonce makes every run's paths unique.
+fn tmp(name: &str) -> String {
+    static RUN: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    let run = RUN.get_or_init(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    format!("{}/{}-{}-{}", std::env::temp_dir().display(), std::process::id(), run, name)
+}
 fn env(key: &str, sc: &[&str], nd: u8, lam: u64) -> Envelope { scoped(key, sc, node(nd), lam, b"x") }
 fn chan(name: &str) -> Channel {
     Channel::open(ScopePolicy::new().allow("qallow.semantic.cert").allow("veyn.sensor.eeg"),
