@@ -57,10 +57,17 @@ pub struct AnchorCfg {
     /// Peers must resolve to tailnet or loopback addresses unless this is true.
     #[serde(default)]
     pub allow_public_peers: bool,
+    /// Push anchors over the QFLTL-encrypted, mutually authenticated transport
+    /// (needs the `qfltl` feature). Each peer must be pinned under
+    /// `<log dir>/anchor-state/qfltl/known_servers/<peer>.pub`, and the peer must
+    /// pin this gate's `<log dir>/anchor-state/qfltl/identity.pub` as a client.
+    /// When true there is never a plaintext fallback.
+    #[serde(default)]
+    pub encrypt: bool,
 }
 fn default_connect_timeout_ms() -> u64 { 2000 }
 impl Default for AnchorCfg {
-    fn default() -> Self { Self { every: 0, peers: vec![], connect_timeout_ms: default_connect_timeout_ms(), allow_public_peers: false } }
+    fn default() -> Self { Self { every: 0, peers: vec![], connect_timeout_ms: default_connect_timeout_ms(), allow_public_peers: false, encrypt: false } }
 }
 
 #[derive(Debug, Deserialize)]
@@ -393,6 +400,57 @@ pub fn push_envelope(peer: &str, env: &Envelope, timeout: std::time::Duration, o
     Ok(ack[0])
 }
 
+/// QFLTL-encrypted twin of [`push_envelope`]: same frame, same ack, same outbox
+/// bookkeeping, but over the mutually authenticated v3 handshake from
+/// ductei-sync. `state_root` holds this gate's identity and the pinned server
+/// keys (`<state_root>/qfltl/...`). A peer with no pinned key is refused before
+/// any byte is sent, and a failed handshake sends nothing.
+#[cfg(feature = "qfltl")]
+pub fn push_envelope_qfltl(state_root: &Path, peer: &str, env: &Envelope, timeout: std::time::Duration, outbox: &Path, allow_public: bool) -> Result<u8, String> {
+    use ductei_sync::qfltl_transport::{client_handshake, load_or_generate_identity, pinned_server_key};
+    use std::io::Read;
+    use std::net::{TcpStream, ToSocketAddrs};
+    let addr = peer.to_socket_addrs().map_err(|e| format!("{peer}: {e}"))?.next().ok_or_else(|| format!("{peer}: no address"))?;
+    if !allow_public && !peer_allowed(&addr) {
+        return Err(format!("{peer} resolves to {addr}, not a tailnet or loopback address (set anchor.allow_public_peers to override)"));
+    }
+    let pin = pinned_server_key(state_root, peer)
+        .map_err(|e| format!("{peer}: read pin: {e}"))?
+        .ok_or_else(|| format!("{peer}: no pinned server key under {}/qfltl/known_servers; refusing to send", state_root.display()))?;
+    let identity = load_or_generate_identity(state_root).map_err(|e| format!("{peer}: identity: {e}"))?;
+    let mut ob = ductei_core::outbox::Outbox::open(outbox).map_err(|e| e.to_string())?;
+    ob.record_intent(env).map_err(|e| e.to_string())?;
+    let tcp = TcpStream::connect_timeout(&addr, timeout).map_err(|e| format!("{peer}: connect: {e}"))?;
+    tcp.set_read_timeout(Some(timeout)).ok();
+    tcp.set_write_timeout(Some(timeout)).ok();
+    let mut s = client_handshake(tcp, &identity, &pin).map_err(|e| format!("{peer}: handshake: {e}"))?;
+    let body = serde_json::to_vec(env).map_err(|e| e.to_string())?;
+    s.write_all(&(body.len() as u32).to_le_bytes()).and_then(|_| s.write_all(&body)).and_then(|_| s.flush()).map_err(|e| format!("{peer}: write: {e}"))?;
+    let mut ack = [0u8; 1];
+    if let Err(e) = s.read_exact(&mut ack) {
+        let _ = ob.record_receipt(&env.key, env.lamport, &env.node_id, 0xFF);
+        return Err(format!("{peer}: no ack: {e}"));
+    }
+    ob.record_receipt(&env.key, env.lamport, &env.node_id, ack[0]).map_err(|e| e.to_string())?;
+    Ok(ack[0])
+}
+
+/// Push one anchor the way the config says. With `anchor.encrypt` it uses the
+/// QFLTL transport and never falls back to plaintext; if this build lacks the
+/// `qfltl` feature that is an error, not a downgrade.
+pub fn push_anchor(cfg: &AnchorCfg, state_root: &Path, peer: &str, env: &Envelope, outbox: &Path) -> Result<u8, String> {
+    let timeout = std::time::Duration::from_millis(cfg.connect_timeout_ms);
+    if cfg.encrypt {
+        #[cfg(feature = "qfltl")]
+        return push_envelope_qfltl(state_root, peer, env, timeout, outbox, cfg.allow_public_peers);
+        #[cfg(not(feature = "qfltl"))]
+        {
+            let _ = state_root;
+            return Err("anchor.encrypt is set but this build has no `qfltl` feature; refusing plaintext".into());
+        }
+    }
+    push_envelope(peer, env, timeout, outbox, cfg.allow_public_peers)
+}
 /// Anchors found in a peer's exported log (channel.jsonl) or a local
 /// anchors.jsonl: every envelope whose blob parses as an Anchor.
 pub fn anchors_in(path: &Path) -> Result<Vec<Anchor>, String> {
@@ -1149,7 +1207,7 @@ mod tests {
         let (peer, peer_dir) = anchor_peer();
         let d = tmp();
         let mut c = cfg(&["echo"], 10);
-        c.anchor = AnchorCfg { every: 1, peers: vec![peer.clone()], connect_timeout_ms: 2000, allow_public_peers: false };
+        c.anchor = AnchorCfg { every: 1, peers: vec![peer.clone()], connect_timeout_ms: 2000, allow_public_peers: false, encrypt: false };
         let (tx, rx) = std::sync::mpsc::channel();
         let mut g = Gate::open(&c, &d).unwrap();
         g.anchor_tx = Some(tx);
@@ -1186,7 +1244,7 @@ mod tests {
     fn unreachable_peer_does_not_block_or_lose_the_local_anchor() {
         let d = tmp();
         let mut c = cfg(&["echo"], 10);
-        c.anchor = AnchorCfg { every: 1, peers: vec!["127.0.0.1:9".into()], connect_timeout_ms: 300, allow_public_peers: false };
+        c.anchor = AnchorCfg { every: 1, peers: vec!["127.0.0.1:9".into()], connect_timeout_ms: 300, allow_public_peers: false, encrypt: false };
         let mut g = Gate::open(&c, &d).unwrap();
         g.on_client_line(&call(1, "echo"));
         g.on_server_line(r#"{"jsonrpc":"2.0","id":1,"result":1}"#).unwrap();
@@ -1508,4 +1566,105 @@ mod tests {
             assert!(!Signer::verify(Scheme::MlDsa65, &pk, r.hash.as_bytes(), r.sig.as_ref().unwrap()), "bare hash must not verify");
         }
     }
-}
+
+    #[cfg(not(feature = "qfltl"))]
+    #[test]
+    fn encrypt_without_the_feature_refuses_plaintext() {
+        let a = AnchorCfg { every: 1, encrypt: true, ..AnchorCfg::default() };
+        let d = tmp();
+        let mut c = cfg(&["echo"], 10);
+        c.anchor = a.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let mut g = Gate::open(&c, &d).unwrap();
+        g.anchor_tx = Some(tx);
+        g.on_client_line(&call(1, "echo"));
+        g.on_server_line(r#"{"jsonrpc":"2.0","id":1,"result":1}"#).unwrap();
+        let env = rx.try_recv().unwrap();
+        let err = push_anchor(&a, &d, "127.0.0.1:9", &env, &d.join("o.jsonl")).unwrap_err();
+        assert!(err.contains("refusing plaintext"), "{err}");
+    }
+
+    #[cfg(feature = "qfltl")]
+    mod qfltl_push {
+        use super::*;
+        use ductei_sync::qfltl_transport::{load_or_generate_identity, pin_key, serve_qfltl, PinRole};
+        use ductei_sync::StateDir;
+        use std::net::TcpListener;
+
+        fn one_anchor() -> (Envelope, PathBuf) {
+            let d = tmp();
+            let mut c = cfg(&["echo"], 10);
+            c.anchor = AnchorCfg { every: 1, peers: vec![], connect_timeout_ms: 2000, allow_public_peers: false, encrypt: true };
+            let (tx, rx) = std::sync::mpsc::channel();
+            let mut g = Gate::open(&c, &d).unwrap();
+            g.anchor_tx = Some(tx);
+            g.on_client_line(&call(1, "echo"));
+            g.on_server_line(r#"{"jsonrpc":"2.0","id":1,"result":1}"#).unwrap();
+            (rx.try_recv().unwrap(), d)
+        }
+
+        fn serve_one(root: &Path, gate_pub: &[u8]) -> (String, Vec<u8>, std::thread::JoinHandle<std::io::Result<()>>) {
+            fs::create_dir_all(root).unwrap();
+            let state = StateDir::open(root).unwrap();
+            let kp = load_or_generate_identity(root).unwrap();
+            pin_key(root, PinRole::Client, "gate", gate_pub, false).unwrap();
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap().to_string();
+            let public = kp.public_bytes();
+            let policy = ScopePolicy::new().allow(&anchor_scope("t"));
+            let h = std::thread::spawn(move || {
+                serve_qfltl(&state, l, policy, &["127.0.0.1".parse().unwrap()], Some(1), &kp, |_, _| {})
+            });
+            (addr, public, h)
+        }
+
+        #[test]
+        fn encrypted_push_is_applied_by_a_pinned_peer() {
+            let (env, d) = one_anchor();
+            let gate_root = d.join("anchor-state");
+            fs::create_dir_all(&gate_root).unwrap();
+            let gate_kp = load_or_generate_identity(&gate_root).unwrap();
+            let (addr, server_pub, h) = serve_one(&d.join("peer"), &gate_kp.public_bytes());
+            pin_key(&gate_root, PinRole::Server, &addr, &server_pub, false).unwrap();
+            let ack = push_envelope_qfltl(&gate_root, &addr, &env, std::time::Duration::from_secs(5), &d.join("outbox.jsonl"), false).unwrap();
+            assert_eq!(ack, 1);
+            h.join().unwrap().unwrap();
+        }
+
+        #[test]
+        fn unpinned_peer_is_refused_before_anything_is_sent() {
+            let (env, d) = one_anchor();
+            let gate_root = d.join("anchor-state");
+            fs::create_dir_all(&gate_root).unwrap();
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap().to_string();
+            let outbox = d.join("outbox.jsonl");
+            let err = push_envelope_qfltl(&gate_root, &addr, &env, std::time::Duration::from_secs(2), &outbox, false).unwrap_err();
+            assert!(err.contains("no pinned server key"), "{err}");
+            assert!(!outbox.exists(), "nothing may be recorded or sent");
+        }
+
+        #[test]
+        fn wrong_pinned_key_fails_the_handshake_and_is_not_applied() {
+            let (env, d) = one_anchor();
+            let gate_root = d.join("anchor-state");
+            fs::create_dir_all(&gate_root).unwrap();
+            let gate_kp = load_or_generate_identity(&gate_root).unwrap();
+            let (addr, _server_pub, h) = serve_one(&d.join("peer"), &gate_kp.public_bytes());
+            let other_root = d.join("other");
+            fs::create_dir_all(&other_root).unwrap();
+            let impostor = load_or_generate_identity(&other_root).unwrap().public_bytes();
+            pin_key(&gate_root, PinRole::Server, &addr, &impostor, false).unwrap();
+            let err = push_envelope_qfltl(&gate_root, &addr, &env, std::time::Duration::from_secs(3), &d.join("outbox.jsonl"), false).unwrap_err();
+            assert!(err.contains("handshake"), "{err}");
+            let _ = h.join();
+        }
+
+        #[test]
+        fn push_anchor_never_downgrades_to_plaintext() {
+            let (env, d) = one_anchor();
+            let a = AnchorCfg { every: 1, peers: vec![], connect_timeout_ms: 500, allow_public_peers: false, encrypt: true };
+            let err = push_anchor(&a, &d.join("anchor-state"), "127.0.0.1:9", &env, &d.join("o.jsonl")).unwrap_err();
+            assert!(!err.contains("connect:"), "must not have tried a plain connection: {err}");
+        }
+    }}

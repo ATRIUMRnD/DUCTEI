@@ -9,6 +9,11 @@ description = "ductei-mcp-gate: a scoped, persisted, receipt-signing stdio gatew
 # ML-DSA receipt signing (FIPS 204). Off by default so the gate builds with
 # no PQ crates; receipts are still hash-chained, just unsigned (scheme = "none").
 sign = ["dep:pqcrypto-mldsa", "dep:pqcrypto-traits"]
+# Encrypt and mutually authenticate anchor pushes (anchor.encrypt = true) with the
+# QFLTL v3 handshake from ductei-sync. Off by default so the gate still builds
+# with no PQ crates; when a config asks for encryption and this is off, the gate
+# refuses to start rather than fall back to plaintext.
+qfltl = ["dep:ductei-sync"]
 
 [dependencies]
 ductei-core = { path = "../ductei-core", features = ["net"] }
@@ -18,6 +23,7 @@ toml = "0.8"
 sha2 = "0.10"
 getrandom = "0.2"
 zeroize = "1"
+ductei-sync = { path = "../ductei-sync", features = ["qfltl"], optional = true }
 pqcrypto-mldsa = { version = "0.1", optional = true }
 pqcrypto-traits = { version = "0.3", optional = true }
 
