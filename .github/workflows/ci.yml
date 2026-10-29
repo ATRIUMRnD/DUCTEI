@@ -8,11 +8,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # ductei-sync pins private xingxerx/QFLTL as a git dep; cargo fetches it via git CLI with this read token.
-      - name: allow cargo to fetch private QFLTL
+      # ductei-sync pins private xingxerx/QFLTL (and transitively universal-clock); cargo fetches them via git CLI with this read token.
+      - name: allow cargo to fetch private QFLTL deps
         env:
           QFLTL_READ_TOKEN: ${{ secrets.QFLTL_READ_TOKEN }}
-        run: git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/QFLTL".insteadOf https://github.com/xingxerx/QFLTL
+        run: |
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/QFLTL".insteadOf https://github.com/xingxerx/QFLTL
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/universal-clock".insteadOf https://github.com/xingxerx/universal-clock
       - run: cargo test --workspace
       - run: cargo test --workspace --features ductei-core/net
       # ductei-sync is network-only, so it is opt-in (see its Cargo.toml).
@@ -49,11 +51,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # ductei-sync pins private xingxerx/QFLTL as a git dep; cargo fetches it via git CLI with this read token.
-      - name: allow cargo to fetch private QFLTL
+      # ductei-sync pins private xingxerx/QFLTL (and transitively universal-clock); cargo fetches them via git CLI with this read token.
+      - name: allow cargo to fetch private QFLTL deps
         env:
           QFLTL_READ_TOKEN: ${{ secrets.QFLTL_READ_TOKEN }}
-        run: git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/QFLTL".insteadOf https://github.com/xingxerx/QFLTL
+        run: |
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/QFLTL".insteadOf https://github.com/xingxerx/QFLTL
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/universal-clock".insteadOf https://github.com/xingxerx/universal-clock
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -82,11 +86,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # ductei-sync pins private xingxerx/QFLTL as a git dep; cargo fetches it via git CLI with this read token.
-      - name: allow cargo to fetch private QFLTL
+      # ductei-sync pins private xingxerx/QFLTL (and transitively universal-clock); cargo fetches them via git CLI with this read token.
+      - name: allow cargo to fetch private QFLTL deps
         env:
           QFLTL_READ_TOKEN: ${{ secrets.QFLTL_READ_TOKEN }}
-        run: git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/QFLTL".insteadOf https://github.com/xingxerx/QFLTL
+        run: |
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/QFLTL".insteadOf https://github.com/xingxerx/QFLTL
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/universal-clock".insteadOf https://github.com/xingxerx/universal-clock
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -117,11 +123,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # ductei-sync pins private xingxerx/QFLTL as a git dep; cargo fetches it via git CLI with this read token.
-      - name: allow cargo to fetch private QFLTL
+      # ductei-sync pins private xingxerx/QFLTL (and transitively universal-clock); cargo fetches them via git CLI with this read token.
+      - name: allow cargo to fetch private QFLTL deps
         env:
           QFLTL_READ_TOKEN: ${{ secrets.QFLTL_READ_TOKEN }}
-        run: git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/QFLTL".insteadOf https://github.com/xingxerx/QFLTL
+        run: |
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/QFLTL".insteadOf https://github.com/xingxerx/QFLTL
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/universal-clock".insteadOf https://github.com/xingxerx/universal-clock
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -166,11 +174,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      # ductei-sync pins private xingxerx/QFLTL as a git dep; cargo fetches it via git CLI with this read token.
-      - name: allow cargo to fetch private QFLTL
+      # ductei-sync pins private xingxerx/QFLTL (and transitively universal-clock); cargo fetches them via git CLI with this read token.
+      - name: allow cargo to fetch private QFLTL deps
         env:
           QFLTL_READ_TOKEN: ${{ secrets.QFLTL_READ_TOKEN }}
-        run: git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/QFLTL".insteadOf https://github.com/xingxerx/QFLTL
+        run: |
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/QFLTL".insteadOf https://github.com/xingxerx/QFLTL
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/universal-clock".insteadOf https://github.com/xingxerx/universal-clock
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
