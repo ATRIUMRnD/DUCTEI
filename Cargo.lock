@@ -437,6 +437,7 @@ name = "ductei-mcp"
 version = "0.2.0"
 dependencies = [
  "ductei-core",
+ "ductei-sync",
  "getrandom 0.2.17",
  "pqcrypto-mldsa",
  "pqcrypto-traits",
@@ -1335,8 +1336,20 @@ dependencies = [
  "aes-gcm",
  "hkdf",
  "ml-kem",
+ "qfltl-it",
  "rand 0.8.7",
  "sha2",
+ "windows-sys 0.59.0",
+ "zeroize",
+]
+
+[[package]]
+name = "qfltl-it"
+version = "0.2.0"
+dependencies = [
+ "rand 0.8.7",
+ "sha2",
+ "subtle",
  "zeroize",
 ]
 

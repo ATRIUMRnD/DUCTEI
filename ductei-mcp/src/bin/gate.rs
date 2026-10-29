@@ -11,13 +11,12 @@
 //! spawns the real server from [server] in the config. MCP stdio framing is
 //! newline-delimited JSON-RPC, so the relay is line based. The gate's own
 //! diagnostics go to stderr (stdout is the protocol channel).
-use ductei_mcp::{anchors_in, new_launch, policy_json, push_envelope, sha256_hex, verify_receipts, Config, Decision, Gate, Signer, VerifyTrust, GATE_NONCE_ENV};
+use ductei_mcp::{anchors_in, new_launch, policy_json, push_anchor, sha256_hex, verify_receipts, Config, Decision, Gate, Signer, VerifyTrust, GATE_NONCE_ENV};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::Duration;
 
 const USAGE: &str = "usage: ductei-mcp-gate run <config.toml>\n       ductei-mcp-gate verify <ductei_dir> [--pubkey <file> | --fingerprint <hex> | --allow-unpinned] [--anchor <seq>:<hash>] [--anchor-file <peer channel.jsonl>]\n       ductei-mcp-gate fingerprint <ductei_dir>";
 
@@ -108,6 +107,10 @@ fn run(config_path: &Path) -> i32 {
         eprintln!("ductei-mcp-gate: {e}"); return 2;
     }
     eprintln!("ductei-mcp-gate: policy {}", &sha256_hex(policy.as_bytes())[..16]);
+    if cfg.anchor.every > 0 && cfg.anchor.encrypt && !cfg!(feature = "qfltl") {
+        eprintln!("ductei-mcp-gate: anchor.encrypt is set but this build has no `qfltl` feature; refusing to push anchors in plaintext (rebuild with --features qfltl or unset anchor.encrypt)");
+        return 2;
+    }
     let anchor_rx = if cfg.anchor.every > 0 && !cfg.anchor.peers.is_empty() {
         let (tx, rx) = mpsc::channel();
         gate.anchor_tx = Some(tx);
@@ -115,9 +118,9 @@ fn run(config_path: &Path) -> i32 {
     } else { None };
     let anchor_thread = anchor_rx.map(|rx| {
         let peers = cfg.anchor.peers.clone();
-        let timeout = Duration::from_millis(cfg.anchor.connect_timeout_ms);
+        let acfg = cfg.anchor.clone();
+        let state_root = dir.join("anchor-state");
         let outbox = dir.join("outbox.jsonl");
-        let public = cfg.anchor.allow_public_peers;
         thread::spawn(move || {
             let mut pending = None;
             let mut sent = 0u64;
@@ -125,7 +128,7 @@ fn run(config_path: &Path) -> i32 {
             for env in rx {
                 let mut ok_any = false;
                 for p in &peers {
-                    match push_envelope(p, &env, timeout, &outbox, public) {
+                    match push_anchor(&acfg, &state_root, p, &env, &outbox) {
                         Ok(1) | Ok(2) => ok_any = true,
                         Ok(code) => eprintln!("ductei-mcp-gate: anchor rejected by {p} (ack {code}); does its policy allow the anchor scope?"),
                         Err(e) => eprintln!("ductei-mcp-gate: anchor push failed: {e}"),
@@ -136,7 +139,7 @@ fn run(config_path: &Path) -> i32 {
             }
             // Channel closed: last chance for whatever is still unsent.
             if let Some(env) = pending {
-                for p in &peers { if matches!(push_envelope(p, &env, timeout, &outbox, public), Ok(1) | Ok(2)) { sent += 1; failed = failed.saturating_sub(1); break; } }
+                for p in &peers { if matches!(push_anchor(&acfg, &state_root, p, &env, &outbox), Ok(1) | Ok(2)) { sent += 1; failed = failed.saturating_sub(1); break; } }
             }
             eprintln!("ductei-mcp-gate: anchors pushed={sent} unsent={failed}");
         })
