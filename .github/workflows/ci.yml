@@ -13,6 +13,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           toolchain: stable
+      # ductei-sync pins private xingxerx/QFLTL (and transitively universal-clock); cargo fetches them via git CLI with this read token.
+      - name: allow cargo to fetch private QFLTL deps
+        env:
+          QFLTL_READ_TOKEN: ${{ secrets.QFLTL_READ_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/QFLTL".insteadOf https://github.com/xingxerx/QFLTL
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/universal-clock".insteadOf https://github.com/xingxerx/universal-clock
       - run: cargo test --workspace
       - run: cargo test --workspace --features ductei-core/net
       # ductei-sync is network-only, so it is opt-in (see its Cargo.toml).
@@ -54,6 +61,14 @@ jobs:
         with:
           toolchain: stable
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      # ductei-sync pins private xingxerx/QFLTL (and transitively universal-clock); cargo fetches them via git CLI with this read token.
+      - name: allow cargo to fetch private QFLTL deps
+        env:
+          QFLTL_READ_TOKEN: ${{ secrets.QFLTL_READ_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/QFLTL".insteadOf https://github.com/xingxerx/QFLTL
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/universal-clock".insteadOf https://github.com/xingxerx/universal-clock
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: checkout LIMEN at pinned rev
@@ -86,6 +101,14 @@ jobs:
         with:
           toolchain: stable
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      # ductei-sync pins private xingxerx/QFLTL (and transitively universal-clock); cargo fetches them via git CLI with this read token.
+      - name: allow cargo to fetch private QFLTL deps
+        env:
+          QFLTL_READ_TOKEN: ${{ secrets.QFLTL_READ_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/QFLTL".insteadOf https://github.com/xingxerx/QFLTL
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/universal-clock".insteadOf https://github.com/xingxerx/universal-clock
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: checkout LIMEN at pinned rev
@@ -120,6 +143,14 @@ jobs:
         with:
           toolchain: stable
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      # ductei-sync pins private xingxerx/QFLTL (and transitively universal-clock); cargo fetches them via git CLI with this read token.
+      - name: allow cargo to fetch private QFLTL deps
+        env:
+          QFLTL_READ_TOKEN: ${{ secrets.QFLTL_READ_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/QFLTL".insteadOf https://github.com/xingxerx/QFLTL
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/universal-clock".insteadOf https://github.com/xingxerx/universal-clock
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: checkout VEYN at pinned rev
@@ -169,6 +200,14 @@ jobs:
         with:
           toolchain: stable
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+      # ductei-sync pins private xingxerx/QFLTL (and transitively universal-clock); cargo fetches them via git CLI with this read token.
+      - name: allow cargo to fetch private QFLTL deps
+        env:
+          QFLTL_READ_TOKEN: ${{ secrets.QFLTL_READ_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/QFLTL".insteadOf https://github.com/xingxerx/QFLTL
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/universal-clock".insteadOf https://github.com/xingxerx/universal-clock
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
       - name: checkout LIMEN at pinned rev
