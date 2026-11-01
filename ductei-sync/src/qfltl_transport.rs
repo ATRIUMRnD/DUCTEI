@@ -1155,4 +1155,46 @@ mod tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].key, "k1");
     }
-}
+
+    /// Windows gives the main thread only 1 MiB of stack (the PE default),
+    /// and serve/push used to run the whole QFLTL path there. ML-KEM-768
+    /// keys are large inline values, so a real push+serve round trip must
+    /// fit in 1 MiB on BOTH sides, the way the deployed binary runs them.
+    #[test]
+    fn push_and_serve_fit_in_a_windows_main_thread_stack() {
+        use ductei_core::{scoped, ScopePolicy};
+        const MAIN_STACK: usize = 1 << 20;
+        let a = crate::StateDir::open(tmp("stack-a")).unwrap();
+        let b = crate::StateDir::open(tmp("stack-b")).unwrap();
+        let na = a.node_id().unwrap();
+        a.local_channel(ScopePolicy::new().allow("brain.correction"))
+            .unwrap()
+            .send(scoped("s1", &["brain.correction"], na, 1, b"one"))
+            .unwrap();
+        let a_pub = load_or_generate_identity(a.root()).unwrap().public_bytes();
+        let b_pub = load_or_generate_identity(b.root()).unwrap().public_bytes();
+        pin_key(b.root(), PinRole::Client, "xing-pc", &a_pub, false).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        pin_key(a.root(), PinRole::Server, &addr, &b_pub, false).unwrap();
+
+        let b2 = b.clone();
+        let server = std::thread::Builder::new()
+            .stack_size(MAIN_STACK)
+            .spawn(move || {
+                let id = load_or_generate_identity(b2.root()).unwrap();
+                let mut ok = None;
+                serve_qfltl(&b2, listener, ScopePolicy::new().allow("brain.correction"), &[], Some(1), &id, |_, r| {
+                    ok = Some(r.is_ok())
+                })
+                .unwrap();
+                ok
+            })
+            .unwrap();
+        let client = std::thread::Builder::new()
+            .stack_size(MAIN_STACK)
+            .spawn(move || push_once_qfltl(&a, &addr).unwrap().delivered)
+            .unwrap();
+        assert_eq!(client.join().unwrap(), 1);
+        assert_eq!(server.join().unwrap(), Some(true));
+    }}

@@ -1,5 +1,6 @@
 # Rust
 target/
+target-*/
 **/*.rs.bk
 
 # MSVC / C build output (conformance/verify.c, sync_wire)
@@ -24,3 +25,23 @@ ductei-smoke-*/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# --- secrets and key material: never commit (security baseline) ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.kdbx
+id_rsa*
+id_ed25519*
+*.seed
+*.seed.*
+*.dpapi
+secrets/
+
+# local build output
+build/
+scripts/build/
