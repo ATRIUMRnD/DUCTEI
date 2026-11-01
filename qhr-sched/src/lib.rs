@@ -27,7 +27,9 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub mod pool;
+pub mod weight;
 pub use pool::Pool;
+pub use weight::BranchWeighter;
 
 pub const RECEIPT_SCOPE: &str = "qhr.receipt";
 pub const RECEIPT_KEY_PREFIX: &str = "qhr/collapse/";
@@ -65,6 +67,11 @@ pub struct BranchReceipt {
     pub fate: Fate,
     pub elapsed_us: u64,
     pub over_budget: bool,
+    /// Weighter class for this branch, so a replay can rebuild the learned
+    /// prior. Omitted from the serialized form when `None`, which keeps
+    /// receipts written before this field byte-identical (same hash).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -189,6 +196,7 @@ impl Scheduler {
                 fate: Fate::Pruned,
                 elapsed_us: 0,
                 over_budget: false,
+                class: None,
             })
             .collect();
 
