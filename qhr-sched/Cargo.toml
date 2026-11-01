@@ -1,0 +1,15 @@
+[package]
+name = "qhr-sched"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "QHR speculative scheduler: fan a cell out over N branches, commit the first verified result, and persist a hash-chained receipt through the DUCTEI channel."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+qhr-cell = { path = "../qhr-cell" }
+ductei-core = { path = "../ductei-core" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }

@@ -1386,6 +1386,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "qhr-cell"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
+name = "qhr-sched"
+version = "0.1.0"
+dependencies = [
+ "ductei-core",
+ "qhr-cell",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "qsw-inspect"
 version = "0.1.0"
 dependencies = [
