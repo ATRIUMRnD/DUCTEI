@@ -661,19 +661,42 @@ fn blob_hashes(path: &Path, flags: u16) -> HashSet<String> {
     set
 }
 
+/// Blob hashes keyed by Lamport stamp. A receipt names the exact channel
+/// entries it covers (`lamport_call`, `lamport_result`); checking by position
+/// catches deletion of an entry whose content repeats elsewhere, which a plain
+/// hash set cannot (a polling client repeats the same call thousands of times).
+fn blob_index(path: &Path, flags: u16) -> HashMap<u64, Vec<String>> {
+    let mut map: HashMap<u64, Vec<String>> = HashMap::new();
+    if let Ok(store) = LogStore::open(path) {
+        if let Ok((envs, _)) = store.replay(0) {
+            for e in envs.iter().filter(|e| e.flags == flags) { map.entry(e.lamport).or_default().push(sha256_hex(&e.blob)); }
+        }
+    }
+    map
+}
+
 /// Recompute the chain, every signature, the key pin, and cross-check each
 /// receipt's hashes against the channel / denied logs (the gate's receipts).
 pub fn verify_receipts(dir: &Path, trust: &VerifyTrust) -> Result<VerifyReport, String> {
-    let calls = blob_hashes(&dir.join("channel.jsonl"), 0);
-    let results = blob_hashes(&dir.join("channel.jsonl"), 1);
+    // Read order matters on a live gate. The gate persists to channel.jsonl
+    // before it writes the receipt, so: count receipts first, read the channel
+    // second, and cross-check only receipts that existed before the channel
+    // snapshot. Later receipts still get the chain/signature checks; they are
+    // cross-checked on the next run. Reading channel first made a call landing
+    // between the two reads look like a missing result (seen live, Nov 1 2026).
+    let snapshot = File::open(dir.join("receipts.jsonl")).map(|f| BufReader::new(f).lines().count() as u64).unwrap_or(0);
+    let calls = blob_index(&dir.join("channel.jsonl"), 0);
+    let results = blob_index(&dir.join("channel.jsonl"), 1);
+    let at = |m: &HashMap<u64, Vec<String>>, l: u64, h: &str| m.get(&l).is_some_and(|v| v.iter().any(|x| x == h));
     let denied = blob_hashes(&dir.join("denied.jsonl"), 0);
     let sessions = blob_hashes(&dir.join("sessions.jsonl"), 0);
     verify_chain(dir, trust, |r, rep| {
         let s = r.body.seq;
+        if s >= snapshot { return; }
         match r.body.verdict.as_str() {
             "accepted" => {
-                if !calls.contains(&r.body.call_sha256) { rep.errors.push(format!("seq {s}: call not found in channel.jsonl")); }
-                if !results.contains(&r.body.result_sha256) { rep.errors.push(format!("seq {s}: result not found in channel.jsonl")); }
+                if !at(&calls, r.body.lamport_call, &r.body.call_sha256) { rep.errors.push(format!("seq {s}: call not found in channel.jsonl at lamport {}", r.body.lamport_call)); }
+                if !at(&results, r.body.lamport_result, &r.body.result_sha256) { rep.errors.push(format!("seq {s}: result not found in channel.jsonl at lamport {}", r.body.lamport_result)); }
             }
             "denied" => {
                 if !denied.contains(&r.body.call_sha256) { rep.errors.push(format!("seq {s}: denied call not found in denied.jsonl")); }
@@ -1410,6 +1433,30 @@ mod tests {
         assert!(verify_receipts(&d, &unpinned()).unwrap().ok(), "chain alone cannot see truncation");
         let rep = verify_receipts(&d, &trust).unwrap();
         assert!(rep.errors.iter().any(|e| e.starts_with("TRUNCATED")), "{:?}", rep.errors);
+    }
+
+    #[test]
+    fn deleting_a_repeated_channel_entry_is_caught() {
+        // A polling client sends the same call and gets the same answer over
+        // and over. Deleting one copy must still fail verification: receipts
+        // are checked against the entry at their own Lamport stamp, not
+        // against "this hash appears somewhere".
+        let d = tmp();
+        let mut g = Gate::open(&cfg(&["echo"], 10), &d).unwrap();
+        for id in 1..=3 {
+            g.on_client_line(&call(id, "echo"));
+            g.on_server_line(&format!(r#"{{"jsonrpc":"2.0","id":{id},"result":0}}"#)).unwrap();
+        }
+        drop(g);
+        assert!(verify_receipts(&d, &unpinned()).unwrap().ok());
+        let p = d.join("channel.jsonl");
+        let lines: Vec<String> = fs::read_to_string(&p).unwrap().lines().map(String::from).collect();
+        let mut kept = lines.clone();
+        kept.remove(lines.len() / 2); // a middle call or result whose twin stays behind
+        fs::write(&p, kept.join("\n") + "\n").unwrap();
+        let rep = verify_receipts(&d, &unpinned()).unwrap();
+        assert!(!rep.ok(), "deleted duplicate entry went unnoticed");
+        assert!(rep.errors.iter().any(|e| e.contains("not found in channel.jsonl at lamport")), "{:?}", rep.errors);
     }
 
     #[test]

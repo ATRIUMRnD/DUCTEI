@@ -26,6 +26,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+pub mod tree;
+
 pub use ductei_mcp::{Durability, ReceiptBody, ReceiptLog, SignCfg, VerifyReport, VerifyTrust};
 
 pub const HEARTBEAT_SCOPE: &str = "atrium.heartbeat";
@@ -255,7 +257,7 @@ pub fn sha256_hex(b: &[u8]) -> String {
 
 // ---------------------------------------------------------------- supervisor
 
-struct Managed { child: Option<Child>, backoff: Duration, next_try: Instant, restarts: u64, started: Instant }
+struct Managed { child: Option<Child>, tree: Option<tree::Tree>, backoff: Duration, next_try: Instant, restarts: u64, started: Instant }
 
 pub struct Supervisor {
     cfg: Config,
@@ -276,7 +278,7 @@ impl Supervisor {
             status.rooms.insert(r.name.clone(), RoomStatus { health: Health::Down, kind: r.kind.clone(), pid: None, restarts: 0, since_unix: now, note: String::new() });
         }
         let managed = cfg.room.iter().filter(|r| r.kind == Kind::Managed)
-            .map(|r| (r.name.clone(), Managed { child: None, backoff: Duration::from_secs(1), next_try: Instant::now(), restarts: 0, started: Instant::now() })).collect();
+            .map(|r| (r.name.clone(), Managed { child: None, tree: None, backoff: Duration::from_secs(1), next_try: Instant::now(), restarts: 0, started: Instant::now() })).collect();
         Ok(Self { cfg, log, managed, status, tick: 0, last_beat: BTreeMap::new() })
     }
 
@@ -299,10 +301,16 @@ impl Supervisor {
         let mut cmd = Command::new(&exe);
         cmd.args(&room.args).stdin(Stdio::null()).stdout(out).stderr(err).envs(&room.env);
         if let Some(c) = &room.cwd { cmd.current_dir(c); }
-        let child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", exe.display()))?;
+        let mut child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", exe.display()))?;
         let pid = child.id();
+        // Own the whole tree before the child starts grandchildren; fail closed.
+        let tree = match tree::Tree::adopt(&child) {
+            Ok(t) => t,
+            Err(e) => { let _ = child.kill(); let _ = child.wait(); return Err(format!("{}: {e}", room.name)); }
+        };
         let m = self.managed.get_mut(&room.name).expect("managed entry");
         m.child = Some(child);
+        m.tree = Some(tree);
         m.started = Instant::now();
         Ok(pid)
     }
@@ -321,7 +329,7 @@ impl Supervisor {
                     // Reap.
                     let mut exited = None;
                     if let Some(c) = m.child.as_mut() {
-                        if let Ok(Some(st)) = c.try_wait() { exited = Some(st.code().unwrap_or(-1)); m.child = None; }
+                        if let Ok(Some(st)) = c.try_wait() { exited = Some(st.code().unwrap_or(-1)); m.child = None; m.tree = None; /* drop kills leftover grandchildren */ }
                     }
                     if let Some(code) = exited {
                         m.backoff = (m.backoff * 2).min(Duration::from_secs(30));
@@ -394,7 +402,10 @@ impl Supervisor {
     pub fn shutdown(&mut self) -> std::io::Result<()> {
         let names: Vec<String> = self.managed.keys().cloned().collect();
         for n in names {
+            let tree = self.managed.get_mut(&n).and_then(|m| m.tree.take());
             if let Some(mut c) = self.managed.get_mut(&n).and_then(|m| m.child.take()) {
+                if let Some(t) = &tree { t.kill(); }
+                tree::kill_tree_by_pid(c.id());
                 let _ = c.kill();
                 let _ = c.wait();
                 if let Some(s) = self.status.rooms.get_mut(&n) { s.health = Health::Down; s.pid = None; s.note = "stopped by atrium down".into(); }
