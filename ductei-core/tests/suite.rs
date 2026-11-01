@@ -35,7 +35,41 @@ static DEFAULT_OUTBOX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn default_outbox_guard() -> std::sync::MutexGuard<'static, ()> {
     // A test that failed while holding the lock poisons it; the next test
     // should still run, not fail with a confusing PoisonError.
-    DEFAULT_OUTBOX_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    let g = DEFAULT_OUTBOX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    isolate_default_outbox();
+    g
+}
+
+/// Point the "default" outbox at a per-process temp file before any test
+/// resolves it. Without this, default_outbox_path() is the real per-user
+/// file (~/.ductei/outbox.jsonl when HOME is set), which a live ductei-node
+/// on the same machine is writing: tests raced it (flaky
+/// outbox_kill_and_restart_retry_ack2_default_path) and deleted it
+/// (remove_file in the default-path tests), wiping the node's pending
+/// intents. Every default-path test takes default_outbox_guard() first, so
+/// this runs before any of them reads the variable.
+#[cfg(feature = "net")]
+fn isolate_default_outbox() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let p = std::env::temp_dir().join(format!("ductei-test-outbox-{}.jsonl", std::process::id()));
+        std::env::set_var("DUCTEI_OUTBOX_PATH", p);
+    });
+}
+
+#[cfg(feature = "net")]
+#[test]
+fn tests_never_resolve_the_real_user_outbox() {
+    let _g = default_outbox_guard();
+    let p = ductei_core::transport::default_outbox_path();
+    assert!(p.starts_with(std::env::temp_dir()), "test outbox escaped temp: {}", p.display());
+    for var in ["HOME", "USERPROFILE", "XDG_STATE_HOME"] {
+        if let Ok(home) = std::env::var(var) {
+            let home = std::path::PathBuf::from(home);
+            // temp_dir() can live under the profile on Windows; only the ductei dirs are off limits.
+            assert!(!p.starts_with(home.join(".ductei")) && !p.starts_with(home.join("ductei")), "test outbox is the real one: {}", p.display());
+        }
+    }
 }
 
 #[test]

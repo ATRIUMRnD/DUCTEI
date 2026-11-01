@@ -86,6 +86,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-spec"
+version = "0.1.0"
+dependencies = [
+ "ductei-limen",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -459,12 +469,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ductei-qhr"
+version = "0.1.0"
+dependencies = [
+ "ductei-limen",
+ "ductei-mcp",
+ "ductei-router",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "ductei-router"
 version = "0.1.0"
 dependencies = [
  "ductei-mcp",
  "serde",
  "serde_json",
+ "toml",
 ]
 
 [[package]]

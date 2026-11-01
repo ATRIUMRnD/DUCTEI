@@ -1,11 +1,16 @@
-//! T0 local brain: Ollama on 127.0.0.1 only. Used for classification and
+//! T0 local brain: Ollama on this machine only. Used for classification and
 //! private work. Model output is data; it is parsed into a Task and then
 //! goes through the CANON gate like anything else.
+//!
+//! Host resolution: `DUCTEI_T0_HOST`, then `OLLAMA_HOST` (host[:port]), then
+//! 127.0.0.1:11434. Whatever is chosen must be an address bound on this
+//! machine (loopback or one of its own interfaces, e.g. the Tailscale IP);
+//! anything else is refused so private work cannot leak to another box.
 
 use crate::{Effect, Kind, Task};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::net::TcpStream;
+use std::net::{IpAddr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::time::Duration;
 
 pub trait Brain {
@@ -15,19 +20,44 @@ pub trait Brain {
 
 pub struct Ollama { pub host: String, pub port: u16, pub model: String, pub timeout: Duration }
 
+fn host_from_env() -> (String, u16) {
+    let raw = std::env::var("DUCTEI_T0_HOST").or_else(|_| std::env::var("OLLAMA_HOST")).unwrap_or_default();
+    let raw = raw.trim().trim_start_matches("http://").trim_start_matches("https://").trim_end_matches('/');
+    if raw.is_empty() { return ("127.0.0.1".into(), 11434); }
+    match raw.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() => match p.parse::<u16>() { Ok(port) => (h.to_string(), port), Err(_) => (raw.to_string(), 11434) },
+        _ => (raw.to_string(), 11434),
+    }
+}
+
 impl Default for Ollama {
     fn default() -> Self {
-        Self { host: "127.0.0.1".into(), port: 11434, model: std::env::var("DUCTEI_T0_MODEL").unwrap_or_else(|_| "llama3.2:latest".into()), timeout: Duration::from_secs(60) }
+        let (host, port) = host_from_env();
+        Self { host, port, model: std::env::var("DUCTEI_T0_MODEL").unwrap_or_else(|_| "llama3.2:latest".into()), timeout: Duration::from_secs(60) }
     }
+}
+
+/// True iff `ip` is loopback or an address this machine owns (a UDP bind to
+/// it succeeds). Binding never sends anything.
+pub fn is_local_ip(ip: IpAddr) -> bool {
+    if ip.is_loopback() { return true; }
+    if ip.is_unspecified() { return false; }
+    UdpSocket::bind(SocketAddr::new(ip, 0)).is_ok()
 }
 
 #[derive(Deserialize)]
 struct GenResp { response: String }
 
 impl Ollama {
+    fn addr(&self) -> Result<SocketAddr, String> {
+        if self.host.eq_ignore_ascii_case("localhost") { return Ok(SocketAddr::from(([127, 0, 0, 1], self.port))); }
+        let ip: IpAddr = self.host.parse().map_err(|_| format!("T0 host must be an IP or localhost, got {:?}", self.host))?;
+        if !is_local_ip(ip) { return Err(format!("T0 brain must be local; {ip} is not an address of this machine")); }
+        (ip, self.port).to_socket_addrs().map_err(|e| e.to_string())?.next().ok_or_else(|| "no addr".into())
+    }
     fn post(&self, path: &str, body: &str) -> Result<String, String> {
-        if self.host != "127.0.0.1" && self.host != "localhost" { return Err("T0 brain must be local".into()); }
-        let mut s = TcpStream::connect_timeout(&format!("{}:{}", self.host, self.port).parse().map_err(|e| format!("{e}"))?, Duration::from_secs(3)).map_err(|e| format!("ollama not reachable: {e}"))?;
+        let addr = self.addr()?;
+        let mut s = TcpStream::connect_timeout(&addr, Duration::from_secs(3)).map_err(|e| format!("ollama not reachable at {addr}: {e}"))?;
         s.set_read_timeout(Some(self.timeout)).map_err(|e| e.to_string())?;
         let req = format!("POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", self.host, body.len());
         s.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
@@ -49,7 +79,7 @@ impl Ollama {
 }
 
 impl Brain for Ollama {
-    fn name(&self) -> String { format!("ollama:{}", self.model) }
+    fn name(&self) -> String { format!("ollama:{}@{}:{}", self.model, self.host, self.port) }
     fn complete(&self, system: &str, prompt: &str) -> Result<String, String> {
         let body = serde_json::json!({ "model": self.model, "system": system, "prompt": prompt, "stream": false, "format": "json", "options": { "temperature": 0 } }).to_string();
         let raw = self.post("/api/generate", &body)?;
@@ -87,13 +117,50 @@ fn lenient_effect(v: serde_json::Value) -> Option<Effect> {
     })
 }
 
+/// A classification plus where it came from. `fallback` is Some(reason) when
+/// the brain was unreachable or unparsable; callers must treat such a Task as
+/// unverified (the hook asks for approval instead of allowing).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Classification { pub task: Task, pub brain: String, #[serde(default)] pub fallback: Option<String> }
+
 /// Turn a raw intent into a Task via the local brain. Fallible and bounded:
-/// bad model output falls back to a conservative T1 code task with no effects.
-pub fn classify(brain: &dyn Brain, id: &str, intent: &str) -> Task {
-    let fallback = Task { id: id.into(), intent: intent.into(), kind: Kind::Code, criticality: 2, private: false, effects: vec![] };
-    let raw = match brain.complete(CLASSIFY_SYSTEM, intent) { Ok(r) => r, Err(e) => { eprintln!("t0: {e}; fallback"); return fallback } };
+/// bad model output falls back to a conservative criticality-3 code task
+/// with no effects, and says so.
+pub fn classify(brain: &dyn Brain, id: &str, intent: &str) -> Classification {
+    let fallback = |why: String| Classification {
+        task: Task { id: id.into(), intent: intent.into(), kind: Kind::Code, criticality: 3, private: false, effects: vec![] },
+        brain: brain.name(), fallback: Some(why),
+    };
+    let raw = match brain.complete(CLASSIFY_SYSTEM, intent) { Ok(r) => r, Err(e) => { eprintln!("t0: {e}; fallback"); return fallback(e) } };
     match serde_json::from_str::<Classified>(&raw) {
-        Ok(c) => Task { id: id.into(), intent: intent.into(), kind: c.kind, criticality: c.criticality.min(3), private: c.private, effects: c.effects.into_iter().filter_map(lenient_effect).collect() },
-        Err(e) => { eprintln!("t0: unparsable {raw:?} ({e}); fallback"); fallback }
+        Ok(c) => Classification {
+            task: Task { id: id.into(), intent: intent.into(), kind: c.kind, criticality: c.criticality.min(3), private: c.private, effects: c.effects.into_iter().filter_map(lenient_effect).collect() },
+            brain: brain.name(), fallback: None,
+        },
+        Err(e) => { eprintln!("t0: unparsable {raw:?} ({e}); fallback"); fallback(format!("unparsable model output: {e}")) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    struct Dead;
+    impl Brain for Dead { fn name(&self) -> String { "dead".into() } fn complete(&self, _: &str, _: &str) -> Result<String, String> { Err("down".into()) } }
+    struct Fixed(&'static str);
+    impl Brain for Fixed { fn name(&self) -> String { "fixed".into() } fn complete(&self, _: &str, _: &str) -> Result<String, String> { Ok(self.0.into()) } }
+
+    #[test] fn dead_brain_is_visible_and_conservative() {
+        let c = classify(&Dead, "a", "commit and push");
+        assert!(c.fallback.is_some()); assert_eq!(c.task.criticality, 3); assert!(c.task.effects.is_empty());
+    }
+    #[test] fn parsed_brain_keeps_effects() {
+        let c = classify(&Fixed(r#"{"kind":"code","criticality":9,"effects":[{"type":"push"},{"type":"bogus"}]}"#), "a", "x");
+        assert!(c.fallback.is_none()); assert_eq!(c.task.criticality, 3); assert_eq!(c.task.effects, vec![Effect::Push]);
+    }
+    #[test] fn remote_host_refused_local_allowed() {
+        assert!(is_local_ip("127.0.0.1".parse().unwrap()));
+        assert!(!is_local_ip("1.1.1.1".parse().unwrap()));
+        let o = Ollama { host: "8.8.8.8".into(), port: 11434, model: "m".into(), timeout: Duration::from_secs(1) };
+        assert!(o.addr().unwrap_err().contains("must be local"));
     }
 }

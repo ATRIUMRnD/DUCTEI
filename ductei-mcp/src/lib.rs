@@ -104,8 +104,29 @@ pub struct LogCfg {
     /// Windows: on every start, reset the dir's ACL to this user + SYSTEM only.
     #[serde(default = "yes")]
     pub restrict_acl: bool,
+    /// Receipt durability. 1 (default) = fsync every receipt (the verified
+    /// tier). N > 1 = fast lane: fsync every N receipts or when `sync_max_ms`
+    /// has passed since the last fsync, whichever comes first, plus always at
+    /// exit. Receipts are still hash-chained and signed one by one; only the
+    /// crash-loss window changes (at most the last N unsynced receipts), and
+    /// a truncated tail is still caught by anchors.
+    #[serde(default = "one")]
+    pub sync_every: u64,
+    /// Fast lane only: upper bound in ms between fsyncs while receipts flow.
+    /// 0 = count-only. Checked at the next record, so an idle tail waits for
+    /// exit or the next receipt.
+    #[serde(default)]
+    pub sync_max_ms: u64,
+    /// Fast lane only: fsync on a background thread every `sync_max_ms`
+    /// (10 ms when unset) so `record` never waits on the disk, except as
+    /// backpressure when `sync_every` receipts are pending. A failed
+    /// background fsync stops the gate (fail closed). Ignored when
+    /// `sync_every` = 1.
+    #[serde(default)]
+    pub sync_background: bool,
 }
 fn yes() -> bool { true }
+fn one() -> u64 { 1 }
 
 #[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq, Eq)]
 pub enum Scheme {
@@ -178,7 +199,7 @@ impl Config {
 }
 
 impl Default for LogCfg {
-    fn default() -> Self { Self { dir: None, restrict_acl: true } }
+    fn default() -> Self { Self { dir: None, restrict_acl: true, sync_every: 1, sync_max_ms: 0, sync_background: false } }
 }
 
 pub fn scope_for(server: &str, tool: &str) -> String {
@@ -192,7 +213,7 @@ pub fn to_hex(bytes: &[u8]) -> String {
 }
 
 pub fn from_hex(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 { return None; }
+    if !s.len().is_multiple_of(2) { return None; }
     (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).ok()).collect()
 }
 
@@ -216,7 +237,7 @@ pub fn load_or_create_node_id(dir: &Path) -> std::io::Result<[u8; 16]> {
         }
     }
     let mut id = [0u8; 16];
-    getrandom::getrandom(&mut id).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    getrandom::getrandom(&mut id).map_err(|e| std::io::Error::other(e.to_string()))?;
     fs::write(&path, to_hex(&id))?;
     Ok(id)
 }
@@ -275,16 +296,61 @@ pub fn signing_message(hash_hex: &str) -> Vec<u8> {
 
 const GENESIS: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
+/// When receipts.jsonl is fsynced. See `LogCfg::sync_every`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Durability {
+    pub sync_every: u64,
+    pub sync_max_ms: u64,
+    /// fsync on a background thread every `sync_max_ms`; `record` never
+    /// fsyncs inline unless `sync_every` receipts are pending (backpressure).
+    pub background: bool,
+}
+impl Default for Durability {
+    fn default() -> Self { Self { sync_every: 1, sync_max_ms: 0, background: false } }
+}
+/// Background flush interval when `background` is set but no interval is.
+pub const DEFAULT_BACKGROUND_SYNC_MS: u64 = 10;
+impl Durability {
+    pub fn from_log(cfg: &LogCfg) -> Self {
+        let background = cfg.sync_background && cfg.sync_every > 1;
+        let sync_max_ms = if background && cfg.sync_max_ms == 0 { DEFAULT_BACKGROUND_SYNC_MS } else { cfg.sync_max_ms };
+        Self { sync_every: cfg.sync_every.max(1), sync_max_ms, background }
+    }
+}
+
+/// The background fsync thread of a `ReceiptLog`, stopped and joined on drop.
+struct Flusher { stop: std::sync::Arc<std::sync::atomic::AtomicBool>, handle: Option<std::thread::JoinHandle<()>> }
+
 /// Append-only receipts.jsonl with an in-memory chain head.
 pub struct ReceiptLog {
     file: File,
     pub seq: u64,
     pub head: String,
     pub signer: Signer,
+    durability: Durability,
+    /// Receipts written / known durable since open. Shared with the flusher.
+    written: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    synced: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// fsyncs performed, inline and background (observable in tests and the exit line).
+    syncs: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Set by the flusher when an fsync fails; the next record/flush fails closed.
+    bg_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    last_sync: std::time::Instant,
+    flusher: Option<Flusher>,
 }
 
 impl ReceiptLog {
     pub fn open(dir: &Path, sign: &SignCfg) -> Result<Self, String> {
+        Self::open_with(dir, sign, Durability::default())
+    }
+
+    pub fn open_with(dir: &Path, sign: &SignCfg, durability: Durability) -> Result<Self, String> {
+        Self::open_in(dir, dir, sign, durability)
+    }
+
+    /// Receipts in `dir`, signing key in `key_dir`. Lets several chains share
+    /// one key (one fingerprint to pin), as QHR does with verified/ and fast/.
+    pub fn open_in(dir: &Path, key_dir: &Path, sign: &SignCfg, durability: Durability) -> Result<Self, String> {
         let path = dir.join("receipts.jsonl");
         let (seq, head) = match File::open(&path) {
             Ok(f) => {
@@ -307,11 +373,39 @@ impl ReceiptLog {
             Err(_) => (0, GENESIS.to_string()),
         };
         let file = OpenOptions::new().create(true).append(true).open(&path).map_err(|e| e.to_string())?;
-        let signer = Signer::load_or_create(dir, sign)?;
-        Ok(Self { file, seq, head, signer })
+        let signer = Signer::load_or_create(key_dir, sign)?;
+        use std::sync::{atomic::{AtomicBool, AtomicU64}, Arc};
+        let written = Arc::new(AtomicU64::new(0));
+        let synced = Arc::new(AtomicU64::new(0));
+        let syncs = Arc::new(AtomicU64::new(0));
+        let bg_failed = Arc::new(AtomicBool::new(false));
+        let flusher = if durability.background {
+            let f = file.try_clone().map_err(|e| format!("{}: clone for background fsync: {e}", path.display()))?;
+            Some(spawn_flusher(f, durability.sync_max_ms.max(1), written.clone(), synced.clone(), syncs.clone(), bg_failed.clone())?)
+        } else { None };
+        Ok(Self { file, seq, head, signer, durability, written, synced, syncs, bg_failed, last_sync: std::time::Instant::now(), flusher })
+    }
+
+    pub fn durability(&self) -> Durability { self.durability }
+
+    /// Receipts written but not yet fsynced (0 in the verified tier).
+    pub fn unsynced(&self) -> u64 {
+        use std::sync::atomic::Ordering::Acquire;
+        self.written.load(Acquire).saturating_sub(self.synced.load(Acquire))
+    }
+
+    /// fsyncs performed so far, inline and background.
+    pub fn syncs(&self) -> u64 { self.syncs.load(std::sync::atomic::Ordering::Acquire) }
+
+    fn check_background(&self) -> std::io::Result<()> {
+        if self.bg_failed.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(std::io::Error::other("background fsync of receipts.jsonl failed; refusing to continue unsynced"));
+        }
+        Ok(())
     }
 
     pub fn record(&mut self, mut body: ReceiptBody) -> std::io::Result<Receipt> {
+        self.check_background()?;
         body.v = RECEIPT_VERSION;
         body.seq = self.seq;
         body.prev = self.head.clone();
@@ -320,10 +414,73 @@ impl ReceiptLog {
         let sig = self.signer.sign(&signing_message(&hash));
         let r = Receipt { body, hash: hash.clone(), scheme: self.signer.scheme.as_str().into(), sig };
         writeln!(self.file, "{}", serde_json::to_string(&r)?)?;
-        self.file.sync_data()?;
+        // Count only after the line is written, so the flusher never claims
+        // durability for a line that is not in the file yet.
+        self.written.fetch_add(1, std::sync::atomic::Ordering::Release);
+        let d = self.durability;
+        let due_by_count = self.unsynced() >= d.sync_every;
+        let due_by_time = !d.background && d.sync_max_ms > 0 && self.last_sync.elapsed().as_millis() as u64 >= d.sync_max_ms;
+        if due_by_count || due_by_time {
+            self.flush()?;
+        }
+        // The chain head advances only after the line is written; on a failed
+        // fsync the error surfaces to the caller and the head stays behind.
         self.seq += 1;
         self.head = hash;
         Ok(r)
+    }
+
+    /// fsync anything not yet synced. No-op when nothing is pending. Called
+    /// before every anchor and at every exit path of the gate.
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire};
+        self.check_background()?;
+        let w = self.written.load(Acquire);
+        if w <= self.synced.load(Acquire) { return Ok(()); }
+        self.file.sync_data()?;
+        self.synced.fetch_max(w, AcqRel);
+        self.syncs.fetch_add(1, AcqRel);
+        self.last_sync = std::time::Instant::now();
+        Ok(())
+    }
+}
+
+fn spawn_flusher(
+    file: File,
+    every_ms: u64,
+    written: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    synced: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    syncs: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<Flusher, String> {
+    use std::sync::atomic::{AtomicBool, Ordering::{AcqRel, Acquire, Release}};
+    let stop = std::sync::Arc::new(AtomicBool::new(false));
+    let s = stop.clone();
+    let interval = std::time::Duration::from_millis(every_ms);
+    let handle = std::thread::Builder::new().name("receipts-fsync".into()).spawn(move || {
+        while !s.load(Acquire) {
+            std::thread::park_timeout(interval);
+            // Read the count first: every line it covers is already in the file.
+            let w = written.load(Acquire);
+            if w > synced.load(Acquire) {
+                match file.sync_data() {
+                    Ok(()) => { synced.fetch_max(w, AcqRel); syncs.fetch_add(1, AcqRel); }
+                    Err(e) => { eprintln!("ductei-mcp: background fsync failed: {e}"); failed.store(true, Release); return; }
+                }
+            }
+        }
+    }).map_err(|e| format!("spawn background fsync: {e}"))?;
+    Ok(Flusher { stop, handle: Some(handle) })
+}
+
+impl Drop for ReceiptLog {
+    fn drop(&mut self) {
+        if let Some(mut f) = self.flusher.take() {
+            f.stop.store(true, std::sync::atomic::Ordering::Release);
+            if let Some(h) = f.handle.take() { h.thread().unpark(); let _ = h.join(); }
+        }
+        // Best effort: whatever is still pending goes to disk on the way out.
+        let _ = self.flush();
     }
 }
 
@@ -505,8 +662,35 @@ fn blob_hashes(path: &Path, flags: u16) -> HashSet<String> {
 }
 
 /// Recompute the chain, every signature, the key pin, and cross-check each
-/// receipt's hashes against the channel / denied logs.
+/// receipt's hashes against the channel / denied logs (the gate's receipts).
 pub fn verify_receipts(dir: &Path, trust: &VerifyTrust) -> Result<VerifyReport, String> {
+    let calls = blob_hashes(&dir.join("channel.jsonl"), 0);
+    let results = blob_hashes(&dir.join("channel.jsonl"), 1);
+    let denied = blob_hashes(&dir.join("denied.jsonl"), 0);
+    let sessions = blob_hashes(&dir.join("sessions.jsonl"), 0);
+    verify_chain(dir, trust, |r, rep| {
+        let s = r.body.seq;
+        match r.body.verdict.as_str() {
+            "accepted" => {
+                if !calls.contains(&r.body.call_sha256) { rep.errors.push(format!("seq {s}: call not found in channel.jsonl")); }
+                if !results.contains(&r.body.result_sha256) { rep.errors.push(format!("seq {s}: result not found in channel.jsonl")); }
+            }
+            "denied" => {
+                if !denied.contains(&r.body.call_sha256) { rep.errors.push(format!("seq {s}: denied call not found in denied.jsonl")); }
+            }
+            "session" => {
+                if !sessions.contains(&r.body.call_sha256) { rep.errors.push(format!("seq {s}: session policy not found in sessions.jsonl")); }
+            }
+            v => rep.errors.push(format!("seq {s}: unknown verdict {v}")),
+        }
+    })
+}
+
+/// Chain, signatures, key pin and anchors for any receipts.jsonl written by
+/// `ReceiptLog`. `check` sees every parsed receipt and adds log-specific
+/// errors (the gate cross-checks its channel; QHR and the router check their
+/// verdict vocabulary).
+pub fn verify_chain(dir: &Path, trust: &VerifyTrust, mut check: impl FnMut(&Receipt, &mut VerifyReport)) -> Result<VerifyReport, String> {
     let path = dir.join("receipts.jsonl");
     let f = File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
     let mut rep = VerifyReport::default();
@@ -530,11 +714,6 @@ pub fn verify_receipts(dir: &Path, trust: &VerifyTrust) -> Result<VerifyReport, 
     }
     let kid = pk.as_ref().map(|(_, b)| sha256_hex(b));
     rep.kid = kid.clone();
-
-    let calls = blob_hashes(&dir.join("channel.jsonl"), 0);
-    let results = blob_hashes(&dir.join("channel.jsonl"), 1);
-    let denied = blob_hashes(&dir.join("denied.jsonl"), 0);
-    let sessions = blob_hashes(&dir.join("sessions.jsonl"), 0);
 
     let mut expect_seq = 0u64;
     let mut prev = GENESIS.to_string();
@@ -564,19 +743,7 @@ pub fn verify_receipts(dir: &Path, trust: &VerifyTrust) -> Result<VerifyReport, 
         } else if !r.body.kid.is_empty() {
             rep.errors.push(format!("seq {s}: unsigned receipt carries kid"));
         }
-        match r.body.verdict.as_str() {
-            "accepted" => {
-                if !calls.contains(&r.body.call_sha256) { rep.errors.push(format!("seq {s}: call not found in channel.jsonl")); }
-                if !results.contains(&r.body.result_sha256) { rep.errors.push(format!("seq {s}: result not found in channel.jsonl")); }
-            }
-            "denied" => {
-                if !denied.contains(&r.body.call_sha256) { rep.errors.push(format!("seq {s}: denied call not found in denied.jsonl")); }
-            }
-            "session" => {
-                if !sessions.contains(&r.body.call_sha256) { rep.errors.push(format!("seq {s}: session policy not found in sessions.jsonl")); }
-            }
-            v => rep.errors.push(format!("seq {s}: unknown verdict {v}")),
-        }
+        check(&r, &mut rep);
         expect_seq = s + 1;
         hashes.insert(s, r.hash.clone());
         prev = r.hash;
@@ -627,13 +794,16 @@ pub struct Signer {
 
 impl Signer {
     fn pk_path(dir: &Path, scheme: Scheme) -> PathBuf { dir.join(format!("gate-{}.pk", scheme.as_str())) }
+    #[cfg_attr(not(feature = "sign"), allow(dead_code))]
     fn sk_plain_path(dir: &Path, scheme: Scheme) -> PathBuf { dir.join(format!("gate-{}.sk", scheme.as_str())) }
+    #[cfg_attr(not(feature = "sign"), allow(dead_code))]
     fn sk_dpapi_path(dir: &Path, scheme: Scheme) -> PathBuf { dir.join(format!("gate-{}.sk.dpapi", scheme.as_str())) }
 
     pub fn scheme_for_pubkey_len(len: usize) -> Option<Scheme> {
         match len { 1952 => Some(Scheme::MlDsa65), 2592 => Some(Scheme::MlDsa87), _ => None }
     }
 
+    #[cfg_attr(not(feature = "sign"), allow(dead_code))]
     fn effective_store(cfg: &SignCfg) -> Result<KeyStore, String> {
         let store = match cfg.key_store {
             KeyStore::Auto => if cfg!(windows) { KeyStore::Dpapi } else { KeyStore::Plaintext },
@@ -708,7 +878,7 @@ impl Signer {
         #[cfg(feature = "sign")]
         {
             let sk = self.secret.as_ref()?;
-            return Some(to_hex(&pq::sign(self.scheme, sk, msg)));
+            Some(to_hex(&pq::sign(self.scheme, sk, msg)))
         }
         #[cfg(not(feature = "sign"))]
         { let _ = msg; None }
@@ -903,7 +1073,7 @@ impl Gate {
             channel,
             denied,
             sessions,
-            receipts: ReceiptLog::open(dir, &cfg.sign)?,
+            receipts: ReceiptLog::open_with(dir, &cfg.sign, Durability::from_log(&cfg.log))?,
             pending: HashMap::new(),
             pending_lists: HashSet::new(),
             allow: cfg.policy.allow.iter().cloned().collect(),
@@ -925,7 +1095,9 @@ impl Gate {
     /// anchors.jsonl and hand it to the pusher. Local write first, so an
     /// anchor is never in flight without a record of it.
     fn maybe_anchor(&mut self) {
-        if self.anchor_every == 0 || self.receipts.seq % self.anchor_every != 0 { return; }
+        if self.anchor_every == 0 || !self.receipts.seq.is_multiple_of(self.anchor_every) { return; }
+        // An anchor asserts the head is on disk. Fast lane: make that true first.
+        if let Err(e) = self.receipts.flush() { eprintln!("ductei-mcp-gate: receipts fsync before anchor failed: {e}; anchor skipped"); return; }
         let Some(env) = self.anchor_now() else { return };
         if let Err(e) = self.anchors.append(&env) { eprintln!("ductei-mcp-gate: anchors.jsonl append failed: {e}"); return; }
         if let Some(tx) = &self.anchor_tx { let _ = tx.send(env); }
@@ -1161,7 +1333,7 @@ pub struct LaunchRecord {
 /// Returns (nonce hex for the child's env, record written to the log dir).
 pub fn new_launch(dir: &Path, server: &str, node: [u8; 16]) -> std::io::Result<(String, LaunchRecord)> {
     let mut nonce = [0u8; 32];
-    getrandom::getrandom(&mut nonce).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    getrandom::getrandom(&mut nonce).map_err(|e| std::io::Error::other(e.to_string()))?;
     let nonce_hex = to_hex(&nonce);
     let rec = LaunchRecord { v: 1, gate_pid: std::process::id(), node_id: to_hex(&node), nonce_sha256: sha256_hex(nonce_hex.as_bytes()), server: server.into() };
     fs::write(dir.join(GATE_LAUNCH_FILE), serde_json::to_string(&rec)?)?;
@@ -1468,6 +1640,126 @@ mod tests {
         let text = fs::read_to_string(&p).unwrap().replace("\"verdict\":\"accepted\"", "\"verdict\":\"denied\"");
         fs::write(&p, text).unwrap();
         assert!(!verify_receipts(&d, &unpinned()).unwrap().ok());
+    }
+
+    fn body(i: u64) -> ReceiptBody {
+        ReceiptBody::new("k".into(), "mcp:t:echo".into(), "accepted", i, i, sha256_hex(b"c"), sha256_hex(b"r"))
+    }
+
+    #[test]
+    fn verified_tier_fsyncs_every_receipt() {
+        let d = tmp();
+        let mut log = ReceiptLog::open(&d, &SignCfg::default()).unwrap();
+        for i in 0..5 { log.record(body(i)).unwrap(); assert_eq!(log.unsynced(), 0); }
+        assert_eq!(log.syncs(), 5);
+        assert_eq!(log.durability(), Durability::default());
+    }
+
+    #[test]
+    fn fast_lane_fsyncs_by_count_and_on_flush() {
+        let d = tmp();
+        let dur = Durability { sync_every: 4, sync_max_ms: 0, background: false };
+        let mut log = ReceiptLog::open_with(&d, &SignCfg::default(), dur).unwrap();
+        for i in 0..10 { log.record(body(i)).unwrap(); }
+        // 10 receipts, sync at 4 and 8, two left pending.
+        assert_eq!(log.syncs(), 2);
+        assert_eq!(log.unsynced(), 2);
+        log.flush().unwrap();
+        assert_eq!((log.syncs(), log.unsynced()), (3, 0));
+        log.flush().unwrap();
+        assert_eq!(log.syncs(), 3, "flush with nothing pending is a no-op");
+        // Chain is intact and reopenable regardless of the sync schedule.
+        drop(log);
+        let reopened = ReceiptLog::open(&d, &SignCfg::default()).unwrap();
+        assert_eq!(reopened.seq, 10);
+    }
+
+    #[test]
+    fn fast_lane_fsyncs_by_time() {
+        let d = tmp();
+        let dur = Durability { sync_every: 1_000, sync_max_ms: 20, background: false };
+        let mut log = ReceiptLog::open_with(&d, &SignCfg::default(), dur).unwrap();
+        log.record(body(0)).unwrap();
+        assert_eq!(log.syncs(), 0);
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        log.record(body(1)).unwrap();
+        assert_eq!((log.syncs(), log.unsynced()), (1, 0), "second record is past sync_max_ms");
+    }
+
+    #[test]
+    fn fast_lane_gate_receipts_still_verify_and_anchor_flushes_first() {
+        let d = tmp();
+        let mut c = cfg(&["echo"], 10);
+        c.log.sync_every = 100;
+        c.anchor = AnchorCfg { every: 2, ..Default::default() };
+        let mut g = Gate::open(&c, &d).unwrap();
+        for i in 1..=3u32 {
+            g.on_client_line(&call(i, "echo"));
+            g.on_server_line(&format!(r#"{{"jsonrpc":"2.0","id":{i},"result":{i}}}"#)).unwrap();
+        }
+        // 3 call receipts (the session receipt is the binary's job). sync_every=100
+        // would never have synced on its own; the anchor at seq 2 forced exactly
+        // one fsync, and the third receipt is still pending.
+        assert_eq!(g.receipts.seq, 3);
+        assert_eq!(g.receipts.syncs(), 1, "anchor must fsync before asserting a head");
+        assert_eq!(g.receipts.unsynced(), 1);
+        g.receipts.flush().unwrap();
+        assert_eq!((g.receipts.syncs(), g.receipts.unsynced()), (2, 0));
+        assert!(verify_receipts(&d, &unpinned()).unwrap().ok());
+    }
+
+    #[test]
+    fn background_flusher_drains_without_inline_fsync_and_backpressures() {
+        let d = tmp();
+        let dur = Durability { sync_every: 50, sync_max_ms: 5, background: true };
+        let mut log = ReceiptLog::open_with(&d, &SignCfg::default(), dur).unwrap();
+        for i in 0..10 { log.record(body(i)).unwrap(); }
+        // Nothing was fsynced inline (10 < 50 and background mode ignores the timer inline).
+        // Give the flusher a few intervals; it must drain on its own.
+        let t = std::time::Instant::now();
+        while log.unsynced() > 0 && t.elapsed() < std::time::Duration::from_secs(2) { std::thread::sleep(std::time::Duration::from_millis(2)); }
+        assert_eq!(log.unsynced(), 0, "background thread did not drain");
+        assert!(log.syncs() >= 1);
+        // Backpressure: write faster than the flusher with a tiny window.
+        let dur2 = Durability { sync_every: 3, sync_max_ms: 1_000, background: true };
+        let d2 = tmp();
+        let mut log2 = ReceiptLog::open_with(&d2, &SignCfg::default(), dur2).unwrap();
+        for i in 0..9 { log2.record(body(i)).unwrap(); assert!(log2.unsynced() < 3, "backpressure must cap pending below sync_every"); }
+        assert!(log2.syncs() >= 3);
+    }
+
+    #[test]
+    fn dropping_a_background_log_leaves_nothing_pending_and_chain_reopens() {
+        let d = tmp();
+        {
+            let dur = Durability { sync_every: 1_000, sync_max_ms: 10_000, background: true };
+            let mut log = ReceiptLog::open_with(&d, &SignCfg::default(), dur).unwrap();
+            for i in 0..7 { log.record(body(i)).unwrap(); }
+            assert_eq!(log.unsynced(), 7);
+            // drop: stops the thread, final flush
+        }
+        let reopened = ReceiptLog::open(&d, &SignCfg::default()).unwrap();
+        assert_eq!(reopened.seq, 7);
+    }
+
+    #[test]
+    fn log_cfg_background_mapping() {
+        let c: LogCfg = toml::from_str("sync_every = 100\nsync_background = true").unwrap();
+        assert_eq!(Durability::from_log(&c), Durability { sync_every: 100, sync_max_ms: DEFAULT_BACKGROUND_SYNC_MS, background: true });
+        let c: LogCfg = toml::from_str("sync_background = true").unwrap();
+        assert!(!Durability::from_log(&c).background, "verified tier never goes background");
+        let c: LogCfg = toml::from_str("sync_every = 8\nsync_max_ms = 3\nsync_background = true").unwrap();
+        assert_eq!(Durability::from_log(&c), Durability { sync_every: 8, sync_max_ms: 3, background: true });
+    }
+
+    #[test]
+    fn log_cfg_durability_defaults_to_verified_tier() {
+        let c: LogCfg = toml::from_str("").unwrap();
+        assert_eq!((c.sync_every, c.sync_max_ms), (1, 0));
+        let c: LogCfg = toml::from_str("sync_every = 0").unwrap();
+        assert_eq!(Durability::from_log(&c).sync_every, 1, "0 is clamped, never 'never sync'");
+        let c: LogCfg = toml::from_str("sync_every = 50\nsync_max_ms = 10").unwrap();
+        assert_eq!(Durability::from_log(&c), Durability { sync_every: 50, sync_max_ms: 10, background: false });
     }
 
     #[test]

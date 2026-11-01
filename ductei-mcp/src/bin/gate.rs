@@ -222,7 +222,9 @@ fn run(config_path: &Path) -> i32 {
             }
         }
         g.anchor_tx = None;
-        eprintln!("ductei-mcp-gate: exit, calls={} receipts={} head={}", g.calls, g.receipts.seq, &g.receipts.head[..16]);
+        // Fast lane: whatever is still unsynced goes to disk before we report.
+        if let Err(e) = g.receipts.flush() { eprintln!("ductei-mcp-gate: final receipts fsync failed: {e}"); }
+        eprintln!("ductei-mcp-gate: exit, calls={} receipts={} head={} fsyncs={}", g.calls, g.receipts.seq, &g.receipts.head[..16], g.receipts.syncs());
     }
     if let Some(t) = anchor_thread { let _ = t.join(); }
     let _ = std::fs::remove_file(dir.join(ductei_mcp::GATE_LAUNCH_FILE));
@@ -238,11 +240,22 @@ fn restrict_acl(dir: &Path) -> Result<(), String> {
         (Ok(d), Ok(u)) => format!("{d}\\{u}"),
         _ => return Err("restrict_acl: USERDOMAIN/USERNAME not set".into()),
     };
+    // Restrict the directory itself, then make every child inherit from it.
+    // Never pass (OI)(CI) grants with /T: on a file those flags mean
+    // "inherit-only", so the file ends up with an empty effective ACL and
+    // nothing, the gate included, can open it.
     let out = Command::new("icacls").arg(dir)
-        .args(["/inheritance:r", "/grant:r", &format!("{user}:(OI)(CI)F"), "*S-1-5-18:(OI)(CI)F", "/T", "/Q"])
+        .args(["/inheritance:r", "/grant:r", &format!("{user}:(OI)(CI)F"), "*S-1-5-18:(OI)(CI)F", "/Q"])
         .output().map_err(|e| format!("restrict_acl: icacls: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("restrict_acl: icacls failed: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)));
+    }
+    let mut children = dir.as_os_str().to_owned();
+    children.push("\\*");
+    let out = Command::new("icacls").arg(&children).args(["/reset", "/T", "/Q"])
+        .output().map_err(|e| format!("restrict_acl: icacls reset: {e}"))?;
     if out.status.success() { Ok(()) } else {
-        Err(format!("restrict_acl: icacls failed: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
+        Err(format!("restrict_acl: icacls reset failed: {}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
     }
 }
 

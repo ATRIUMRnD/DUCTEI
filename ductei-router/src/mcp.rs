@@ -3,12 +3,24 @@
 //! Input from the client is data; it is parsed, never executed.
 
 use crate::*;
-use ductei_mcp::{ReceiptBody, ReceiptLog, SignCfg};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::path::Path;
 
 const PROTOCOL: &str = "2024-11-05";
+
+/// Extra tools a downstream crate (ductei-qhr) adds to this server.
+/// `call` returns None when the name is not one of its tools, so the
+/// router's own tools are tried next. Names must not collide with
+/// decide / classify / outcome.
+pub trait ToolExt {
+    fn tools(&self) -> Vec<Value> { Vec::new() }
+    fn call(&mut self, _name: &str, _args: &Value) -> Option<Result<Value, String>> { None }
+}
+
+/// No extension: the plain router server.
+pub struct NoExt;
+impl ToolExt for NoExt {}
 
 fn tools() -> Value {
     json!([
@@ -16,7 +28,7 @@ fn tools() -> Value {
           "inputSchema": { "type": "object", "required": ["task"], "properties": {
               "task": { "type": "object", "description": "Task: id, intent, kind (classify|chat|code|research|quantum), criticality 0-3, private bool, effects [{type: read|write|delete|commit|push|send|purchase|network, target}]" },
               "approvals": { "type": "array", "items": { "type": "string" }, "description": "Approval tokens the user granted in chat, e.g. commit, push, delete:d:\\\\atrium\\\\x" } } } },
-        { "name": "classify", "description": "Turn a raw request into a Task using the local T0 brain (Ollama, never leaves the machine). Then call decide with the result.",
+        { "name": "classify", "description": "Turn a raw request into a Task using the local T0 brain (Ollama, never leaves the machine). Returns {task, brain, fallback}. If fallback is non-null the brain was unavailable and the task is an unverified conservative guess: do not treat an allow on it as permission for side effects. Then call decide with result.task.",
           "inputSchema": { "type": "object", "required": ["intent"], "properties": { "intent": { "type": "string" }, "id": { "type": "string" } } } },
         { "name": "outcome", "description": "Record whether a routed task succeeded on its tier, so routing can learn.",
           "inputSchema": { "type": "object", "required": ["task", "tier", "ok"], "properties": {
@@ -24,7 +36,7 @@ fn tools() -> Value {
     ])
 }
 
-fn call(state: &Path, name: &str, args: &Value) -> Result<Value, String> {
+fn call(router: &mut Router, state: &Path, name: &str, args: &Value) -> Result<Value, String> {
     if name == "classify" {
         let intent = args.get("intent").and_then(Value::as_str).ok_or("missing intent")?;
         let id = args.get("id").and_then(Value::as_str).map(String::from).unwrap_or_else(|| format!("c{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)));
@@ -36,14 +48,7 @@ fn call(state: &Path, name: &str, args: &Value) -> Result<Value, String> {
     match name {
         "decide" => {
             let approvals: Vec<String> = serde_json::from_value(args.get("approvals").cloned().unwrap_or(json!([]))).map_err(|e| format!("bad approvals: {e}"))?;
-            let canon = Canon::default();
-            let verdict = canon.check(&task, &approvals);
-            let (tier, reason, escalated) = route(&task, &Stats::load(&outcomes).map_err(|e| e.to_string())?);
-            let d = Decision { task_id: task.id.clone(), tier, reason, escalated, verdict };
-            let mut log = ReceiptLog::open(state, &SignCfg::default())?;
-            let scope = format!("router:{}", serde_json::to_value(tier).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default());
-            let r = log.record(ReceiptBody::new(task.id.clone(), scope, d.verdict.label(), 0, 0, sha256_json(&task), sha256_json(&d))).map_err(|e| e.to_string())?;
-            Ok(json!({ "decision": d, "receipt": r.hash }))
+            serde_json::to_value(router.decide(&task, &approvals)?).map_err(|e| e.to_string())
         }
         "outcome" => {
             let tier: Tier = serde_json::from_value(args.get("tier").cloned().unwrap_or(Value::Null)).map_err(|e| format!("bad tier: {e}"))?;
@@ -63,8 +68,15 @@ fn reply(out: &mut impl Write, id: Value, body: Result<Value, (i64, String)>) {
     let _ = writeln!(out, "{msg}"); let _ = out.flush();
 }
 
-pub fn serve(state: &Path) -> std::io::Result<()> {
+pub fn serve(state: &Path) -> std::io::Result<()> { serve_with(state, &mut NoExt, "ductei-router") }
+
+/// Serve the router tools plus `ext`'s tools under one MCP server named `name`.
+pub fn serve_with(state: &Path, ext: &mut dyn ToolExt, name: &str) -> std::io::Result<()> {
     std::fs::create_dir_all(state)?;
+    let mut all_tools = tools();
+    if let Some(list) = all_tools.as_array_mut() { list.extend(ext.tools()); }
+    // Opened once: the chain is verified at start, then each decide is one append.
+    let mut router = Router::open(state).map_err(std::io::Error::other)?;
     let stdin = std::io::stdin(); let mut out = std::io::stdout().lock();
     for line in stdin.lock().lines() {
         let line = line?; if line.trim().is_empty() { continue; }
@@ -74,13 +86,14 @@ pub fn serve(state: &Path) -> std::io::Result<()> {
         if id.is_null() { continue; } // notification
         let params = req.get("params").cloned().unwrap_or(json!({}));
         let res = match method {
-            "initialize" => Ok(json!({ "protocolVersion": PROTOCOL, "capabilities": { "tools": {} }, "serverInfo": { "name": "ductei-router", "version": env!("CARGO_PKG_VERSION") } })),
+            "initialize" => Ok(json!({ "protocolVersion": PROTOCOL, "capabilities": { "tools": {} }, "serverInfo": { "name": name, "version": env!("CARGO_PKG_VERSION") } })),
             "ping" => Ok(json!({})),
-            "tools/list" => Ok(json!({ "tools": tools() })),
+            "tools/list" => Ok(json!({ "tools": all_tools.clone() })),
             "tools/call" => {
-                let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+                let tool = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                match call(state, name, &args) {
+                let res = match ext.call(tool, &args) { Some(r) => r, None => call(&mut router, state, tool, &args) };
+                match res {
                     Ok(v) => Ok(json!({ "content": [{ "type": "text", "text": v.to_string() }], "isError": false })),
                     Err(e) => Ok(json!({ "content": [{ "type": "text", "text": e }], "isError": true })),
                 }

@@ -13,7 +13,14 @@ sign = ["ductei-mcp/sign"]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ductei-mcp = { path = "../ductei-mcp" }
+toml = "0.8"
 
 [[bin]]
 name = "ductei-route"
 path = "src/bin/ductei-route.rs"
+
+# Claude Code PreToolUse hook: reads the hook JSON on stdin, maps the tool
+# call to a Task, runs it through `decide`, answers allow / ask / deny.
+[[bin]]
+name = "ductei-hook"
+path = "src/bin/ductei-hook.rs"
