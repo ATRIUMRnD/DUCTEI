@@ -1,0 +1,21 @@
+[package]
+name = "atrium-ctl"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "atrium: the one front door that boots, watches, chains and verifies every ATRIUM room"
+
+[features]
+# ML-DSA signing of the heartbeat chain, same key store the gate and QHR use.
+sign = ["ductei-mcp/sign"]
+
+[dependencies]
+ductei-mcp = { path = "../ductei-mcp" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+sha2 = "0.10"
+
+[[bin]]
+name = "atrium"
+path = "src/main.rs"

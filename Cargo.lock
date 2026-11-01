@@ -86,6 +86,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-ctl"
+version = "0.1.0"
+dependencies = [
+ "ductei-mcp",
+ "serde",
+ "serde_json",
+ "sha2",
+ "toml",
+]
+
+[[package]]
 name = "atrium-spec"
 version = "0.1.0"
 dependencies = [
