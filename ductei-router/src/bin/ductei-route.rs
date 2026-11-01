@@ -1,4 +1,4 @@
-//! ductei-route: decide | outcome
+//! ductei-route: decide | outcome | serve (MCP stdio server)
 //!   ductei-route decide  --task FILE.json [--approve commit,push] [--state DIR]
 //!   ductei-route outcome --task FILE.json --tier t1_claude --ok true|false [--state DIR]
 //! Exit codes for decide: 0 allow, 2 needs approval, 3 deny, 1 error.
@@ -23,6 +23,15 @@ fn run() -> Result<i32, String> {
         return Err(format!("state dir refused: {r}"));
     }
     std::fs::create_dir_all(&state).map_err(|e| e.to_string())?;
+    if cmd == "classify" {
+        let intent = arg(&args, "--intent").ok_or("missing --intent TEXT")?;
+        let id = arg(&args, "--id").unwrap_or_else(|| format!("c{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)));
+        let brain = ductei_router::brain::Ollama::default();
+        let task = ductei_router::brain::classify(&brain, &id, &intent);
+        println!("{}", serde_json::to_string_pretty(&task).unwrap());
+        return Ok(0);
+    }
+    if cmd == "serve" { ductei_router::mcp::serve(&state).map_err(|e| e.to_string())?; return Ok(0); }
     let task_path = arg(&args, "--task").ok_or("missing --task FILE.json")?;
     let task: Task = serde_json::from_str(&std::fs::read_to_string(&task_path).map_err(|e| format!("{task_path}: {e}"))?).map_err(|e| format!("bad task json: {e}"))?;
     let outcomes = state.join("outcomes.jsonl");
@@ -46,7 +55,7 @@ fn run() -> Result<i32, String> {
             println!("recorded");
             Ok(0)
         }
-        _ => Err("usage: ductei-route decide|outcome --task FILE.json [...]".into()),
+        _ => Err("usage: ductei-route decide|outcome --task FILE.json [...] | serve [--state DIR]".into()),
     }
 }
 
