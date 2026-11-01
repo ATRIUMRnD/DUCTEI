@@ -459,6 +459,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ductei-router"
+version = "0.1.0"
+dependencies = [
+ "ductei-mcp",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ductei-sync"
 version = "0.1.0"
 dependencies = [
