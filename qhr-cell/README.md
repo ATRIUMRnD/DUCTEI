@@ -36,10 +36,24 @@ and verified commit.
 
 ## Measured
 
-Release, 2-core container, 8 trivial branches, 2000 collapses:
-about 273 us per collapse, dominated by thread spawn. On xing-pc (16
-threads) expect less, but per-collapse spawn is the floor; a persistent
-worker pool is the next step if sub-100 us collapses are needed.
+Release, xing-pc (16 threads), 8 trivial branches, 2000 collapses:
+
+| mode | p50 | p99 | max |
+|---|---|---|---|
+| scoped thread per branch (`Scheduler::default()`) | 287 us | 386 us | 855 us |
+| persistent pool (`.with_pool(Pool::new(8))`) | 43.5 us | 69.8 us | 142 us |
+
+Thread spawn was the floor of the scoped path. The pool keeps workers parked
+on one channel each (round-robin dispatch, no shared lock); a collapse is 8
+sends, 8 wakeups, 8 input hashes and one receipt hash. The remaining cost is
+split between the wakeups and serde_json + SHA-256 per branch; hashing in
+the worker instead of the scheduler thread is the next cut if needed.
+
+The pool path is the only `unsafe` in qhr: branch jobs are lifetime-erased
+to cross into long-lived workers, and `superpose` blocks on a `Completion`
+counter until every worker has run and dropped its job, which is the same
+guarantee `std::thread::scope` gives via join. The scoped path has no unsafe
+and stays the default.
 
 ```powershell
 cargo run --release -p qhr-sched --example overhead

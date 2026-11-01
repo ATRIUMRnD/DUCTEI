@@ -23,8 +23,11 @@
 use ductei_core::{Channel, ChannelError, Envelope};
 use qhr_cell::{hash_value, Cell, Clock, Ctx, Deadline, Hash, MonotonicClock};
 use serde::{Deserialize, Serialize};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
+
+pub mod pool;
+pub use pool::Pool;
 
 pub const RECEIPT_SCOPE: &str = "qhr.receipt";
 pub const RECEIPT_KEY_PREFIX: &str = "qhr/collapse/";
@@ -109,7 +112,11 @@ impl<In> From<In> for Branch<In> {
 #[derive(Clone)]
 pub struct Scheduler {
     pub fan_out_cap: u32,
-    pub clock: std::sync::Arc<dyn Clock>,
+    pub clock: Arc<dyn Clock>,
+    /// Persistent workers. `None` = one scoped thread per branch (simple,
+    /// zero shared state, ~300 us per collapse). `Some` = dispatch to parked
+    /// workers (sub-100 us target). Same semantics either way.
+    pub pool: Option<Arc<Pool>>,
 }
 
 impl Default for Scheduler {
@@ -119,7 +126,8 @@ impl Default for Scheduler {
             .unwrap_or(2) as u32;
         Self {
             fan_out_cap: n.saturating_mul(2).max(1),
-            clock: std::sync::Arc::new(MonotonicClock),
+            clock: Arc::new(MonotonicClock),
+            pool: None,
         }
     }
 }
@@ -140,6 +148,12 @@ enum Msg<Out> {
 impl Scheduler {
     pub fn with_fan_out(mut self, cap: u32) -> Self {
         self.fan_out_cap = cap.max(1);
+        self
+    }
+
+    /// Run branches on `pool` instead of spawning a thread per branch.
+    pub fn with_pool(mut self, pool: Arc<Pool>) -> Self {
+        self.pool = Some(pool);
         self
     }
 
@@ -189,46 +203,42 @@ impl Scheduler {
 
         let ctx = Ctx::new();
         let (tx, rx) = mpsc::channel::<Msg<C::Out>>();
-        let mut winner: Option<(u32, C::Out)> = None;
+        let winner: Mutex<Option<(u32, C::Out)>> = Mutex::new(None);
 
-        std::thread::scope(|s| {
-            for &i in &active {
-                let tx = tx.clone();
-                let ctx = ctx.clone();
-                let input = &branches[i].input;
-                let clock = &self.clock;
-                s.spawn(move || {
-                    let t0 = clock.now();
-                    let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        cell.run(&ctx, input)
-                    }));
-                    let finished = clock.now();
-                    let elapsed = finished.duration_since(t0);
-                    let msg = match r {
-                        Ok(out) => Msg::Done {
-                            idx: i as u32,
-                            out,
-                            elapsed,
-                            finished,
-                        },
-                        Err(_) => Msg::Panicked {
-                            idx: i as u32,
-                            elapsed,
-                        },
-                    };
-                    let _ = tx.send(msg);
-                });
-            }
-            drop(tx);
+        // One branch, on whatever thread runs it. Sends exactly one message.
+        let run_branch = |i: usize, tx: mpsc::Sender<Msg<C::Out>>, ctx: Ctx| {
+            let input = &branches[i].input;
+            let t0 = self.clock.now();
+            let r =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| cell.run(&ctx, input)));
+            let finished = self.clock.now();
+            let elapsed = finished.duration_since(t0);
+            let msg = match r {
+                Ok(out) => Msg::Done {
+                    idx: i as u32,
+                    out,
+                    elapsed,
+                    finished,
+                },
+                Err(_) => Msg::Panicked {
+                    idx: i as u32,
+                    elapsed,
+                },
+            };
+            let _ = tx.send(msg);
+        };
 
+        // The scheduler side: classify every active branch's message.
+        let collect = |receipts: &mut Vec<BranchReceipt>| {
+            let mut winner = winner.lock().unwrap_or_else(|p| p.into_inner());
             let mut remaining = active.len();
             while remaining > 0 {
                 let wait = deadline.remaining(self.clock.as_ref());
                 let msg = if winner.is_some() || wait.is_zero() {
                     // Winner chosen or deadline passed: every active branch
-                    // has been told to stop via `Ctx`. Scoped threads are
-                    // joined at the end of this block regardless, so wait
-                    // for each one's message and classify it honestly. A
+                    // has been told to stop via `Ctx`. Every branch is waited
+                    // for regardless (scope join, or the pool's Completion),
+                    // so take each one's message and classify it honestly. A
                     // cell that ignores `Ctx` delays collapse until it
                     // returns; that is the cooperative-cancel contract.
                     if winner.is_some() {
@@ -276,7 +286,7 @@ impl Scheduler {
                         let input = &branches[idx as usize].input;
                         if cell.verify(input, &out) {
                             r.fate = Fate::Won;
-                            winner = Some((idx, out));
+                            *winner = Some((idx, out));
                             ctx.cancel();
                         } else {
                             r.fate = Fate::Rejected;
@@ -286,8 +296,46 @@ impl Scheduler {
             }
             // Past the deadline with no winner: stop the stragglers.
             ctx.cancel();
-        });
+        };
 
+        match &self.pool {
+            Some(pool) => {
+                let done = pool::Completion::new(active.len());
+                for &i in &active {
+                    let tx = tx.clone();
+                    let ctx = ctx.clone();
+                    let run = &run_branch;
+                    let job: Box<dyn FnOnce() + Send + '_> = Box::new(move || run(i, tx, ctx));
+                    // SAFETY: the job borrows `cell`, `branches`, `self.clock`
+                    // and `run_branch`, all of which outlive this function
+                    // body. `done.wait()` below blocks until the worker has
+                    // run AND dropped every dispatched job, so no borrow is
+                    // alive when this frame returns. Same contract as
+                    // `std::thread::scope`, enforced by `Completion`.
+                    let job: pool::Job = unsafe {
+                        std::mem::transmute::<Box<dyn FnOnce() + Send + '_>, pool::Job>(job)
+                    };
+                    pool.dispatch(job, Arc::clone(&done));
+                }
+                drop(tx);
+                collect(&mut receipts);
+                done.wait();
+            }
+            None => {
+                std::thread::scope(|s| {
+                    for &i in &active {
+                        let tx = tx.clone();
+                        let ctx = ctx.clone();
+                        let run = &run_branch;
+                        s.spawn(move || run(i, tx, ctx));
+                    }
+                    drop(tx);
+                    collect(&mut receipts);
+                });
+            }
+        }
+
+        let winner = winner.into_inner().unwrap_or_else(|p| p.into_inner());
         let mut receipt = CollapseReceipt {
             cell: cell.name().to_string(),
             prev,
@@ -534,6 +582,126 @@ mod tests {
             "siblings were not cancelled promptly"
         );
         assert_eq!(seen.load(Ordering::SeqCst), 2);
+    }
+
+    fn pooled() -> Scheduler {
+        Scheduler::default().with_fan_out(8).with_pool(Pool::new(4))
+    }
+
+    #[test]
+    fn pool_first_verified_branch_wins() {
+        let s = pooled();
+        let c = s.superpose(
+            &Sqrt,
+            vec![(3, 49).into(), (7, 49).into(), (8, 49).into()],
+            far(),
+            Hash::ZERO,
+        );
+        assert_eq!(c.output, Some(7));
+        assert_eq!(c.receipt.winner, Some(1));
+        assert_eq!(c.receipt.compute_hash().unwrap(), c.receipt.hash);
+    }
+
+    #[test]
+    fn pool_panic_is_contained_and_worker_survives() {
+        let s = pooled();
+        for _ in 0..20 {
+            let c = s.superpose(&Boom, vec![1u8.into(), 2u8.into()], far(), Hash::ZERO);
+            assert_eq!(c.output, Some(2));
+            assert_eq!(c.receipt.branches[0].fate, Fate::Panicked);
+        }
+    }
+
+    #[test]
+    fn pool_deadline_expires_slow_branches() {
+        let s = pooled();
+        let d = Deadline::after(&MonotonicClock, Duration::from_millis(20));
+        let c = s.superpose(
+            &Slow(Duration::from_millis(300)),
+            vec![1.into(), 2.into()],
+            d,
+            Hash::ZERO,
+        );
+        assert!(c.output.is_none());
+        for b in &c.receipt.branches {
+            assert!(
+                matches!(b.fate, Fate::Expired | Fate::Rejected),
+                "{:?}",
+                b.fate
+            );
+        }
+    }
+
+    #[test]
+    fn pool_winner_cancels_siblings_promptly() {
+        struct Mixed;
+        impl Cell for Mixed {
+            type In = u32;
+            type Out = u32;
+            fn name(&self) -> &'static str {
+                "mixed"
+            }
+            fn run(&self, c: &Ctx, i: &u32) -> u32 {
+                if *i == 0 {
+                    return 0;
+                }
+                let t0 = Instant::now();
+                while t0.elapsed() < Duration::from_secs(2) {
+                    if c.cancelled() {
+                        return u32::MAX;
+                    }
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+                *i
+            }
+            fn verify(&self, _i: &u32, o: &u32) -> bool {
+                *o != u32::MAX
+            }
+        }
+        let t0 = Instant::now();
+        let c = pooled().superpose(
+            &Mixed,
+            vec![0.into(), 1.into(), 2.into()],
+            far(),
+            Hash::ZERO,
+        );
+        assert_eq!(c.output, Some(0));
+        assert!(t0.elapsed() < Duration::from_secs(1));
+    }
+
+    /// Soundness of the lifetime erasure: inputs live on this stack frame
+    /// and are dropped right after each collapse, while the pool outlives
+    /// all of them. Every branch output must still be derived from its own
+    /// input, across many collapses sharing the same workers.
+    #[test]
+    fn pool_borrows_never_outlive_the_collapse() {
+        struct Echo;
+        impl Cell for Echo {
+            type In = String;
+            type Out = String;
+            fn name(&self) -> &'static str {
+                "echo"
+            }
+            fn run(&self, _c: &Ctx, i: &String) -> String {
+                format!("{i}!")
+            }
+            fn verify(&self, i: &String, o: &String) -> bool {
+                o.len() == i.len() + 1 && i.ends_with('7')
+            }
+        }
+        let pool = Pool::new(3);
+        let s = Scheduler::default()
+            .with_fan_out(8)
+            .with_pool(Arc::clone(&pool));
+        let mut prev = Hash::ZERO;
+        for round in 0..500u32 {
+            let inputs: Vec<Branch<String>> =
+                (0..8).map(|k| format!("r{round}-k{k}").into()).collect();
+            let c = s.superpose(&Echo, inputs, far(), prev);
+            assert_eq!(c.output, Some(format!("r{round}-k7!")));
+            assert_eq!(c.receipt.winner, Some(7));
+            prev = c.receipt.hash;
+        }
     }
 
     #[test]
