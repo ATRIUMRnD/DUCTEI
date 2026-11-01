@@ -1,5 +1,6 @@
 # Rust
 target/
+target-*/
 **/*.rs.bk
 
 # MSVC / C build output (conformance/verify.c, sync_wire)
@@ -40,3 +41,7 @@ id_ed25519*
 *.seed.*
 *.dpapi
 secrets/
+
+# local build output
+build/
+scripts/build/
