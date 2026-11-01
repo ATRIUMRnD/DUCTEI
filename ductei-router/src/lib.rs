@@ -198,3 +198,6 @@ mod tests {
         assert_eq!((tier, esc), (Tier::T1Claude, true));
     }
 }
+
+pub mod mcp;
+pub mod brain;
