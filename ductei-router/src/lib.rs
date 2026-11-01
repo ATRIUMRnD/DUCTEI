@@ -74,7 +74,9 @@ fn norm(p: &Path) -> String { p.to_string_lossy().replace('/', "\\").trim_end_ma
 
 impl Canon {
     fn path_reason(&self, p: &Path) -> Option<String> {
-        if p.components().any(|c| matches!(c, Component::ParentDir)) {
+        // Split on both separators ourselves: on Linux a Windows path like D:\a\..\b
+        // is a single component, so Path::components alone never sees the "..".
+        if p.components().any(|c| matches!(c, Component::ParentDir)) || norm(p).split('\\').any(|c| c == "..") {
             return Some(format!("path traversal refused: {}", p.display()));
         }
         let s = norm(p);
