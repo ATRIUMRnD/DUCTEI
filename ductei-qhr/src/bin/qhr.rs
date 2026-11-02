@@ -7,6 +7,10 @@
 //!       Lanes: cpu, llm (local Ollama), qpu (when --spool is given). Prints the report
 //!       as JSON. Exit 0 done, 2 needs approval, 3 denied/refused, 4 lane error/miss.
 //!   qhr fingerprint <state>
+//!   qhr prefetch --spool <limen spool> --request <limend request.json>
+//!       Spools an offline request ahead of the clock and returns at once; the
+//!       next qpu.run of the same request is served from the result. Prints the
+//!       spooled id (or the cache key if already cached). Hardware requests refused.
 //!   qhr serve <state> [--spool <dir>] [--weighter uniform|evidence] [--router-state <dir>]
 //!       MCP stdio server: decide, classify, outcome, qhr_submit, qhr_verify.
 //!       Router chain: --router-state, else DUCTEI_ROUTER_STATE, else <state>\router.
@@ -23,7 +27,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const DEFAULT_STATE: &str = r"D:\dev\ductei-qhr-state";
-const USAGE: &str = "usage: qhr verify <state> [--pubkey <file> | --fingerprint <hex> | --allow-unpinned] [--anchor <seq>:<hash>] [--anchor-file <file>]\n       qhr submit <state> --job <job.json> [--spool <dir>] [--approve a,b] [--weighter uniform|evidence]\n       qhr fingerprint <state>";
+const USAGE: &str = "usage: qhr verify <state> [--pubkey <file> | --fingerprint <hex> | --allow-unpinned] [--anchor <seq>:<hash>] [--anchor-file <file>]\n       qhr submit <state> --job <job.json> [--spool <dir>] [--approve a,b] [--weighter uniform|evidence]\n       qhr fingerprint <state>\n       qhr prefetch --spool <dir> --request <request.json>";
+
+fn cmd_prefetch(args: &[String]) -> Result<i32, String> {
+    let spool = arg(args, "--spool").ok_or(USAGE)?;
+    let req = arg(args, "--request").ok_or(USAGE)?;
+    let probe = Task { id: "spool".into(), intent: "spool".into(), kind: Kind::Chat, criticality: 0, private: true, effects: vec![Effect::Write(PathBuf::from(&spool))] };
+    if let Verdict::Deny(r) = Canon::default().check(&probe, &[]) { return Err(format!("spool refused: {r}")); }
+    let payload = std::fs::read_to_string(&req).map_err(|e| format!("{req}: {e}"))?;
+    println!("{}", QpuLane::new(QpuConfig::new(spool)).prefetch(&payload)?);
+    Ok(0)
+}
 
 fn arg(args: &[String], name: &str) -> Option<String> {
     args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
@@ -139,6 +153,7 @@ fn main() {
         Some("submit") => cmd_submit(&args),
         Some("serve") => cmd_serve(&args),
         Some("fingerprint") => cmd_fingerprint(&args),
+        Some("prefetch") => cmd_prefetch(&args),
         Some("--version" | "-V") => { println!("qhr {}", env!("CARGO_PKG_VERSION")); Ok(0) }
         _ => { eprintln!("{USAGE}"); Ok(2) }
     };

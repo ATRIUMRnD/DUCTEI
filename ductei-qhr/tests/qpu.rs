@@ -147,3 +147,145 @@ fn real_limend_once_certifies_a_spooled_job() {
     assert_eq!(v["backend"], "statevector");
     assert!(v["success_probability"].as_f64().unwrap() > 0.0);
 }
+
+// ---- ahead-of-clock cache and exact check ----
+
+fn done_count(d: &Path) -> usize { std::fs::read_dir(d.join("spool/done")).unwrap().count() }
+
+fn done_json(r: &ductei_qhr::Report) -> serde_json::Value {
+    let Status::Done(out) = &r.status else { panic!("{:?}", r.status) };
+    serde_json::from_str(out).unwrap()
+}
+
+#[test]
+fn exact_check_and_shots_to_optimum_ride_along() {
+    let d = dir("exact");
+    fake_limend(d.join("spool"), Duration::ZERO, None, Duration::from_secs(5));
+    let mut cfg = QpuConfig::new(d.join("spool")); cfg.est_job_secs = 0;
+    let mut q = open(&d, cfg);
+    let v = done_json(&q.submit(&qjob("x1", SMOKE_QUBO, 3_000), &[]).unwrap());
+    // hub=0, leaf0=leaf1=1: -1 -1 = -2 (setting hub costs -1 but +2 per active leaf pair).
+    assert_eq!(v["exact_energy"], -2.0);
+    assert_eq!(v["exact_assignment"]["hub"], 0);
+    assert_eq!(v["exact_assignment"]["leaf0"], 1);
+    // p = 0.178: ceil(ln 0.01 / ln 0.822) = 24.
+    assert_eq!(v["shots_to_optimum_99"], 24);
+    assert!(v.get("cached").is_none());
+}
+
+#[test]
+fn repeat_offline_request_is_served_from_cache_without_spooling() {
+    let d = dir("cache");
+    fake_limend(d.join("spool"), Duration::from_millis(20), None, Duration::from_secs(5));
+    let mut cfg = QpuConfig::new(d.join("spool")); cfg.est_job_secs = 0;
+    let mut q = open(&d, cfg);
+    let first = done_json(&q.submit(&qjob("c1", SMOKE_QUBO, 3_000), &[]).unwrap());
+    assert!(first.get("cached").is_none());
+    let t = Instant::now();
+    let r2 = q.submit(&qjob("c2", SMOKE_QUBO, 3_000), &[]).unwrap();
+    let hit = t.elapsed();
+    let second = done_json(&r2);
+    assert_eq!(second["cached"], true);
+    assert_eq!(second["job_id"], "c1", "a hit names the run that produced it");
+    assert_eq!(second["success_probability"], first["success_probability"]);
+    assert_eq!(done_count(&d), 1, "the repeat never reached limend");
+    assert!(hit < Duration::from_millis(15), "cache hit took {hit:?}");
+    assert_eq!(q.receipts(Assurance::Verified).seq, 2, "a hit is still receipted");
+}
+
+#[test]
+fn cached_answers_still_serve_while_limend_is_down() {
+    let d = dir("cache-down");
+    fake_limend(d.join("spool"), Duration::ZERO, None, Duration::from_secs(5));
+    let mut cfg = QpuConfig::new(d.join("spool")); cfg.est_job_secs = 0; cfg.max_backlog = 2;
+    let mut q = open(&d, cfg);
+    done_json(&q.submit(&qjob("w1", SMOKE_QUBO, 3_000), &[]).unwrap());
+    // limend "down": the fake has exited and a backlog has piled up.
+    std::thread::sleep(Duration::from_millis(5_100));
+    std::fs::write(d.join("spool/pending/x.json"), "{}").unwrap();
+    std::fs::write(d.join("spool/pending/y.json"), "{}").unwrap();
+    let hit = done_json(&q.submit(&qjob("w2", SMOKE_QUBO, 3_000), &[]).unwrap());
+    assert_eq!(hit["cached"], true, "a cached answer needs no limend");
+    let other = r#"{"qubo":[[["a","b"],1.0]],"fidelity_target":0.9,"credit_budget":0,"offline":true}"#;
+    match q.submit(&qjob("w3", other, 3_000), &[]).unwrap().status {
+        Status::Refused(w) => assert!(w.contains("limend is down or behind"), "{w}"),
+        s => panic!("uncached request must still be refused: {s:?}"),
+    }
+    assert_eq!(std::fs::read_dir(d.join("spool/pending")).unwrap().count(), 2, "nothing new spooled");
+}
+
+#[test]
+fn hardware_requests_are_never_cached() {
+    let d = dir("nocache");
+    fake_limend(d.join("spool"), Duration::ZERO, None, Duration::from_secs(5));
+    let mut cfg = QpuConfig::new(d.join("spool")); cfg.est_job_secs = 0;
+    let mut q = open(&d, cfg);
+    let hw = SMOKE_QUBO.replace(r#""offline":true"#, r#""offline":false"#);
+    for id in ["h1", "h2"] {
+        let v = done_json(&q.submit(&qjob(id, &hw, 3_000), &[]).unwrap());
+        assert!(v.get("cached").is_none());
+    }
+    assert_eq!(done_count(&d), 2);
+    assert!(!d.join("spool/qhr-cache").exists() || std::fs::read_dir(d.join("spool/qhr-cache")).unwrap().count() == 0);
+    // And prefetch refuses them outright.
+    let lane = QpuLane::new(QpuConfig::new(d.join("spool")));
+    assert!(lane.prefetch(&hw).unwrap_err().contains("offline requests only"));
+}
+
+#[test]
+fn prefetch_then_run_adopts_the_prefetched_cert() {
+    let d = dir("prefetch");
+    let lane = QpuLane::new(QpuConfig::new(d.join("spool")));
+    let id = lane.prefetch(SMOKE_QUBO).unwrap();
+    assert!(id.starts_with("prefetch-"));
+    assert_eq!(lane.prefetch(SMOKE_QUBO).unwrap(), id, "prefetch is idempotent while in flight");
+    // limend works it ahead of the clock.
+    fake_limend(d.join("spool"), Duration::ZERO, None, Duration::from_secs(5));
+    let t = Instant::now();
+    while !d.join(format!("spool/certs/{id}.json")).exists() {
+        assert!(t.elapsed() < Duration::from_secs(3), "fake limend never certified the prefetch");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let mut cfg = QpuConfig::new(d.join("spool")); cfg.est_job_secs = 0;
+    let mut q = open(&d, cfg);
+    let v = done_json(&q.submit(&qjob("p1", SMOKE_QUBO, 3_000), &[]).unwrap());
+    assert_eq!(v["cached"], true);
+    assert_eq!(v["job_id"], id);
+    assert_eq!(v["exact_energy"], -2.0);
+    assert_eq!(done_count(&d), 1, "only the prefetch ran");
+    // Now it is in the cache proper: prefetch reports the key, not a new spool.
+    assert!(!lane.prefetch(SMOKE_QUBO).unwrap().starts_with("prefetch-"));
+}
+
+#[test]
+fn cache_key_ignores_job_id_and_term_order_but_not_the_problem() {
+    let d = dir("key");
+    fake_limend(d.join("spool"), Duration::ZERO, None, Duration::from_secs(5));
+    let mut cfg = QpuConfig::new(d.join("spool")); cfg.est_job_secs = 0;
+    let mut q = open(&d, cfg);
+    let _ = done_json(&q.submit(&qjob("k1", SMOKE_QUBO, 3_000), &[]).unwrap());
+    // Same terms, reordered: hit.
+    let reordered = r#"{"qubo":[[["hub","hub"],-1.0],[["leaf1","leaf1"],-1.0],[["hub","leaf1"],2.0],[["leaf0","leaf0"],-1.0],[["hub","leaf0"],2.0]],"credit_budget":0.0,"fidelity_target":0.9,"offline":true}"#;
+    assert_eq!(done_json(&q.submit(&qjob("k2", reordered, 3_000), &[]).unwrap())["cached"], true);
+    // One weight changed: miss.
+    let changed = SMOKE_QUBO.replace(r#"[["hub","hub"],-1.0]"#, r#"[["hub","hub"],-1.5]"#);
+    assert!(done_json(&q.submit(&qjob("k3", &changed, 3_000), &[]).unwrap()).get("cached").is_none());
+    // Different fidelity target: miss.
+    let fid = SMOKE_QUBO.replace(r#""fidelity_target":0.9"#, r#""fidelity_target":0.5"#);
+    assert!(done_json(&q.submit(&qjob("k4", &fid, 3_000), &[]).unwrap()).get("cached").is_none());
+    assert_eq!(done_count(&d), 3);
+}
+
+#[test]
+fn brute_force_and_shots_math() {
+    use ductei_qhr::qpu::{brute_force, shots_to_optimum};
+    let q = |a: &str, b: &str, w: f64| ((a.to_string(), b.to_string()), w);
+    // Max-cut-ish: x+y-2xy rewards exactly one set; minimum is -1 at (1,0) or (0,1).
+    let (e, a) = brute_force(&[q("x", "x", -1.0), q("y", "y", -1.0), q("x", "y", 2.0)], 16).unwrap();
+    assert_eq!(e, -1.0);
+    assert_eq!(a.iter().map(|(_, b)| *b as u32).sum::<u32>(), 1);
+    assert!(brute_force(&[q("a", "a", 1.0)], 0).is_none(), "exact_max_vars = 0 turns it off");
+    assert_eq!(shots_to_optimum(1.0, 0.99), Some(1));
+    assert_eq!(shots_to_optimum(0.5, 0.99), Some(7));
+    assert_eq!(shots_to_optimum(0.0, 0.99), None);
+}

@@ -142,6 +142,10 @@ pub trait Lane: Send + Sync {
     fn id(&self) -> LaneId;
     /// Must be cheap: it runs inside the job's budget. Cache slow probes.
     fn health(&self) -> Health;
+    /// True when this job can be answered without the lane's backend (a
+    /// cached result), so an Unavailable health must not refuse it. Must be
+    /// cheap. Default: false.
+    fn serves_offline(&self, _job: &Job) -> bool { false }
     /// Deterministic check before anything runs. Default: accept.
     fn preflight(&self, _job: &Job) -> Result<(), String> { Ok(()) }
     /// Do the work. `deadline` is absolute; honour it.
@@ -296,7 +300,9 @@ impl Qhr {
     fn preflight(&self, id: LaneId, job: &Job) -> Result<Arc<dyn Lane>, String> {
         if job.budget_ms == 0 { return Err("budget_ms must be > 0".into()); }
         let lane = self.lanes.get(&id).cloned().ok_or_else(|| format!("no {} lane registered", id.as_str()))?;
-        if let Health::Unavailable(why) = lane.health() { return Err(format!("{} lane unavailable: {why}", id.as_str())); }
+        if let Health::Unavailable(why) = lane.health() {
+            if !lane.serves_offline(job) { return Err(format!("{} lane unavailable: {why}", id.as_str())); }
+        }
         if let Some((_, p99, n)) = self.latency(id) {
             if n >= MIN_SAMPLES_FOR_PREDICTION && p99 > job.budget_ms.saturating_mul(1000) {
                 return Err(format!("predicted miss: budget {} ms is below {} lane p99 {:.3} ms over {n} runs", job.budget_ms, id.as_str(), p99 as f64 / 1000.0));
