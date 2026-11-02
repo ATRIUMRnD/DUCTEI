@@ -131,6 +131,10 @@ pub struct Report {
     pub status: Status,
     /// End to end, submit to receipt written.
     pub elapsed_us: u64,
+    /// Submit to verdict, before the receipt write. This is the part the
+    /// deadline bounds; the durable fsync after it depends on the disk.
+    #[serde(default)]
+    pub decided_us: u64,
     pub receipt: String,
     /// How the lane was chosen: weighter name and each candidate's weight, or
     /// why no candidate survived. Receipted via the result hash.
@@ -246,6 +250,7 @@ impl Qhr {
             },
         };
 
+        let decided_us = t0.elapsed().as_micros() as u64;
         if let (Some(id), true) = (lane, status.ran()) {
             let v = self.latency.entry(id).or_default();
             if v.len() == LATENCY_WINDOW { v.remove(0); }
@@ -266,7 +271,7 @@ impl Qhr {
         let body = ReceiptBody::new(job.task.id.clone(), scope, status.label(), 0, 0, sha256_json(job), result);
         let log = match job.assurance { Assurance::Verified => &mut self.verified, Assurance::Fast => &mut self.fast };
         let r = log.record(body).map_err(|e| format!("receipt write failed, result withheld: {e}"))?;
-        Ok(Report { task_id: job.task.id.clone(), tier, lane, status, elapsed_us: t0.elapsed().as_micros() as u64, receipt: r.hash, pick_why })
+        Ok(Report { task_id: job.task.id.clone(), tier, lane, status, elapsed_us: t0.elapsed().as_micros() as u64, decided_us, receipt: r.hash, pick_why })
     }
 
     /// Candidate scan + weighting. Every candidate goes through the same

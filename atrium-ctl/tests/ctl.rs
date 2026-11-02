@@ -76,7 +76,8 @@ fn managed_restarts_with_backoff() {
     let st = Status::load(&s).unwrap();
     assert!(st.rooms["flaky"].note.contains("exit 7"), "{}", st.rooms["flaky"].note);
     assert_eq!(st.rooms["flaky"].health, Health::Down);
-    assert_eq!(st.rooms["flaky"].restarts, 1, "not respawned inside the backoff window");
+    // First spawn is a start (restarts 0); no respawn inside the backoff window.
+    assert_eq!(st.rooms["flaky"].restarts, 0, "not respawned inside the backoff window");
     sup.shutdown().unwrap();
 }
 

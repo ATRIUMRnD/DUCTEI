@@ -89,6 +89,7 @@ dependencies = [
 name = "atrium-ctl"
 version = "0.1.0"
 dependencies = [
+ "ductei-core",
  "ductei-mcp",
  "serde",
  "serde_json",

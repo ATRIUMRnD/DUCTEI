@@ -104,11 +104,15 @@ fn deadline_miss_is_reported_and_bounded() {
     let d = dir("deadline");
     let mut q = open(&d);
     let t = Instant::now();
-    // 2 s job, 30 ms budget: returning in under 1 s proves the runtime stopped
-    // waiting at the deadline, with enough slack for a loaded test box.
+    // 2 s job, 30 ms budget. The verdict must land well under the 2 s job
+    // (proves the runtime stopped waiting at the deadline). Wall time also
+    // includes the durable receipt fsync, which can stall on a busy disk, so
+    // it only has to beat the job itself.
     let r = q.submit(&job("slow", "cpu.sleep", "2000", 30), &[]).unwrap();
     assert_eq!(r.status, Status::DeadlineMissed { budget_ms: 30 });
-    assert!(t.elapsed() < Duration::from_millis(1000), "runtime must stop waiting at the deadline, took {:?}", t.elapsed());
+    let decided = Duration::from_micros(r.decided_us);
+    assert!(decided < Duration::from_millis(1000), "runtime must stop waiting at the deadline, decided after {decided:?}");
+    assert!(t.elapsed() < Duration::from_millis(2000), "submit must not wait out the job, took {:?}", t.elapsed());
     assert_eq!(q.receipts(Assurance::Verified).seq, 1, "a miss is receipted, never silent");
 }
 

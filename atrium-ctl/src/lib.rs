@@ -52,7 +52,17 @@ pub struct Config {
     pub room: Vec<Room>,
     #[serde(default)]
     pub verify: Vec<VerifyStep>,
+    /// Chain-head anchoring, same `[anchor]` table and transport as the gate.
+    /// Scope on the peer: `mcp:atrium:anchor`.
+    #[serde(default)]
+    pub anchor: ductei_mcp::AnchorCfg,
+    /// Peer anchor exports (copied here by a verify step) that the own-chain
+    /// check must agree with; catches a cut-off tail.
+    #[serde(default)]
+    pub anchor_files: Vec<PathBuf>,
 }
+
+pub const ANCHOR_SERVER: &str = "atrium";
 fn d_tick() -> u64 { 1000 }
 fn d_beat() -> u64 { 60 }
 
@@ -257,7 +267,7 @@ pub fn sha256_hex(b: &[u8]) -> String {
 
 // ---------------------------------------------------------------- supervisor
 
-struct Managed { child: Option<Child>, tree: Option<tree::Tree>, backoff: Duration, next_try: Instant, restarts: u64, started: Instant }
+struct Managed { child: Option<Child>, tree: Option<tree::Tree>, backoff: Duration, next_try: Instant, restarts: u64, spawned: bool, started: Instant }
 
 pub struct Supervisor {
     cfg: Config,
@@ -266,6 +276,10 @@ pub struct Supervisor {
     status: Status,
     tick: u64,
     last_beat: BTreeMap<String, u64>,
+    anchors: Option<ductei_core::LogStore>,
+    anchor_tx: Option<std::sync::mpsc::Sender<ductei_core::Envelope>>,
+    anchor_thread: Option<std::thread::JoinHandle<()>>,
+    node: [u8; 16],
 }
 
 impl Supervisor {
@@ -278,8 +292,57 @@ impl Supervisor {
             status.rooms.insert(r.name.clone(), RoomStatus { health: Health::Down, kind: r.kind.clone(), pid: None, restarts: 0, since_unix: now, note: String::new() });
         }
         let managed = cfg.room.iter().filter(|r| r.kind == Kind::Managed)
-            .map(|r| (r.name.clone(), Managed { child: None, tree: None, backoff: Duration::from_secs(1), next_try: Instant::now(), restarts: 0, started: Instant::now() })).collect();
-        Ok(Self { cfg, log, managed, status, tick: 0, last_beat: BTreeMap::new() })
+            .map(|r| (r.name.clone(), Managed { child: None, tree: None, backoff: Duration::from_secs(1), next_try: Instant::now(), restarts: 0, spawned: false, started: Instant::now() })).collect();
+        let mut node = [0u8; 16];
+        node.copy_from_slice(&Sha256::digest(format!("atrium:{}", cfg.state.display()).as_bytes())[..16]);
+        let mut sup = Self { cfg, log, managed, status, tick: 0, last_beat: BTreeMap::new(), anchors: None, anchor_tx: None, anchor_thread: None, node };
+        sup.start_anchoring()?;
+        Ok(sup)
+    }
+
+    /// Local anchors.jsonl always; a pusher thread only when peers are set.
+    /// The pusher never blocks a tick: newest anchor wins, older unsent ones
+    /// are superseded (a later head covers them).
+    fn start_anchoring(&mut self) -> Result<(), String> {
+        let a = self.cfg.anchor.clone();
+        if a.every == 0 { return Ok(()); }
+        if a.encrypt && !cfg!(feature = "qfltl") {
+            return Err("anchor.encrypt is set but this build has no `qfltl` feature; refusing plaintext anchors".into());
+        }
+        let store = ductei_core::LogStore::open(self.cfg.state.join("anchors.jsonl")).map_err(|e| format!("anchors.jsonl: {e}"))?;
+        self.anchors = Some(store);
+        if a.peers.is_empty() { return Ok(()); }
+        let (tx, rx) = std::sync::mpsc::channel::<ductei_core::Envelope>();
+        let state_root = self.cfg.state.join("anchor-state");
+        let outbox = self.cfg.state.join("anchor-outbox.jsonl");
+        let logdir = self.cfg.state.clone();
+        self.anchor_tx = Some(tx);
+        self.anchor_thread = Some(std::thread::spawn(move || {
+            while let Ok(mut env) = rx.recv() {
+                while let Ok(newer) = rx.try_recv() { env = newer; }
+                let mut ok = false;
+                for p in &a.peers {
+                    match ductei_mcp::push_anchor(&a, &state_root, p, &env, &outbox) {
+                        Ok(1) | Ok(2) => { ok = true; }
+                        Ok(code) => slog(&logdir, &format!("anchor rejected by {p} (ack {code})")),
+                        Err(e) => slog(&logdir, &format!("anchor push to {p} failed: {e}")),
+                    }
+                }
+                if !ok { slog(&logdir, &format!("anchor {} unsent to any peer", env.key)); }
+            }
+        }));
+        Ok(())
+    }
+
+    /// Sign the current head, write it locally, then hand it to the pusher.
+    fn anchor_now(&mut self) {
+        let Some(store) = self.anchors.as_mut() else { return };
+        let Some(a) = self.log.anchor() else { return };
+        let blob = serde_json::to_vec(&a).unwrap_or_default();
+        let key = format!("mcp/{ANCHOR_SERVER}/anchor/{}", a.seq);
+        let env = ductei_core::scoped(&key, &[&ductei_mcp::anchor_scope(ANCHOR_SERVER)], self.node, a.seq + 1, &blob);
+        if let Err(e) = store.append(&env) { slog(&self.cfg.state, &format!("anchors.jsonl append failed: {e}")); return; }
+        if let Some(tx) = &self.anchor_tx { let _ = tx.send(env); }
     }
 
     pub fn state(&self) -> &Path { &self.cfg.state }
@@ -290,6 +353,8 @@ impl Supervisor {
         self.log.record(body)?;
         self.status.chain_seq = self.log.seq;
         self.status.chain_head = self.log.head.clone();
+        let every = self.cfg.anchor.every;
+        if every > 0 && self.log.seq.is_multiple_of(every) { self.anchor_now(); }
         Ok(())
     }
 
@@ -339,14 +404,15 @@ impl Supervisor {
                     }
                     let deps_up = r.requires.iter().all(|d| self.status.rooms.get(d).map(|s| s.health == Health::Up).unwrap_or(false));
                     let m = self.managed.get_mut(&r.name).expect("managed entry");
-                    if m.child.is_none() && r.restart || m.child.is_none() && m.restarts == 0 {
+                    if m.child.is_none() && (r.restart || !m.spawned) {
                         if !deps_up { (Health::Blocked, None, format!("waiting for {}", r.requires.join(","))) }
                         else if Instant::now() < m.next_try { (Health::Down, None, self.status.rooms[&r.name].note.clone()) }
                         else {
                             match self.spawn(r) {
                                 Ok(pid) => {
                                     let m = self.managed.get_mut(&r.name).unwrap();
-                                    m.restarts += 1;
+                                    // The first spawn is a start, not a restart.
+                                    if m.spawned { m.restarts += 1; } else { m.spawned = true; }
                                     (Health::Up, Some(pid), String::new())
                                 }
                                 Err(e) => {
@@ -417,6 +483,10 @@ impl Supervisor {
         self.status.supervisor_pid = 0;
         self.status.store(&self.cfg.state)?;
         let _ = fs::remove_file(self.cfg.state.join("pids.json"));
+        // Final head goes out even off an `every` boundary, then the pusher drains.
+        self.anchor_now();
+        self.anchor_tx = None;
+        if let Some(t) = self.anchor_thread.take() { let _ = t.join(); }
         Ok(())
     }
 
@@ -433,11 +503,37 @@ impl Supervisor {
             report(&s.name, ok, &detail);
         }
         // Finally the chain itself, after everything above is on it.
-        let trust = VerifyTrust { pubkey: None, fingerprint: None, allow_unpinned: true, anchors: Vec::new(), pinned_head: None };
+        let mut anchors = Vec::new();
+        let mut anchor_err = None;
+        for f in &self.cfg.anchor_files {
+            match ductei_mcp::anchors_in(f) {
+                Ok(a) => anchors.extend(a),
+                Err(e) => anchor_err = Some(e),
+            }
+        }
+        // Anchors from other servers on the same peer log are not ours.
+        let own_kid = self.log.anchor().map(|a| a.kid);
+        anchors.retain(|a| Some(&a.kid) == own_kid.as_ref());
+        let n_anchors = anchors.len();
+        let top = anchors.iter().map(|a| a.seq).max();
+        let trust = VerifyTrust { pubkey: None, fingerprint: None, allow_unpinned: true, anchors, pinned_head: None };
         let own = verify_own_chain(&self.cfg.state, &trust);
-        let (ok, detail) = match own { Ok(rep) => (rep.ok(), format!("{} receipts, {} errors", rep.receipts, rep.errors.len())), Err(e) => (false, e) };
+        let (ok, detail) = match own {
+            Ok(rep) => {
+                let ok = rep.ok() && anchor_err.is_none() && (self.cfg.anchor_files.is_empty() || n_anchors > 0);
+                (ok, format!("{} receipts, {} errors{}; anchors {n_anchors} (top seq {}){}", rep.receipts, rep.errors.len(),
+                    if rep.errors.is_empty() { String::new() } else { format!(": {}", rep.errors.join(" | ")) },
+                    top.map(|s| s.to_string()).unwrap_or_else(|| "-".into()),
+                    anchor_err.map(|e| format!("; anchor file: {e}")).unwrap_or_default()))
+            }
+            Err(e) => (false, e),
+        };
         if ok { pass += 1 } else { fail += 1 }
         report("atrium-chain", ok, &detail);
+        // verify is a one-shot process: anchor what it wrote and drain before exit.
+        self.anchor_now();
+        self.anchor_tx = None;
+        if let Some(t) = self.anchor_thread.take() { let _ = t.join(); }
         self.status.unix = now_unix();
         self.status.store(&self.cfg.state)?;
         Ok((pass, fail))
