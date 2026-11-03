@@ -105,6 +105,66 @@ fn verify_steps_chain_and_fail_closed() {
 }
 
 #[test]
+fn queued_verify_runs_beside_live_rooms_and_check_reads_in_parallel() {
+    let s = tmp("queue");
+    #[cfg(windows)]
+    let v = "[[verify]]\nname = \"ok\"\ncmd = [\"cmd.exe\", \"/c\", \"echo hello\"]\nexpect_text = \"hello\"\n";
+    #[cfg(not(windows))]
+    let v = "[[verify]]\nname = \"ok\"\ncmd = [\"sh\", \"-c\", \"echo hello\"]\nexpect_text = \"hello\"\n";
+    let rooms = format!("[[room]]\nname = \"free\"\nkind = \"managed\"\nexe = {:?}\nargs = {:?}\n", SLEEPER.0, SLEEPER.1);
+    let c = cfg(&s, &rooms, v);
+    let mut sup = Supervisor::open(c.clone()).unwrap();
+    sup.tick().unwrap();
+    let req = s.join("requests");
+    fs::create_dir_all(&req).unwrap();
+    fs::write(req.join("verify-1.req"), b"verify").unwrap();
+    let done = req.join("verify-1.done");
+    let mut reads = 0;
+    for _ in 0..400 {
+        sup.tick().unwrap();
+        sup.service_requests().unwrap();
+        // A reader beside the writer: read-only checks never fail mid-run.
+        if reads < 5 {
+            let r = chain_reports(&c, own_kid(&s).as_deref());
+            assert!(r.iter().all(|x| x.1), "parallel read failed: {r:?}");
+            reads += 1;
+        }
+        if done.exists() { break; }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let text = fs::read_to_string(&done).expect("verify answered");
+    assert!(text.contains("PASS ok:"), "{text}");
+    assert!(text.contains("PASS atrium-chain:"), "{text}");
+    assert!(text.trim_end().ends_with("exit 0"), "{text}");
+    assert!(!req.join("verify-1.running").exists());
+    assert_eq!(Status::load(&s).unwrap().rooms["free"].health, Health::Up, "rooms stayed up during verify");
+    sup.shutdown().unwrap();
+    let trust = VerifyTrust { pubkey: None, fingerprint: None, allow_unpinned: true, anchors: Vec::new(), pinned_head: None };
+    let rep = verify_own_chain(&s, &trust).unwrap();
+    assert!(rep.ok(), "one writer, clean chain: {:?}", rep.errors);
+}
+
+#[test]
+fn second_writer_is_refused_by_os_lock_and_repair_is_signed() {
+    let s = tmp("lock");
+    let mut first = Supervisor::open(cfg(&s, "", "")).unwrap();
+    // Nothing published to status.json yet: only the OS lock can stop this.
+    let second = Supervisor::open(cfg(&s, "", ""));
+    assert!(second.is_err(), "second writer must be refused");
+    assert!(second.err().unwrap().contains("one writer per chain"));
+    let q = s.join("fork.jsonl");
+    fs::write(&q, b"quarantined line\n").unwrap();
+    let h = first.record_repair(&q, "test").unwrap();
+    assert_eq!(h, sha256_hex(b"quarantined line\n"));
+    drop(first);
+    // Lock is released with the writer; the chain still verifies.
+    let again = Supervisor::open(cfg(&s, "", ""));
+    assert!(again.is_ok(), "lock released on drop");
+    let trust = VerifyTrust { pubkey: None, fingerprint: None, allow_unpinned: true, anchors: Vec::new(), pinned_head: None };
+    assert!(verify_own_chain(&s, &trust).unwrap().ok());
+}
+
+#[test]
 fn status_store_is_atomic_and_live_detection() {
     let s = tmp("status");
     let ten = std::time::Duration::from_secs(10);

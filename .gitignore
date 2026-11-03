@@ -45,3 +45,7 @@ secrets/
 # local build output
 build/
 scripts/build/
+
+# Suffixed backups (foo.bak-2026..., foo.bak.txt) that *.bak misses
+*.bak-*
+*.bak.*

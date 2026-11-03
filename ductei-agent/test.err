@@ -1,0 +1,9 @@
+    Updating git repository `https://github.com/xingxerx/QFLTL`
+     Locking 1 package to latest compatible version
+      Adding qfltl-crypto v0.2.0 (https://github.com/xingxerx/QFLTL?rev=81bcd1d3c3d6634be6c3527f744bac1101ef987f#81bcd1d3)
+    Blocking waiting for file lock on build directory
+    Blocking waiting for file lock on artifact directory
+   Compiling ductei-agent v0.1.0 (D:\ATRIUM\DUCTEI\ductei-agent)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 6m 48s
+     Running unittests src\lib.rs (D:\ATRIUM\DUCTEI\target\debug\deps\ductei_agent-0644a5d1dc0c6538.exe)
+   Doc-tests ductei_agent

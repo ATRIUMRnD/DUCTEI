@@ -1,0 +1,15 @@
+
+running 5 tests
+test tests::unknown_tool_result_is_refused ... ok
+test tests::rejects_path_traversal_thread_names ... ok
+test tests::events_are_injected_not_user ... ok
+test tests::redelivered_message_runs_once ... ok
+test tests::hibernates_and_resumes_across_process_restart ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.66s
+
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.37s
+
