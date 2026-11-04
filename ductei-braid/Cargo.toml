@@ -1,0 +1,16 @@
+[package]
+name = "ductei-braid"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Three hash-chained, cross-anchored ledgers (limen, oneiro, atrium) fed from DUCTEI envelopes"
+
+[dependencies]
+ductei-core = { path = "../ductei-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+blake3 = "1"
+
+[[bin]]
+name = "braid"
+path = "src/main.rs"

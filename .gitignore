@@ -46,6 +46,9 @@ secrets/
 build/
 scripts/build/
 
-# Suffixed backups (foo.bak-2026..., foo.bak.txt) that *.bak misses
+# Backups and scratch test output
+*.bak
 *.bak-*
 *.bak.*
+test.err
+test.out

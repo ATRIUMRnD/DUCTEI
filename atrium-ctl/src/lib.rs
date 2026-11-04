@@ -115,6 +115,10 @@ pub struct Room {
     /// Rooms that must be up before this managed room is (re)started.
     #[serde(default)]
     pub requires: Vec<String>,
+    /// External rooms: the Windows scheduled task that owns the room. When set,
+    /// fleet `restart <room>` starts that task (schtasks /Run), nothing else.
+    #[serde(default)]
+    pub task: Option<String>,
 }
 fn d_fresh() -> u64 { 120 }
 fn yes() -> bool { true }

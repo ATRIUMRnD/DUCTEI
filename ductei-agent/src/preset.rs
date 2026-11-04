@@ -5,6 +5,7 @@
 //! unchanged (preset by name only, cwd under the roots, kill switch, audit chain).
 //! The child writes `<inbox>/<thread>/<call_id>.json` via tmp + rename and outlives this
 //! process; the agent hibernates and a later `collect` turns the file into a ToolResult.
+//! The child's pid goes to `<call_id>.pid` so a caller can kill a hung call (`expire`).
 
 use crate::{Body, Dispatcher, Message};
 use std::fs;
@@ -27,6 +28,18 @@ fn safe(s: &str) -> bool {
     !s.is_empty() && s.len() <= 96 && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
+/// Write an error result for `call_id` (tmp + rename). No-op when a result already exists.
+fn write_error(dir: &Path, call_id: &str, text: &str) -> Result<(), String> {
+    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let out = dir.join(format!("{call_id}.json"));
+    if out.exists() {
+        return Ok(());
+    }
+    let tmp = dir.join(format!("{call_id}.json.tmp"));
+    fs::write(&tmp, serde_json::json!({ "ok": false, "output": text }).to_string()).map_err(|e| e.to_string())?;
+    fs::rename(&tmp, &out).map_err(|e| e.to_string())
+}
+
 impl PresetDispatcher {
     fn thread_dir(&self, thread: &str) -> Result<PathBuf, String> {
         if !safe(thread) {
@@ -34,26 +47,43 @@ impl PresetDispatcher {
         }
         Ok(self.inbox.join(thread))
     }
+
+    /// Answer a refused call with an error result (tmp + rename, like the real runner).
+    /// Nothing is spawned; the thread resumes and the model sees `ERROR: <why>`.
+    fn refuse(&self, thread: &str, call_id: &str, why: &str) -> Result<(), String> {
+        write_error(&self.thread_dir(thread)?, call_id, &format!("refused: {why}"))
+    }
 }
 
 impl Dispatcher for PresetDispatcher {
     fn dispatch(&mut self, thread: &str, call_id: &str, tool: &str, args: &serde_json::Value) -> Result<(), String> {
-        if tool != TOOL {
-            return Err(format!("tool `{tool}` is not allowed (only `{TOOL}`)"));
-        }
+        // Ids name files: an unsafe one is a hard error (nothing is written anywhere).
         if !safe(call_id) {
             return Err(format!("invalid call id: {call_id:?}"));
         }
-        let name = args.get("name").and_then(|v| v.as_str()).ok_or("missing `name`")?;
+        // gpt-oss may namespace tool names ("tool.run_preset", "functions.run_preset"); compare the bare name.
+        let tool = tool.rsplit('.').next().unwrap_or(tool);
+        if tool != TOOL {
+            // Refused, nothing runs; the model gets the reason as the call's result and can retry.
+            return self.refuse(thread, call_id, &format!("tool `{tool}` is not allowed (only `{TOOL}`)"));
+        }
+        let Some(name) = args.get("name").and_then(|v| v.as_str()) else {
+            return self.refuse(thread, call_id, "missing `name`");
+        };
         if !self.allow.iter().any(|a| a == name) {
-            return Err(format!("preset `{name}` is not on this agent's allowlist"));
+            return self.refuse(thread, call_id, &format!("preset `{name}` is not on this agent's allowlist"));
         }
         // Models often over-escape Windows paths (D:\\\\ATRIUM); collapse doubled separators.
-        let mut cwd = args.get("cwd").and_then(|v| v.as_str()).ok_or("missing `cwd`")?.replace('/', "\\");
+        // cwd is optional for pinned presets (the pin wins anyway).
+        let mut cwd = args.get("cwd").and_then(|v| v.as_str()).unwrap_or(pinned_cwd(name).unwrap_or("")).replace('/', "\\");
+        if cwd.is_empty() {
+            return self.refuse(thread, call_id, "missing `cwd`");
+        }
         while cwd.contains("\\\\") {
             cwd = cwd.replace("\\\\", "\\");
         }
-        let cwd = cwd.as_str();
+        // Pin the working folder for known presets so the model can't send them to the wrong repo.
+        let cwd = pinned_cwd(name).unwrap_or(cwd.as_str());
         let dir = self.thread_dir(thread)?;
         fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let out = dir.join(format!("{call_id}.json"));
@@ -72,7 +102,52 @@ impl Dispatcher for PresetDispatcher {
             // CREATE_NO_WINDOW | DETACHED_PROCESS: survives this process, no console flash.
             cmd.creation_flags(0x0800_0000 | 0x0000_0008);
         }
-        cmd.spawn().map(|_| ()).map_err(|e| format!("spawn {}: {e}", self.exe.display()))
+        let child = cmd.spawn().map_err(|e| format!("spawn {}: {e}", self.exe.display()))?;
+        // Best effort: without the pid a hung call is still expired, just not killed.
+        let _ = fs::write(dir.join(format!("{call_id}.pid")), child.id().to_string());
+        Ok(())
+    }
+}
+
+/// Pid recorded for a dispatched call, if any.
+pub fn call_pid(inbox: &Path, thread: &str, call_id: &str) -> Option<u32> {
+    if !safe(thread) || !safe(call_id) {
+        return None;
+    }
+    fs::read_to_string(inbox.join(thread).join(format!("{call_id}.pid"))).ok()?.trim().parse().ok()
+}
+
+/// A call ran past its cap: kill its process tree (via `kill`) and record
+/// `<preset>: timed out after <secs>s` as its result so the sweep continues.
+pub fn expire(inbox: &Path, thread: &str, call_id: &str, preset: &str, secs: u64, kill: &mut dyn FnMut(u32)) -> Result<(), String> {
+    if !safe(thread) || !safe(call_id) {
+        return Err(format!("invalid thread or call id: {thread:?} {call_id:?}"));
+    }
+    if let Some(pid) = call_pid(inbox, thread, call_id) {
+        kill(pid);
+    }
+    write_error(&inbox.join(thread), call_id, &crate::sweep::timeout_text(preset, secs))
+}
+
+/// Fixed working folder per preset; `None` means the caller's cwd is used.
+pub fn pinned_cwd(preset: &str) -> Option<&'static str> {
+    match preset {
+        "cargo_check" | "cargo_test_watch" | "cargo_test_agent" | "cargo_test_ctl" | "git_status" | "git_log"
+        | "git_diff_stat" => Some(r"D:\ATRIUM\DUCTEI"),
+        "fleet_status" | "fleet_alarms" | "nvidia_smi" => Some(r"D:\ATRIUM"),
+        "limen_gpu_tier0" => Some(r"D:\ATRIUM\LIMEN"),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod pin_tests {
+    #[test]
+    fn cargo_presets_pin_to_ductei() {
+        assert_eq!(super::pinned_cwd("cargo_test_ctl"), Some(r"D:\ATRIUM\DUCTEI"));
+        assert_eq!(super::pinned_cwd("fleet_alarms"), Some(r"D:\ATRIUM"));
+        assert_eq!(super::pinned_cwd("limen_gpu_tier0"), Some(r"D:\ATRIUM\LIMEN"));
+        assert_eq!(super::pinned_cwd("not_a_preset"), None);
     }
 }
 
@@ -120,10 +195,11 @@ pub fn ack(inbox: &Path, thread: &str, msgs: &[Message]) -> Result<(), String> {
     fs::create_dir_all(&done).map_err(|e| e.to_string())?;
     for m in msgs {
         if let Body::ToolResult { call_id, .. } = &m.body {
-            let f = format!("{call_id}.json");
-            let src = dir.join(&f);
-            if src.exists() {
-                fs::rename(&src, done.join(&f)).map_err(|e| e.to_string())?;
+            for f in [format!("{call_id}.json"), format!("{call_id}.pid")] {
+                let src = dir.join(&f);
+                if src.exists() {
+                    fs::rename(&src, done.join(&f)).map_err(|e| e.to_string())?;
+                }
             }
         }
     }
@@ -151,9 +227,19 @@ mod tests {
     fn deny_by_default() {
         let d = tmp("deny");
         let mut p = disp(&d);
-        assert!(p.dispatch("t", "c1", "shell", &json!({})).unwrap_err().contains("not allowed"));
-        assert!(p.dispatch("t", "c1", TOOL, &json!({"name": "fleet_up", "cwd": "D:\\ATRIUM"})).unwrap_err().contains("allowlist"));
-        assert!(p.dispatch("..\\x", "c1", TOOL, &json!({"name": "cargo_test", "cwd": "D:\\ATRIUM"})).is_err());
+        // Wrong tool / unlisted preset: refused as an ERROR result the model can read, nothing spawned
+        // (the exe does not exist, so a spawn attempt would have been an Err).
+        p.dispatch("t", "c1", "assistant", &json!({})).unwrap();
+        p.dispatch("t", "c2", TOOL, &json!({"name": "fleet_up", "cwd": "D:\\ATRIUM"})).unwrap();
+        let got = collect(&d, "t").unwrap();
+        assert_eq!(got.len(), 2);
+        for m in &got {
+            assert!(matches!(&m.body, Body::ToolResult { output, .. } if output.starts_with("ERROR: refused:")), "{m:?}");
+        }
+        let o = |c: &str| fs::read_to_string(d.join("t").join(format!("{c}.json"))).unwrap();
+        assert!(o("c1").contains("not allowed") && o("c2").contains("allowlist"));
+        // Unsafe ids are still hard errors and write nothing.
+        assert!(p.dispatch("..\\x", "c3", TOOL, &json!({"name": "cargo_test", "cwd": "D:\\ATRIUM"})).is_err());
         assert!(p.dispatch("t", "..\\c", TOOL, &json!({"name": "cargo_test", "cwd": "D:\\ATRIUM"})).is_err());
     }
 
@@ -198,5 +284,23 @@ mod tests {
         fs::write(d.join("t").join("c9.json"), r#"{"ok":false,"output":"kill switch is on"}"#).unwrap();
         let m = collect(&d, "t").unwrap();
         assert!(matches!(&m[0].body, Body::ToolResult { output, .. } if output.starts_with("ERROR:")));
+    }
+
+    #[test]
+    fn expired_call_is_killed_and_recorded_as_timeout() {
+        let d = tmp("expire");
+        fs::create_dir_all(d.join("t")).unwrap();
+        fs::write(d.join("t").join("c7.pid"), "4242").unwrap();
+        let mut killed = Vec::new();
+        expire(&d, "t", "c7", "cargo_test_ctl", 120, &mut |p| killed.push(p)).unwrap();
+        assert_eq!(killed, vec![4242]);
+        let m = collect(&d, "t").unwrap();
+        assert!(matches!(&m[0].body, Body::ToolResult { output, .. } if output == "ERROR: cargo_test_ctl: timed out after 120s"), "{m:?}");
+        assert!(crate::sweep::is_timeout(match &m[0].body { Body::ToolResult { output, .. } => output, _ => "" }));
+        // A late real result never overwrites the recorded timeout, and a missing pid still expires.
+        expire(&d, "t", "c8", "git_status", 120, &mut |_| panic!("no pid, nothing to kill")).unwrap();
+        ack(&d, "t", &m).unwrap();
+        assert!(d.join("t").join("done").join("c7.pid").exists());
+        assert!(expire(&d, "..", "c", "x", 1, &mut |_| {}).is_err());
     }
 }

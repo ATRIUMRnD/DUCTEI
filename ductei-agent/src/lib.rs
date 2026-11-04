@@ -14,6 +14,7 @@
 
 pub mod ollama;
 pub mod preset;
+pub mod sweep;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;

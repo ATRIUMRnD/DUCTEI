@@ -195,7 +195,15 @@ impl Fleet {
 
     fn restart_room(&self, room: &str) -> (bool, String) {
         let Some(r) = self.cfg.room.iter().find(|r| r.name == room) else { return (false, format!("unknown room {room:?}")) };
-        if r.kind != crate::Kind::Managed { return (false, format!("{room} is external (owned by its own task); not restartable from fleet")) }
+        if r.kind != crate::Kind::Managed {
+            return match external_task(r) {
+                Some(task) => {
+                    let (c, t) = run(&["schtasks".into(), "/Run".into(), "/TN".into(), task.clone()], Duration::from_secs(15));
+                    (c == 0, if c == 0 { format!("{room}: started its task {task:?}") } else { format!("{room}: schtasks /Run {task:?} failed: {}", t.trim()) })
+                }
+                None => (false, format!("{room} is external with no `task` configured; not restartable from fleet")),
+            };
+        }
         let pids: std::collections::BTreeMap<String, u32> = fs::read(self.cfg.state.join("pids.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
         let Some(pid) = pids.get(room) else { return (false, format!("{room} has no live pid (is atrium up?)")) };
         crate::tree::kill_tree_by_pid(*pid);
@@ -222,7 +230,46 @@ impl Fleet {
     }
 }
 
+/// The task to start for an external room: only a plain task name from config
+/// (letters, digits, '-', '_', '\\'), so chat text can never reach schtasks.
+pub fn external_task(r: &crate::Room) -> Option<String> {
+    let t = r.task.as_deref()?.trim();
+    let ok = !t.is_empty() && t.len() <= 128 && t.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '\\'));
+    ok.then(|| t.to_string())
+}
+
 // ---------------------------------------------------------------- telegram bot
+
+/// Telegram's sendMessage limit is 4096 UTF-16 code units. Chunks are kept a
+/// little under it, counted in chars (a char is at most 2 UTF-16 units, and
+/// every char in our ops text is in the BMP; the margin covers the rest).
+pub const TG_CHUNK_CHARS: usize = 3800;
+
+/// Split `text` into pieces of at most `max` chars, never truncating. Cuts on
+/// the last newline in the window, else the last sentence end (". ", "! ",
+/// "? "), else the last space, else hard at `max` chars. Always on a char
+/// boundary, so UTF-8 is never broken.
+pub fn split_message(text: &str, max: usize) -> Vec<String> {
+    let max = max.max(1);
+    let mut out = Vec::new();
+    let mut rest = text.trim_end();
+    while !rest.is_empty() {
+        // Byte index just past the first `max` chars (or the whole rest).
+        let end = rest.char_indices().nth(max).map(|(i, _)| i).unwrap_or(rest.len());
+        if end == rest.len() { out.push(rest.to_string()); break; }
+        let win = &rest[..end];
+        let min_cut = win.len() / 3; // never emit a tiny head piece
+        let cut = win.rfind('\n').filter(|&i| i >= min_cut).map(|i| i + 1)
+            .or_else(|| [". ", "! ", "? "].iter().filter_map(|p| win.rfind(p)).max().filter(|&i| i >= min_cut).map(|i| i + 2))
+            .or_else(|| win.rfind(' ').filter(|&i| i >= min_cut).map(|i| i + 1))
+            .unwrap_or(end);
+        let piece = rest[..cut].trim_end();
+        if !piece.is_empty() { out.push(piece.to_string()); }
+        rest = rest[cut..].trim_start_matches(['\n', ' ']);
+    }
+    if out.is_empty() { out.push(String::new()); }
+    out
+}
 
 fn tg_env(p: &std::path::Path) -> Result<(String, i64), String> {
     let t = fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
@@ -241,6 +288,17 @@ fn tg_call(tok: &str, method: &str, fields: &[(&str, String)], timeout_s: u64) -
     if let Some(mut si) = c.stdin.take() { si.write_all(cfg.as_bytes()).map_err(|e| e.to_string())?; }
     let out = c.wait_with_output().map_err(|e| e.to_string())?;
     serde_json::from_slice(&out.stdout).map_err(|e| format!("telegram reply: {e}"))
+}
+
+/// Send `text` as one or more messages (split, never cut). Multi-part
+/// messages get a "(i/n)" suffix so the phone shows they belong together.
+fn tg_send(tok: &str, chat: i64, text: &str) {
+    let parts = split_message(text, TG_CHUNK_CHARS);
+    let n = parts.len();
+    for (i, p) in parts.into_iter().enumerate() {
+        let body = if n > 1 { format!("{p}\n({}/{n})", i + 1) } else { p };
+        if let Err(e) = tg_call(tok, "sendMessage", &[("chat_id", chat.to_string()), ("text", body)], 15) { eprintln!("fleet bot: sendMessage part {}/{n}: {e}", i + 1); }
+    }
 }
 
 /// Map a chat message to fleet args. Destructive verbs need a trailing "yes".
@@ -280,7 +338,7 @@ pub fn tail_new(file: &std::path::Path, cursor_file: &std::path::Path) -> Vec<St
 }
 
 /// Same cursor rules as `tail_new`, but whole lines, untruncated.
-fn tail_new_full(file: &std::path::Path, cursor_file: &std::path::Path) -> Vec<String> {
+pub fn tail_new_full(file: &std::path::Path, cursor_file: &std::path::Path) -> Vec<String> {
     let Ok(bytes) = fs::read(file) else { return Vec::new() };
     let len = bytes.len() as u64;
     let cur = match fs::read_to_string(cursor_file).ok().and_then(|s| s.trim().parse::<u64>().ok()) {
@@ -361,7 +419,7 @@ impl Fleet {
                     Some(args) => { let (ok, t) = self.exec(&args); format!("{} {}\n{}", if ok { "OK" } else { "FAILED" }, args.join(" "), t) }
                     None => bot_help(),
                 };
-                let _ = tg_call(&tok, "sendMessage", &[("chat_id", chat.to_string()), ("text", reply.chars().take(3900).collect())], 15);
+                tg_send(&tok, chat, &reply);
             }
             // Between polls (~25 s): push new bad-token hits on the public endpoint.
             if let Some(a) = &self.fc.mcp_audit {
@@ -369,17 +427,18 @@ impl Fleet {
                 if !hits.is_empty() {
                     let mut msg = format!("ALERT xing-pc-mcp: {} unauthorized request(s) on the public /mcp endpoint\n", hits.len());
                     for h in hits.iter().take(5) { msg += h; msg.push('\n'); }
-                    let _ = tg_call(&tok, "sendMessage", &[("chat_id", chat.to_string()), ("text", msg.chars().take(3900).collect())], 15);
+                    tg_send(&tok, chat, &msg);
                     self.record("alert: mcp unauthorized", false, &msg);
                 }
             }
-            // Agent reports (charter goal 0: keep Xing in the loop).
+            // Agent reports (charter goal 0: keep Xing in the loop). Whole lines,
+            // every one of them: long reports are split across messages, never cut.
             if let Some(o) = &self.fc.agent_outbox {
-                let lines = tail_new(o, &self.dir.join("agent-outbox-cursor"));
+                let lines = tail_new_full(o, &self.dir.join("agent-outbox-cursor"));
                 if !lines.is_empty() {
                     let mut msg = String::from("ATRIUM agent\n");
-                    for l in lines.iter().take(10) { msg += l; msg.push('\n'); }
-                    let _ = tg_call(&tok, "sendMessage", &[("chat_id", chat.to_string()), ("text", msg.chars().take(3900).collect())], 15);
+                    for l in &lines { msg += l; msg.push('\n'); }
+                    tg_send(&tok, chat, &msg);
                     self.record("agent report", true, &msg);
                 }
             }
@@ -394,9 +453,50 @@ mod tests {
     fn commands_map_to_the_allowlist_only() {
         assert_eq!(parse_command("/status"), Some(vec!["status".to_string()]));
         assert_eq!(parse_command("/restart loop yes"), Some(vec!["restart".into(), "loop".into(), "--yes".into()]));
+        let room = |t: &str| -> crate::Room { toml::from_str(&format!("name = \"x\"\n{t}")).unwrap() };
+        assert_eq!(super::external_task(&room("task = \"ductei-sync-serve\"")), Some("ductei-sync-serve".into()));
+        assert_eq!(super::external_task(&room("task = \"a & calc\"")), None);
+        assert_eq!(super::external_task(&room("task = \"x\\\" /F\"")), None);
+        assert_eq!(super::external_task(&room("")), None);
         assert_eq!(parse_command("/restart_anchor@atrium_bot mini yes"), Some(vec!["restart-anchor".into(), "mini".into(), "--yes".into()]));
         assert_eq!(parse_command("rm -rf /"), None);
         assert_eq!(parse_command("/bash ls"), None);
+    }
+
+    #[test]
+    fn long_messages_split_on_boundaries_and_lose_nothing() {
+        assert_eq!(split_message("short", 100), vec!["short".to_string()]);
+        // Sentence boundary wins when there is no newline.
+        let s = "Only report what changed. ".repeat(40);
+        let parts = split_message(&s, 100);
+        assert!(parts.len() > 1);
+        for p in &parts { assert!(p.chars().count() <= 100, "{p:?}"); assert!(p.ends_with('.'), "cut mid-sentence: {p:?}"); }
+        let joined: String = parts.join(" ");
+        assert_eq!(joined.split_whitespace().count(), s.split_whitespace().count());
+        // Newlines are preferred.
+        let lines: String = (0..50).map(|i| format!("line {i} ok\n")).collect();
+        for p in split_message(&lines, 64) { assert!(p.starts_with("line ") && p.ends_with("ok"), "{p:?}"); }
+        // Multibyte text with no spaces: hard cut, still valid UTF-8 and complete.
+        let e = "é😀".repeat(500);
+        let parts = split_message(&e, 333);
+        assert!(parts.iter().all(|p| p.chars().count() <= 333));
+        assert_eq!(parts.concat(), e);
+        // Real limit: a 10k report fits Telegram per piece.
+        let big = "word ".repeat(2000);
+        assert!(split_message(&big, TG_CHUNK_CHARS).iter().all(|p| p.encode_utf16().count() <= 4096));
+    }
+
+    #[test]
+    fn agent_outbox_lines_are_not_truncated() {
+        let d = std::env::temp_dir().join(format!("atrium-outbox-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        let (o, c) = (d.join("outbox.jsonl"), d.join("cursor"));
+        fs::write(&o, "").unwrap();
+        assert!(tail_new_full(&o, &c).is_empty());
+        let long = format!("[ops-1] {} and unload done.", "x".repeat(900));
+        fs::write(&o, format!("{long}\n")).unwrap();
+        assert_eq!(tail_new_full(&o, &c), vec![long]);
     }
 
     #[test]

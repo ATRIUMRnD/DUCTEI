@@ -151,11 +151,19 @@ impl SessionBound {
     }
 }
 
+/// Called once per envelope, only after it is accepted and fsynced to the
+/// accepted log. The log stays the source of truth: an observer failure
+/// never un-accepts an envelope, it is surfaced through `observer_faults`
+/// so a sidecar (e.g. ductei-braid) can be resynced from the log.
+pub type Observer = Box<dyn FnMut(&Envelope) -> Result<(), String> + Send>;
+
 pub struct Channel {
     policy: ScopePolicy,
     log: LogStore,
     gate: gate::CausalGate,
     gate_log: gate::RejectLog,
+    observers: Vec<Observer>,
+    observer_faults: u64,
 }
 impl Channel {
     pub fn open(policy: ScopePolicy, log_path: impl AsRef<Path>, reject_log_path: impl AsRef<Path>) -> std::io::Result<Self> {
@@ -164,10 +172,19 @@ impl Channel {
         let mut gate = gate::CausalGate::new();
         let (past, _) = log.replay(0)?;
         for e in &past { let _ = gate.admit(e); }
-        Ok(Self { policy, log, gate, gate_log: gate::RejectLog::open(reject_log_path)? })
+        Ok(Self {
+            policy, log, gate,
+            gate_log: gate::RejectLog::open(reject_log_path)?,
+            observers: Vec::new(),
+            observer_faults: 0,
+        })
     }
-    /// Scope check → causal gate → persist. Only after all three is the
-    /// envelope "accepted" (and eligible for broadcast).
+    /// Register a post-accept observer (see `Observer`).
+    pub fn observe(&mut self, o: Observer) { self.observers.push(o); }
+    /// Number of observer calls that failed since open.
+    pub fn observer_faults(&self) -> u64 { self.observer_faults }
+    /// Scope check → causal gate → persist → observers. Only after the first
+    /// three is the envelope "accepted" (and eligible for broadcast).
     pub fn send(&mut self, env: Envelope) -> Result<(), ChannelError> {
         if !self.policy.permits(&env) {
             return Err(ChannelError::ScopeDenied(env.key));
@@ -179,7 +196,14 @@ impl Channel {
                 return Err(ChannelError::StaleDelta { key: env.key, lamport: env.lamport });
             }
         }
-        self.log.append(&env).map_err(|e| ChannelError::Io(e.to_string()))
+        self.log.append(&env).map_err(|e| ChannelError::Io(e.to_string()))?;
+        for o in &mut self.observers {
+            if let Err(e) = o(&env) {
+                self.observer_faults += 1;
+                eprintln!("ductei: observer failed for {}: {e}", env.key);
+            }
+        }
+        Ok(())
     }
     pub fn replay(&self, cursor: usize) -> std::io::Result<(Vec<Envelope>, usize)> { self.log.replay(cursor) }
     pub fn session(&mut self, bound: SessionBound) -> Session<'_> {
