@@ -10,6 +10,10 @@
 //! the deterministic report built from the raw preset results goes out instead (sweep.rs).
 //! Each preset call is capped (env ATRIUM_AGENT_PRESET_TIMEOUT_S, default 120 s); a hung call
 //! is killed, recorded as "<preset>: timed out after Ns", and the sweep goes on.
+//!
+//! Phone output (Xing, Nov 4 2026): ONE message per run. No task echo; it holds the AUTO
+//! actions, the model's summary, and the full per-preset log of what matters. The task text
+//! and step trace stay in sweep.log only.
 use ductei_agent::{ollama, preset, run_slice, sweep, Body, Dispatcher, Entry, Message, SliceOutcome, Store};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -55,6 +59,26 @@ fn any_brain_alive(specs: &[ollama::Spec]) -> Result<(), String> {
     }
     down.dedup();
     Err(down.join(", "))
+}
+
+/// The one phone message: AUTO actions, then the report, then the full log (unless the
+/// report already is the raw log).
+fn compose(thread: &str, auto: &[String], body: &str, results: &[(String, String)]) -> String {
+    let mut s = format!("[{thread}]");
+    if !auto.is_empty() {
+        s.push_str("\nAUTO:");
+        for a in auto {
+            s.push_str("\n- ");
+            s.push_str(a);
+        }
+    }
+    s.push_str("\n\n");
+    s.push_str(body.trim());
+    if !body.contains("raw report") && !results.is_empty() {
+        s.push_str("\n\nLOG:\n");
+        s.push_str(&sweep::fallback_report(results));
+    }
+    s
 }
 
 /// Wait for `call_id`'s result, capped at `cap`. On timeout the call is killed and recorded
@@ -105,7 +129,7 @@ fn run() -> Result<(), String> {
     let outbox = root.join("outbox.jsonl");
     let store = Store::open(root.join("history"))?;
     let inbox = root.join("inbox");
-    let allow: Vec<String> = ["git_status", "git_log", "git_diff_stat", "cargo_check", "cargo_test_watch", "cargo_test_agent", "cargo_test_ctl", "fleet_status", "fleet_alarms", "nvidia_smi", "limen_gpu_tier0"]
+    let allow: Vec<String> = ["git_status", "git_log", "git_diff_stat", "cargo_check", "cargo_test_watch", "cargo_test_agent", "cargo_test_ctl", "cargo_test_brain", "fleet_status", "fleet_alarms", "nvidia_smi", "limen_gpu_tier0"]
         .iter().map(|s| s.to_string()).collect();
     let charter = std::fs::read_to_string(CHARTER).map_err(|e| format!("{CHARTER}: {e}"))?;
     let specs = brain_specs()?;
@@ -122,20 +146,22 @@ fn run() -> Result<(), String> {
     // One thread per run, so tasks never bleed into each other.
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let thread = format!("ops-{now}");
-    ollama::report(&outbox, &format!("[{thread}] task: {task}"))?;
+    // Task text goes to sweep.log only, never the phone.
+    eprintln!("[{thread}] task: {task}");
     eprintln!("[{thread}] brains: {} (preset cap {}s)", brain.names.join(" > "), cap.as_secs());
 
     // The one auto-action (Xing, Nov 3 2026): bring atrium back if it is down, else restart a
-    // down room. Only through the signed fleet verbs, never a shell; every action is reported.
-    for line in auto_heal() {
-        ollama::report(&outbox, &format!("[{thread}] AUTO {line}"))?;
+    // down room. Only through the signed fleet verbs, never a shell; folded into the one report.
+    let auto = auto_heal();
+    for line in &auto {
+        eprintln!("[{thread}] AUTO {line}");
     }
 
     // Health pre-check: if no brain answers, send the raw report instead of an error.
     if let Err(hosts) = any_brain_alive(&specs) {
         eprintln!("[{thread}] LLM offline ({hosts}); running the raw sweep");
         let results = offline_sweep(&mut d.inner, &inbox, &thread, cap);
-        return ollama::report(&outbox, &format!("[{thread}] {}", sweep::offline_report(&hosts, &results)));
+        return ollama::report(&outbox, &compose(&thread, &auto, &sweep::offline_report(&hosts, &results), &results));
     }
 
     let results = |store: &Store| store.history(&thread).map(|h| sweep::results_from_history(&h)).unwrap_or_default();
@@ -146,7 +172,8 @@ fn run() -> Result<(), String> {
             Err(e) => {
                 // Model error (empty twice, all brains failed): the deterministic report goes out.
                 eprintln!("[{thread}] step {step}: {e}");
-                ollama::report(&outbox, &format!("[{thread}] {}", sweep::final_report(Err(e), &results(&store))))?;
+                let r = results(&store);
+                ollama::report(&outbox, &compose(&thread, &auto, &sweep::final_report(Err(e), &r), &r))?;
                 ollama::unload_all(&specs);
                 return Ok(());
             }
@@ -165,13 +192,14 @@ fn run() -> Result<(), String> {
                         text: "That was not a valid tool call and nothing ran. Call run_preset with a JSON object {\"name\":..., \"cwd\":...}, or if every preset has run, write the final plain-text report.".into() } }];
                     continue;
                 }
-                ollama::report(&outbox, &format!("[{thread}] {}", sweep::final_report(Ok(last), &results(&store))))?;
+                let r = results(&store);
+                ollama::report(&outbox, &compose(&thread, &auto, &sweep::final_report(Ok(last), &r), &r))?;
                 ollama::unload_all(&specs); // free VRAM between sweeps
                 return Ok(());
             }
             SliceOutcome::Waiting { call_id } => {
                 // Log the folder the preset ACTUALLY runs in (pinned), not the model's guess.
-                // Steps go to sweep.log only; the phone gets the task line and the final report.
+                // Steps go to sweep.log only; the phone gets the one final report.
                 let call = store.history(&thread)?.into_iter().rev().find_map(|e| match e {
                     Entry::ToolCall { args, .. } => Some(args),
                     _ => None,
@@ -187,7 +215,9 @@ fn run() -> Result<(), String> {
         }
     }
     ollama::unload_all(&specs);
-    ollama::report(&outbox, &format!("[{thread}] stopped after {MAX_STEPS} steps without a final answer, raw report:\n{}", sweep::fallback_report(&results(&store))))
+    let r = results(&store);
+    let body = format!("stopped after {MAX_STEPS} steps without a final answer, raw report:\n{}", sweep::fallback_report(&r));
+    ollama::report(&outbox, &compose(&thread, &auto, &body, &r))
 }
 
 /// A "final answer" that is really a tool call the model failed to format.
@@ -269,7 +299,7 @@ fn auto_heal() -> Vec<String> {
 
 #[cfg(test)]
 mod heal_tests {
-    use super::{heal_line, heal_plan, managed_rooms};
+    use super::{compose, heal_line, heal_plan, managed_rooms};
     #[test]
     fn plans() {
         let m: Vec<String> = vec!["loop".into(), "fleet-bot".into()];
@@ -298,5 +328,14 @@ mod heal_tests {
     fn broken_tool_call_is_not_a_report() {
         assert!(super::looks_like_tool_call(r#"{"tool":"run_preset","args":{"name":"fleet_alarms","cwd":"D:\\ATRIUM"}}}"#));
         assert!(!super::looks_like_tool_call("Alarms: none. Tests: all passed."));
+    }
+    #[test]
+    fn one_message_no_task_echo_with_full_log() {
+        let res = vec![("fleet_alarms".to_string(), "no alarms".to_string()), ("git_status".to_string(), "## x".to_string())];
+        let m = compose("ops-1", &["did up: atrium task started".into()], "All green.", &res);
+        assert!(!m.contains("task:"), "{m}");
+        assert!(m.contains("AUTO:\n- did up") && m.contains("All green.") && m.contains("LOG:\nfleet_alarms: none\ngit_status: clean"), "{m}");
+        let raw = compose("ops-1", &[], "LLM offline (h), raw report:\nfleet_alarms: none", &res);
+        assert!(!raw.contains("LOG:"), "{raw}");
     }
 }

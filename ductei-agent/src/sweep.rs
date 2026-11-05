@@ -12,7 +12,10 @@ use std::time::Duration;
 /// Default cap for one preset call (seconds). Override: env ATRIUM_AGENT_PRESET_TIMEOUT_S.
 pub const PRESET_TIMEOUT_S: u64 = 120;
 /// Presets the sweep runs itself when the LLM is offline.
-pub const OFFLINE_SWEEP: &[&str] = &["fleet_alarms", "git_status", "cargo_test_agent", "cargo_test_ctl", "cargo_test_watch", "limen_gpu_tier0"];
+pub const OFFLINE_SWEEP: &[&str] = &["fleet_alarms", "git_status", "cargo_test_agent", "cargo_test_ctl", "cargo_test_watch", "cargo_test_brain", "limen_gpu_tier0"];
+/// Alarm lines shown on the phone (one per line, then "+N more"); keeps the message under
+/// Telegram's 4096-character cap.
+pub const ALARM_LINES: usize = 20;
 
 /// Per-call timeout from env (1..=3600 s), else the default.
 pub fn preset_timeout() -> Duration {
@@ -85,7 +88,15 @@ fn summarize(name: &str, out: &str) -> String {
         if l.is_empty() || l.iter().all(|x| x.to_lowercase().contains("no alarms")) {
             return "none".into();
         }
-        return format!("ALARM {}", l.iter().take(5).map(|x| clip(x, 160)).collect::<Vec<_>>().join(" | "));
+        let mut s = format!("ALARM ({} lines)", l.len());
+        for x in l.iter().take(ALARM_LINES) {
+            s.push_str("\n  ");
+            s.push_str(&clip(x, 140));
+        }
+        if l.len() > ALARM_LINES {
+            s.push_str(&format!("\n  +{} more (full list: fleet_alarms)", l.len() - ALARM_LINES));
+        }
+        return s;
     }
     if name == "git_status" {
         let changed: Vec<&str> = lines(out).filter(|l| !l.starts_with("##")).collect();
@@ -108,6 +119,11 @@ fn summarize(name: &str, out: &str) -> String {
             passed += l.split(';').next().and_then(|p| p.split_whitespace().rev().nth(1)).and_then(|n| n.parse::<u64>().ok()).unwrap_or(0);
         }
         return if runs > 0 { format!("ok, {passed} passed") } else { "ok".into() };
+    }
+    if name == "fleet_status" {
+        // One line per machine; keep them all (the last line alone hid xing-pc and mini).
+        let l: Vec<String> = lines(out).map(|x| clip(x.trim(), 160)).collect();
+        return if l.is_empty() { "no output".into() } else { l.join(" | ") };
     }
     // LIMEN GPU and anything else: the last meaningful line.
     lines(out).last().map(|l| clip(l.trim(), 200)).unwrap_or_else(|| "no output".into())
@@ -218,7 +234,7 @@ mod tests {
             r("limen_gpu_tier0", "warmup\ntier0 ok: 24 qubits 1.8 ms\n"),
         ];
         let t = fallback_report(&res);
-        assert!(t.contains("fleet_alarms: ALARM I3 tamper on ward"), "{t}");
+        assert!(t.contains("fleet_alarms: ALARM (1 lines)\n  I3 tamper on ward"), "{t}");
         assert!(t.contains("git_status: 2 uncommitted: ductei-agent/src/ollama.rs, ductei-braid/"), "{t}");
         assert!(t.contains("cargo_test_agent: ok, 15 passed"), "{t}");
         assert!(t.contains("cargo_test_ctl: FAIL: fleet::x"), "{t}");
@@ -226,6 +242,16 @@ mod tests {
         assert!(t.contains("limen_gpu_tier0: tier0 ok: 24 qubits"), "{t}");
         assert_eq!(fallback_report(&[r("fleet_alarms", "no alarms"), r("git_status", "## timeline\n")]), "fleet_alarms: none\ngit_status: clean");
         assert_eq!(fallback_report(&[]), "no preset results");
+    }
+
+    #[test]
+    fn many_alarms_are_capped_with_a_count() {
+        let out: String = (0..182).map(|i| format!("alarm {i}\n")).collect();
+        let t = fallback_report(&[r("fleet_alarms", &out)]);
+        assert!(t.starts_with("fleet_alarms: ALARM (182 lines)"), "{t}");
+        assert!(t.contains("alarm 19") && !t.contains("alarm 20\n"), "{t}");
+        assert!(t.contains("+162 more"), "{t}");
+        assert!(t.len() < 3500, "{}", t.len());
     }
 
     #[test]
@@ -243,6 +269,13 @@ mod tests {
         assert!(e.starts_with("LLM gave no report") && e.contains("fleet_alarms: none"), "{e}");
         let o = offline_report("http://100.106.147.75:11434", &res);
         assert!(o.starts_with("LLM offline (http://100.106.147.75:11434), raw report:\n"), "{o}");
+    }
+
+    #[test]
+    fn fleet_status_keeps_every_machine() {
+        let out = "xing-pc: atrium UP, 7 rooms\nmini: anchor-peer up, alarms 194\nlaptop: anchor-peer up";
+        let t = fallback_report(&[("fleet_status".into(), out.into())]);
+        assert!(t.contains("xing-pc: atrium UP") && t.contains("mini: anchor-peer up") && t.contains("laptop: anchor-peer up"), "{t}");
     }
 
     #[test]

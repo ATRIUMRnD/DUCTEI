@@ -136,6 +136,7 @@ pub fn pinned_cwd(preset: &str) -> Option<&'static str> {
         | "git_diff_stat" => Some(r"D:\ATRIUM\DUCTEI"),
         "fleet_status" | "fleet_alarms" | "nvidia_smi" => Some(r"D:\ATRIUM"),
         "limen_gpu_tier0" => Some(r"D:\ATRIUM\LIMEN"),
+        "cargo_test_brain" => Some(r"D:\brain"),
         _ => None,
     }
 }
@@ -147,6 +148,7 @@ mod pin_tests {
         assert_eq!(super::pinned_cwd("cargo_test_ctl"), Some(r"D:\ATRIUM\DUCTEI"));
         assert_eq!(super::pinned_cwd("fleet_alarms"), Some(r"D:\ATRIUM"));
         assert_eq!(super::pinned_cwd("limen_gpu_tier0"), Some(r"D:\ATRIUM\LIMEN"));
+        assert_eq!(super::pinned_cwd("cargo_test_brain"), Some(r"D:\brain"));
         assert_eq!(super::pinned_cwd("not_a_preset"), None);
     }
 }
