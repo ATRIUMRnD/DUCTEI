@@ -447,7 +447,7 @@ impl Supervisor {
                 let exp = seqa.load(SeqCst);
                 let trust = VerifyTrust { allow_unpinned: true, ..Default::default() };
                 let problem = match verify_own_chain(&state, &trust) {
-                    Ok(r) if r.ok() && r.receipts as u64 >= exp => None,
+                    Ok(r) if r.ok() && r.receipts >= exp => None,
                     Ok(r) => Some(format!("receipts.jsonl: {} on disk, {} written; {}", r.receipts, exp, r.errors.join(" | "))),
                     Err(e) => Some(e),
                 };

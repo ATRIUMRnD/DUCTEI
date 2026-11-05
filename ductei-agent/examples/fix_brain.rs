@@ -7,6 +7,7 @@
 //!    breaker, kill switch, hash-chained ledger).
 //! 5. Accepted: write a .patch to atrium-state\agent\fixes and one outbox line for the phone.
 //!    Rejected or any error: one outbox line saying why. The worktree is always removed.
+//!
 //! Never commits, never pushes, never edits D:\brain. Every child process runs hidden.
 
 use ductei_agent::fix::{defines_fn, extract_file, failing_tests, failure_text, precheck, prompt, stem, test_fn};

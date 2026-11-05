@@ -3,15 +3,20 @@
 //! Repos come from D:\ATRIUM\ops\agent\fix-repos.txt, one per line: `name|D:\path\to\repo`.
 //! The repo's git root must also be its cargo root (Cargo.toml at the top). For each repo:
 //! 1. Scratch worktree at HEAD under D:\ATRIUM\private\fix (real checkout untouched).
-//! 2. cargo test there. All green: report and move on.
+//! 2. cargo test there. All green: take the next open task for this repo from
+//!    D:\ATRIUM\ops\agent\tasks.txt (same gate, same patch flow), else report and move on.
 //! 3. First failing test: find its file, ask the brain chain for a whole replacement file.
 //! 4. Gate with ductei-verify check-git (fail closed).
 //! 5. Accepted: write a .patch to atrium-state\agent\fixes and one outbox line for the phone.
 //!    Rejected or any error: one outbox line saying why. The worktree is always removed.
+//!
 //! Never commits, never pushes, never edits the real repo. Every child process runs hidden,
 //! and scratch output stays on D: (never the system temp folder).
 
-use ductei_agent::fix::{defines_fn, extract_file, failing_tests, failure_text, precheck, prompt, stem, test_fn};
+use ductei_agent::fix::{
+    defines_fn, extract_file, failing_tests, failure_text, next_task, parse_tasks, patch_header, patch_id, precheck, prompt, stem,
+    task_precheck, task_prompt, test_fn, Task,
+};
 use ductei_agent::ollama::{build_chain, parse_specs, report};
 use ductei_agent::{Entry, Model, ModelOut};
 use std::path::{Path, PathBuf};
@@ -27,6 +32,8 @@ const FIXES: &str = r"D:\ATRIUM\ops\atrium-state\agent\fixes";
 const OUTBOX: &str = r"D:\ATRIUM\ops\atrium-state\agent\outbox.jsonl";
 const BRAINS: &str = r"D:\ATRIUM\ops\agent\brains.txt";
 const STOP: &str = r"D:\ATRIUM\private\verify\STOP";
+const TASKS: &str = r"D:\ATRIUM\ops\agent\tasks.txt";
+const TASK_LOG: &str = r"D:\ATRIUM\ops\atrium-state\agent\tasks-state.txt";
 const TEST_TIMEOUT: Duration = Duration::from_secs(900);
 const MAX_SRC: usize = 60_000;
 const MAX_REPOS: usize = 8;
@@ -193,7 +200,7 @@ fn propose(repo: &Repo, wt: &str) -> Result<String, String> {
     let (ok, out) = run(c, TEST_TIMEOUT).map_err(|e| format!("cargo test: {e}"))?;
     let fails = failing_tests(&out);
     if ok && fails.is_empty() {
-        return Ok("all tests pass at HEAD, nothing to fix".into());
+        return queued_task(repo, wt);
     }
     let Some(test) = fails.first().cloned() else {
         let tail: String = out.lines().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
@@ -233,15 +240,85 @@ fn propose(repo: &Repo, wt: &str) -> Result<String, String> {
     }
 
     // 5. patch for Xing
+    let msg = format!("Fix failing test {}", test_fn(&test));
+    write_patch(repo, wt, &stem(&test), "-", &msg, &format!("failing test {test}"))
+}
+
+/// Diff the worktree into a headed .patch, report it with its approve id.
+fn write_patch(repo: &Repo, wt: &str, label: &str, task: &str, msg: &str, what: &str) -> Result<String, String> {
     let diff = git(wt, &["diff", "HEAD"])?;
+    if diff.trim().is_empty() {
+        return Err("verified change produced an empty diff".into());
+    }
+    let stat = git(wt, &["diff", "HEAD", "--shortstat"]).unwrap_or_default();
     std::fs::create_dir_all(FIXES).map_err(|e| e.to_string())?;
-    let patch = Path::new(FIXES).join(format!("{}-{}-{}.patch", repo.name, stem(&test), now()));
-    std::fs::write(&patch, &diff).map_err(|e| e.to_string())?;
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let id = patch_id(t.as_secs(), t.subsec_nanos());
+    let patch = Path::new(FIXES).join(format!("P{id}-{}-{}.patch", repo.name, label.chars().take(40).collect::<String>()));
+    std::fs::write(&patch, format!("{}{diff}", patch_header(&repo.path, task, msg))).map_err(|e| e.to_string())?;
+    let preview: String = diff.lines().filter(|l| !l.starts_with("index ")).take(40).collect::<Vec<_>>().join("\n");
     Ok(format!(
-        "fix ready for {test} (verified: check, clippy, tests). Review: git -C {} apply --check {}",
-        repo.path,
-        patch.display()
+        "PATCH {id} ready: {what} (verified: check, clippy, tests). {}\nCommit message: {msg}\n/approve {id} to commit it locally (never pushed), /reject {id} to drop it.\n{preview}",
+        stat.trim()
     ))
+}
+
+/// Green repo: take the next queued task for it, if any.
+fn queued_task(repo: &Repo, wt: &str) -> Result<String, String> {
+    let Ok(qtext) = std::fs::read_to_string(TASKS) else {
+        return Ok("all tests pass at HEAD, no task queue".into());
+    };
+    let tasks = parse_tasks(&qtext).map_err(|e| format!("task queue: {e}"))?;
+    let log = std::fs::read_to_string(TASK_LOG).unwrap_or_default();
+    let Some(task) = next_task(&tasks, &log, &repo.name) else {
+        return Ok("all tests pass at HEAD, no open tasks".into());
+    };
+    match attempt_task(repo, wt, task) {
+        Ok(m) => {
+            log_task(&task.id, "pending");
+            Ok(m)
+        }
+        Err(e) => {
+            log_task(&task.id, "fail");
+            Err(format!("task {}: {e}", task.id))
+        }
+    }
+}
+
+fn log_task(id: &str, ev: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(TASK_LOG) {
+        let _ = writeln!(f, "{id}|{ev}");
+    }
+}
+
+fn attempt_task(repo: &Repo, wt: &str, task: &Task) -> Result<String, String> {
+    let file = Path::new(wt).join(&task.file);
+    let old = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", task.file))?;
+    if old.len() > MAX_SRC {
+        return Err(format!("{} is {} bytes, too big to send whole", task.file, old.len()));
+    }
+    let specs = parse_specs(&std::fs::read_to_string(BRAINS).map_err(|e| format!("{BRAINS}: {e}"))?)?;
+    let charter = "You are the ATRIUM build agent. You make one small, correct Rust change with a test. A strict verifier \
+                   rejects anything that fails cargo check, clippy -D warnings or cargo test.";
+    let mut chain = build_chain(&specs, charter, &[], 900);
+    let ask = task_prompt(&task.instruction, &task.file, &old, &repo.name);
+    let reply = match chain.complete(&[Entry::User { text: ask }])? {
+        ModelOut::Text(t) => t,
+        ModelOut::ToolCall { tool, .. } => return Err(format!("model asked for tool {tool} instead of a change")),
+    };
+    let new = extract_file(&reply).ok_or("model reply had no usable file")?;
+    task_precheck(&old, &new)?;
+    std::fs::write(&file, &new).map_err(|e| e.to_string())?;
+    let mut v = hidden(VERIFY);
+    v.args(["check-git", "--policy", POLICY, "--worktree", wt, "--task", &task_id(&repo.name, &task.id)]);
+    let (accepted, verdict) = run(v, Duration::from_secs(1800)).map_err(|e| format!("verifier: {e}"))?;
+    if !accepted {
+        let why: String = verdict.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(400).collect();
+        return Err(format!("verifier rejected the change: {why}"));
+    }
+    let msg: String = task.instruction.chars().take(72).collect();
+    write_patch(repo, wt, &task.id, &task.id, &msg, &format!("task {}", task.id))
 }
 
 fn one(repo: &Repo) {

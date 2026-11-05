@@ -365,8 +365,109 @@ pub const BOT_COMMANDS: &[(&str, &str)] = &[
     ("down", "Stop atrium: /down yes"),
     ("restart", "Restart a room: /restart <room> yes"),
     ("restart_anchor", "Restart an anchor: /restart_anchor mini yes"),
+    ("approve", "Commit an agent patch locally: /approve 123456"),
+    ("reject", "Drop an agent patch: /reject 123456"),
     ("help", "Show every command"),
 ];
+
+// ---------------------------------------------------------------- agent fix approvals
+//
+// The fix agent writes verified patches to <agent outbox dir>/fixes as
+// `P<6 digits>-<repo>-<label>.patch`, each starting with an `# atrium-fix`
+// header (repo path, task id, commit message). /approve applies one to the
+// real repo and commits only the files it touches, locally; nothing is ever
+// pushed. It refuses if those files have uncommitted edits. /reject files it away.
+
+/// `/approve 123456` or `/reject 123456` -> (approve, id). Exactly six digits.
+pub fn parse_fix_command(text: &str) -> Option<(bool, String)> {
+    let mut w = text.split_whitespace();
+    let verb = w.next()?.trim_start_matches('/').split('@').next()?.to_lowercase();
+    let id = w.next()?;
+    if w.next().is_some() || id.len() != 6 || !id.chars().all(|c| c.is_ascii_digit()) { return None; }
+    match verb.as_str() { "approve" => Some((true, id.to_string())), "reject" => Some((false, id.to_string())), _ => None }
+}
+
+/// (repo, task, commit message) from a fix patch header.
+pub fn patch_meta(patch: &str) -> Option<(String, String, String)> {
+    if !patch.starts_with("# atrium-fix\n") { return None; }
+    let get = |k: &str| patch.lines().take(6).find_map(|l| l.strip_prefix(&format!("# {k}: ")).map(|v| v.trim().to_string()));
+    let repo = get("repo")?;
+    let low = repo.to_ascii_lowercase();
+    if !low.starts_with(r"d:\") || low.split('\\').any(|s| s == "..") { return None; }
+    Some((repo, get("task")?, get("msg").filter(|m| !m.is_empty())?))
+}
+
+fn hidden_git(dir: &str, args: &[&str]) -> Result<String, String> {
+    let mut c = Command::new("git");
+    c.arg("-C").arg(dir).args(args).stdin(Stdio::null());
+    #[cfg(windows)]
+    { use std::os::windows::process::CommandExt; c.creation_flags(0x0800_0000); } // no console window
+    let o = c.output().map_err(|e| format!("git: {e}"))?;
+    let text = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+    if o.status.success() { Ok(text) } else { Err(format!("git {}: {}", args.first().unwrap_or(&""), text.trim())) }
+}
+
+impl Fleet {
+    /// Approve (apply + local commit) or reject one fix patch by its six-digit id.
+    pub fn fix_decide(&self, approve: bool, id: &str) -> (bool, String) {
+        let Some(dir) = self.fc.agent_outbox.as_ref().and_then(|o| o.parent()).map(|p| p.join("fixes")) else {
+            return (false, "agent_outbox is not configured".into());
+        };
+        let want = format!("P{id}-");
+        let patch = fs::read_dir(&dir).ok().and_then(|rd| {
+            rd.flatten().map(|e| e.path()).find(|p| {
+                p.extension().is_some_and(|x| x == "patch") && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(&want))
+            })
+        });
+        let Some(patch) = patch else { return (false, format!("no open patch {id}")) };
+        let r = fix_apply(approve, &patch, &dir);
+        self.record(&format!("fix {} {id}", if approve { "approve" } else { "reject" }), r.0, &r.1);
+        r
+    }
+}
+
+fn fix_apply(approve: bool, patch: &std::path::Path, dir: &std::path::Path) -> (bool, String) {
+    let text = match fs::read_to_string(patch) { Ok(t) => t, Err(e) => return (false, e.to_string()) };
+    let Some((repo, task, msg)) = patch_meta(&text) else { return (false, "patch has no valid atrium-fix header".into()) };
+    let mark = |ev: &str| {
+        if task == "-" { return; }
+        use std::io::Write;
+        if let Some(log) = dir.parent().map(|p| p.join("tasks-state.txt")) {
+            if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(log) { let _ = writeln!(f, "{task}|{ev}"); }
+        }
+    };
+    let file_away = |sub: &str| {
+        let d = dir.join(sub);
+        let _ = fs::create_dir_all(&d);
+        if let Some(n) = patch.file_name() { let _ = fs::rename(patch, d.join(n)); }
+    };
+    if !approve {
+        mark("rejected");
+        file_away("rejected");
+        return (true, format!("dropped. Task {task} will not be retried."));
+    }
+    let p = patch.to_string_lossy().to_string();
+    let files: Vec<String> = match hidden_git(&repo, &["apply", "--numstat", &p]) {
+        Ok(o) => o.lines().filter_map(|l| l.split('\t').nth(2).map(|s| s.trim().to_string())).filter(|s| !s.is_empty()).collect(),
+        Err(e) => return (false, e),
+    };
+    if files.is_empty() { return (false, "patch touches no files".into()); }
+    let with_files = |head: &[&str]| -> Vec<String> { head.iter().map(|s| s.to_string()).chain(files.iter().cloned()).collect() };
+    let run = |a: Vec<String>| hidden_git(&repo, &a.iter().map(String::as_str).collect::<Vec<_>>());
+    match run(with_files(&["status", "--porcelain", "--"])) {
+        Ok(o) if o.trim().is_empty() => {}
+        Ok(o) => return (false, format!("those files have uncommitted edits, leaving them alone:\n{}", o.trim())),
+        Err(e) => return (false, e),
+    }
+    if let Err(e) = hidden_git(&repo, &["apply", "--check", &p]) { return (false, format!("patch no longer applies: {e}")); }
+    if let Err(e) = hidden_git(&repo, &["apply", &p]) { return (false, e); }
+    if let Err(e) = run(with_files(&["add", "--"])) { return (false, format!("applied, not committed: {e}")); }
+    if let Err(e) = run(with_files(&["commit", "-q", "-m", &msg, "--"])) { return (false, format!("applied, not committed (changes are in the working folder): {e}")); }
+    let head = hidden_git(&repo, &["log", "--oneline", "-1"]).unwrap_or_default();
+    mark("done");
+    file_away("applied");
+    (true, format!("committed locally in {repo}, not pushed: {}\nfiles: {}", head.trim(), files.join(", ")))
+}
 
 fn commands_json() -> String {
     serde_json::Value::Array(BOT_COMMANDS.iter().map(|(c, d)| serde_json::json!({ "command": c, "description": d })).collect()).to_string()
@@ -415,9 +516,14 @@ impl Fleet {
                 let from = u["message"]["chat"]["id"].as_i64().unwrap_or(0);
                 let text = u["message"]["text"].as_str().unwrap_or("").to_string();
                 if from != chat { self.record(&format!("bot: ignored chat {from}"), false, &text); continue; }
-                let reply = match parse_command(&text) {
-                    Some(args) => { let (ok, t) = self.exec(&args); format!("{} {}\n{}", if ok { "OK" } else { "FAILED" }, args.join(" "), t) }
-                    None => bot_help(),
+                let reply = if let Some((approve, id)) = parse_fix_command(&text) {
+                    let (ok, t) = self.fix_decide(approve, &id);
+                    format!("{} {} {id}\n{t}", if ok { "OK" } else { "FAILED" }, if approve { "approve" } else { "reject" })
+                } else {
+                    match parse_command(&text) {
+                        Some(args) => { let (ok, t) = self.exec(&args); format!("{} {}\n{}", if ok { "OK" } else { "FAILED" }, args.join(" "), t) }
+                        None => bot_help(),
+                    }
                 };
                 tg_send(&tok, chat, &reply);
             }
@@ -464,6 +570,20 @@ mod tests {
     }
 
     #[test]
+    fn fix_commands_and_patch_headers() {
+        assert_eq!(parse_fix_command("/approve 123456"), Some((true, "123456".into())));
+        assert_eq!(parse_fix_command("/reject@atrium_bot 000042"), Some((false, "000042".into())));
+        for bad in ["/approve", "/approve 12345", "/approve 1234567", "/approve abcdef", "/approve 123456 yes", "/status 123456"] {
+            assert_eq!(parse_fix_command(bad), None, "{bad}");
+        }
+        let ok = "# atrium-fix\n# repo: D:\\ATRIUM\\DUCTEI\n# task: t1\n# msg: Add a helper\ndiff --git a/x b/x\n";
+        assert_eq!(patch_meta(ok), Some((r"D:\ATRIUM\DUCTEI".into(), "t1".into(), "Add a helper".into())));
+        assert_eq!(patch_meta(&ok.replace("D:\\ATRIUM", "C:\\Windows")), None);
+        assert_eq!(patch_meta(&ok.replace("D:\\ATRIUM\\DUCTEI", "D:\\ATRIUM\\..\\x")), None);
+        assert_eq!(patch_meta("diff --git a/x b/x\n"), None);
+    }
+
+    #[test]
     fn long_messages_split_on_boundaries_and_lose_nothing() {
         assert_eq!(split_message("short", 100), vec!["short".to_string()]);
         // Sentence boundary wins when there is no newline.
@@ -506,7 +626,12 @@ mod tests {
         for (c, d) in BOT_COMMANDS {
             assert!(!c.is_empty() && c.len() <= 32 && c.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_'), "bad telegram command name {c}");
             assert!(!d.is_empty() && d.len() <= 256);
-            if *c != "help" { assert!(parse_command(&format!("/{c}")).is_some(), "/{c} in menu but not obeyed"); }
+            let obeyed = match *c {
+                "help" => true,
+                "approve" | "reject" => parse_fix_command(&format!("/{c} 123456")).is_some(),
+                _ => parse_command(&format!("/{c}")).is_some(),
+            };
+            assert!(obeyed, "/{c} in menu but not obeyed");
         }
         let v: serde_json::Value = serde_json::from_str(&commands_json()).unwrap();
         assert_eq!(v.as_array().unwrap().len(), BOT_COMMANDS.len());

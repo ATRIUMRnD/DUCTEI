@@ -63,7 +63,7 @@ pub fn extract_file(reply: &str) -> Option<String> {
         let Some(close) = body.find("```") else { break };
         if lang.is_empty() || lang.eq_ignore_ascii_case("rust") || lang.eq_ignore_ascii_case("rs") {
             let code = body[..close].to_string();
-            if best.as_ref().map_or(true, |b| code.len() > b.len()) {
+            if best.as_ref().is_none_or(|b| code.len() > b.len()) {
                 best = Some(code);
             }
         }
@@ -114,9 +114,155 @@ pub fn stem(test: &str) -> String {
     s.chars().take(56).collect()
 }
 
+// ---------------------------------------------------------------- task queue
+//
+// When a repo's tests are all green, the fix agent takes queued build tasks instead.
+// Queue file (Xing edits it): one task per line, `id|repo|file|instruction`, `#` comments.
+// State log (append only, shared with the Telegram bot): `id|event`, event is one of
+// `pending` (patch sent), `fail` (attempt rejected), `done` (approved), `rejected` (Xing said no).
+// A task's status is its last event; after MAX_TASK_FAILS fails it is given up.
+
+pub const MAX_TASK_FAILS: usize = 3;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Task {
+    pub id: String,
+    pub repo: String,
+    pub file: String,
+    pub instruction: String,
+}
+
+/// Parse the queue. Ids: 1-24 letters, digits, - or _. Files: relative, no `..`, ending in .rs.
+pub fn parse_tasks(text: &str) -> Result<Vec<Task>, String> {
+    let mut out: Vec<Task> = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let f: Vec<&str> = line.splitn(4, '|').map(str::trim).collect();
+        if f.len() != 4 || f.iter().any(|s| s.is_empty()) {
+            return Err(format!("line {}: expected id|repo|file|instruction", i + 1));
+        }
+        let id_ok = f[0].len() <= 24 && f[0].chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        let file = f[2].replace('/', "\\");
+        let file_ok = file.ends_with(".rs") && !file.contains(':') && !file.starts_with('\\') && !file.split('\\').any(|s| s == "..");
+        if !id_ok {
+            return Err(format!("line {}: id must be 1-24 letters, digits, - or _", i + 1));
+        }
+        if !file_ok {
+            return Err(format!("line {}: file must be a relative .rs path inside the repo", i + 1));
+        }
+        if out.iter().any(|t| t.id == f[0]) {
+            return Err(format!("line {}: id {} listed twice", i + 1, f[0]));
+        }
+        out.push(Task { id: f[0].into(), repo: f[1].into(), file, instruction: f[3].into() });
+    }
+    Ok(out)
+}
+
+/// (last event, number of fails) for one task id in the state log.
+pub fn task_status<'a>(log: &'a str, id: &str) -> (Option<&'a str>, usize) {
+    let mut last = None;
+    let mut fails = 0;
+    for l in log.lines() {
+        if let Some((tid, ev)) = l.trim().split_once('|') {
+            if tid == id {
+                let ev = ev.trim();
+                if ev == "fail" {
+                    fails += 1;
+                }
+                last = Some(ev);
+            }
+        }
+    }
+    (last, fails)
+}
+
+/// First task for `repo` that is still open: never tried, or only failed fewer than MAX_TASK_FAILS times.
+pub fn next_task<'a>(tasks: &'a [Task], log: &str, repo: &str) -> Option<&'a Task> {
+    tasks.iter().filter(|t| t.repo == repo).find(|t| {
+        let (last, fails) = task_status(log, &t.id);
+        matches!(last, None | Some("fail")) && fails < MAX_TASK_FAILS
+    })
+}
+
+/// The request for one queued task.
+pub fn task_prompt(instruction: &str, rel_path: &str, src: &str, repo: &str) -> String {
+    format!(
+        "Task in Xing's {repo} repo: {instruction}\n\n\
+         File {rel_path}:\n```rust\n{src}```\n\n\
+         Make the smallest change that does the task, and add or update one #[test] that proves it. \
+         Keep every existing test. Do not add #[allow(..)], #[ignore], unsafe, todo!() or new process spawning. \
+         Reply with the COMPLETE new contents of {rel_path} in one ```rust code block, then one line explaining the change."
+    )
+}
+
+/// Pre-checks for a task reply: the file must change, keep every existing test, and not shrink to a stub.
+pub fn task_precheck(old: &str, new: &str) -> Result<(), String> {
+    if old.trim() == new.trim() {
+        return Err("model returned the file unchanged".into());
+    }
+    if new.len() * 2 < old.len() {
+        return Err(format!("model shrank the file from {} to {} bytes", old.len(), new.len()));
+    }
+    if new.matches("#[test]").count() < old.matches("#[test]").count() {
+        return Err("model removed a test".into());
+    }
+    Ok(())
+}
+
+/// Six-digit patch id the phone types for /approve and /reject.
+pub fn patch_id(secs: u64, nanos: u32) -> String {
+    format!("{:06}", (secs.wrapping_mul(1000) + u64::from(nanos / 1_000_000)) % 1_000_000)
+}
+
+/// Header lines put in front of a patch so the bot knows where it goes. `git apply`
+/// skips anything before the first `diff --git`, so the patch stays applicable.
+pub fn patch_header(repo_path: &str, task: &str, message: &str) -> String {
+    let one = |s: &str| s.replace(['\r', '\n'], " ");
+    format!("# atrium-fix\n# repo: {}\n# task: {}\n# msg: {}\n", one(repo_path), one(task), one(message))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_queue_parses_and_rejects_bad_lines() {
+        let t = parse_tasks("# q\n\nt1|ductei|ductei-agent/src/fix.rs|add a helper\n").unwrap();
+        assert_eq!(t[0].file, r"ductei-agent\src\fix.rs");
+        for bad in ["t1|ductei|x.rs", "t 1|ductei|x.rs|do", "t1|ductei|..\\x.rs|do", "t1|ductei|C:\\x.rs|do", "t1|ductei|x.py|do", "a|r|x.rs|d\na|r|y.rs|d"] {
+            assert!(parse_tasks(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn next_task_skips_pending_done_and_given_up() {
+        let tasks = parse_tasks("a|ductei|x.rs|1\nb|ductei|y.rs|2\nc|brain|z.rs|3\nd|ductei|w.rs|4\n").unwrap();
+        assert_eq!(next_task(&tasks, "", "ductei").unwrap().id, "a");
+        assert_eq!(next_task(&tasks, "a|pending\n", "ductei").unwrap().id, "b");
+        assert_eq!(next_task(&tasks, "a|done\nb|fail\n", "ductei").unwrap().id, "b");
+        assert_eq!(next_task(&tasks, "a|rejected\nb|fail\nb|fail\nb|fail\n", "ductei").unwrap().id, "d");
+        assert_eq!(next_task(&tasks, "", "brain").unwrap().id, "c");
+        assert!(next_task(&tasks, "", "nope").is_none());
+    }
+
+    #[test]
+    fn task_precheck_blocks_unchanged_stub_and_lost_tests() {
+        let old = "fn f() {}\n#[test] fn a() {}\n#[test] fn b() {}\n";
+        assert!(task_precheck(old, old).is_err());
+        assert!(task_precheck(old, "fn f() {}").is_err());
+        assert!(task_precheck(old, &old.replace("#[test] fn b() {}\n", "fn g() {} fn h() {} fn i() {}\n")).is_err());
+        assert!(task_precheck(old, &format!("{old}fn g() {{}}\n#[test] fn c() {{}}\n")).is_ok());
+    }
+
+    #[test]
+    fn patch_ids_and_headers() {
+        assert_eq!(patch_id(1_234_567, 890_000_000).len(), 6);
+        let h = patch_header("D:\\ATRIUM\\DUCTEI", "t1", "Add a\nhelper");
+        assert!(h.starts_with("# atrium-fix\n") && h.contains("# msg: Add a helper\n"));
+    }
 
     const OUT: &str = "running 3 tests\n\
 test a::tests::ok ... ok\n\
