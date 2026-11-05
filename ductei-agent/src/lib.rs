@@ -12,6 +12,7 @@
 //!   new slice. Events are injected as synthetic tool results named
 //!   `receive_event__injected`, so the model never mistakes them for the user.
 
+pub mod fix;
 pub mod ollama;
 pub mod preset;
 pub mod sweep;
