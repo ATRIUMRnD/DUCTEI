@@ -67,6 +67,9 @@ fn d_bcast() -> String { "255.255.255.255".into() }
 /// The whole verb list. Anything else is refused before it runs.
 pub const USAGE: &str = "atrium fleet <config> status
 atrium fleet <config> alarms
+atrium fleet <config> rooms
+atrium fleet <config> log
+atrium fleet <config> ping
 atrium fleet <config> wake <machine>
 atrium fleet <config> up
 atrium fleet <config> down --yes
@@ -173,6 +176,9 @@ impl Fleet {
                 Some(m) => { let (c, t) = remote(m, "alarms"); (c == 0, if t.is_empty() { "no alarms".into() } else { t }) }
                 None => (false, "no mini configured".into()),
             },
+            ["rooms"] => (true, self.rooms()),
+            ["log"] => (true, self.recent_actions(10)),
+            ["ping"] => (true, format!("pong. bot alive on xing-pc, unix {}", now_unix())),
             ["wake", name] => match self.machine(name) {
                 Ok(m) => match &m.mac {
                     Some(mac) => match wol(mac, &m.broadcast) { Ok(()) => (true, format!("magic packet sent to {} ({mac}); check status in ~20 s", m.name)), Err(e) => (false, e) },
@@ -184,17 +190,36 @@ impl Fleet {
             ["down"] if yes => { let (c, t) = run(&[std::env::current_exe().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "atrium".into()), "down".into(), self.cfg_path()], Duration::from_secs(60)); (c == 0, t) }
             ["restart", room] if yes => self.restart_room(room),
             ["restart-anchor", name] if yes => match self.machine(name) { Ok(m) => { let (c, t) = remote(m, "restart-anchor"); (c == 0, t) } Err(e) => (false, e) },
-            ["down"] | ["restart", _] | ["restart-anchor", _] => (false, "refused: add --yes to confirm".into()),
+            ["down"] | ["restart", _] | ["restart-anchor", _] => (false, "refused: add yes to confirm".into()),
             _ => (false, format!("not an allowed fleet verb.\n{USAGE}")),
         };
-        if !matches!(a.as_slice(), ["status"] | ["alarms"]) || !ok { self.record(&a.join(" "), ok, &text); }
+        if !matches!(a.as_slice(), ["status"] | ["alarms"] | ["rooms"] | ["log"] | ["ping"]) || !ok { self.record(&a.join(" "), ok, &text); }
         (ok, text)
     }
 
     fn cfg_path(&self) -> String { std::env::var("ATRIUM_CONFIG").unwrap_or_else(|_| "D:/ATRIUM/ops/atrium.toml".into()) }
 
+    /// Every configured room with its live health, so restart names are never guessed.
+    fn rooms(&self) -> String {
+        let live = Status::load(&self.cfg.state).ok().filter(|s| s.live(Duration::from_secs(10)));
+        let mut out = String::new();
+        for r in &self.cfg.room {
+            let h = live.as_ref().and_then(|s| s.rooms.get(&r.name)).map(|x| if x.health == Health::Up { "up" } else { "DOWN" }).unwrap_or("?");
+            out += &format!("{} {h}  (restart: /restart {} yes)\n", r.name, r.name);
+        }
+        if out.is_empty() { "no rooms configured".into() } else { out.trim_end().to_string() }
+    }
+
+    /// Last `n` lines of the plain actions log (the signed chain stays the record).
+    fn recent_actions(&self, n: usize) -> String {
+        let t = fs::read_to_string(self.dir.join("actions.log")).unwrap_or_default();
+        let lines: Vec<&str> = t.lines().filter(|l| !l.trim().is_empty()).collect();
+        if lines.is_empty() { return "no fleet actions yet".into(); }
+        lines[lines.len().saturating_sub(n)..].join("\n")
+    }
+
     fn restart_room(&self, room: &str) -> (bool, String) {
-        let Some(r) = self.cfg.room.iter().find(|r| r.name == room) else { return (false, format!("unknown room {room:?}")) };
+        let Some(r) = self.cfg.room.iter().find(|r| r.name == room) else { return (false, format!("unknown room {room:?} (send /rooms for the list)")) };
         if r.kind != crate::Kind::Managed {
             return match external_task(r) {
                 Some(task) => {
@@ -222,7 +247,7 @@ impl Fleet {
             Err(e) => out += &format!("xing-pc: atrium status unreadable: {e}\n"),
         }
         for m in self.fc.machine.iter().filter(|m| m.ssh.is_some()) {
-            if !reachable(&m.host) { out += &format!("{}: OFFLINE (asleep or off){}\n", m.name, if m.mac.is_some() { "; try wake" } else { "" }); continue; }
+            if !reachable(&m.host) { out += &format!("{}: OFFLINE (asleep or off){}\n", m.name, if m.mac.is_some() { format!("; tap /wake_{}", m.name) } else { String::new() }); continue; }
             let (c, t) = remote(m, "status");
             out += &format!("{}: {}\n", m.name, if c == 0 { t.replace('\n', " | ") } else { format!("reachable, status failed: {}", t.lines().next().unwrap_or("")) });
         }
@@ -242,8 +267,9 @@ pub fn external_task(r: &crate::Room) -> Option<String> {
 
 /// Telegram's sendMessage limit is 4096 UTF-16 code units. Chunks are kept a
 /// little under it, counted in chars (a char is at most 2 UTF-16 units, and
-/// every char in our ops text is in the BMP; the margin covers the rest).
-pub const TG_CHUNK_CHARS: usize = 3800;
+/// every char in our ops text is in the BMP; the margin covers the rest, and
+/// the HTML escaping added after the split).
+pub const TG_CHUNK_CHARS: usize = 3500;
 
 /// Split `text` into pieces of at most `max` chars, never truncating. Cuts on
 /// the last newline in the window, else the last sentence end (". ", "! ",
@@ -271,6 +297,41 @@ pub fn split_message(text: &str, max: usize) -> Vec<String> {
     out
 }
 
+/// Escape text for Telegram's HTML parse mode (only &, < and > matter).
+pub fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Escaped plain text -> Telegram HTML with tappable links. Markdown links
+/// `[text](https://...)` become `<a>` tags; bare URLs and /commands are left
+/// as text, which Telegram already makes tappable. Only http(s) targets, and
+/// a label may not hold brackets, so a stray `[` never swallows a later link.
+pub fn linkify(escaped: &str) -> String {
+    let mut out = String::with_capacity(escaped.len());
+    let mut rest = escaped;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        let parsed = after.find("](").and_then(|mid| {
+            let label = &after[..mid];
+            let tail = &after[mid + 2..];
+            let close = tail.find(')')?;
+            let url = &tail[..close];
+            let ok = (url.starts_with("https://") || url.starts_with("http://")) && !url.contains(char::is_whitespace)
+                && !label.is_empty() && !label.contains(['\n', '[', ']']);
+            ok.then(|| (label, url, open + 1 + mid + 2 + close + 1))
+        });
+        match parsed {
+            Some((label, url, used)) => {
+                out += &rest[..open];
+                out += &format!("<a href=\"{}\">{label}</a>", url.replace('"', "&quot;"));
+                rest = &rest[used..];
+            }
+            None => { out += &rest[..open + 1]; rest = &rest[open + 1..]; }
+        }
+    }
+    out + rest
+}
+
 fn tg_env(p: &std::path::Path) -> Result<(String, i64), String> {
     let t = fs::read_to_string(p).map_err(|e| format!("{}: {e}", p.display()))?;
     let get = |k: &str| t.lines().find_map(|l| l.strip_prefix(&format!("{k}=")).map(|v| v.trim().to_string()));
@@ -284,30 +345,52 @@ fn tg_call(tok: &str, method: &str, fields: &[(&str, String)], timeout_s: u64) -
     use std::io::Write;
     let mut cfg = format!("url = \"https://api.telegram.org/bot{tok}/{method}\"\nsilent\nmax-time = {timeout_s}\n");
     for (k, v) in fields { cfg += &format!("data-urlencode = \"{k}={}\"\n", v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")); }
-    let mut c = Command::new("curl").args(["-K", "-"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn().map_err(|e| format!("curl: {e}"))?;
-    if let Some(mut si) = c.stdin.take() { si.write_all(cfg.as_bytes()).map_err(|e| e.to_string())?; }
-    let out = c.wait_with_output().map_err(|e| e.to_string())?;
+    let mut cmd = Command::new("curl");
+    cmd.args(["-K", "-"]).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(windows)]
+    { use std::os::windows::process::CommandExt; cmd.creation_flags(0x0800_0000); } // no console window
+    let mut child = cmd.spawn().map_err(|e| format!("curl: {e}"))?;
+    if let Some(mut si) = child.stdin.take() { si.write_all(cfg.as_bytes()).map_err(|e| e.to_string())?; }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
     serde_json::from_slice(&out.stdout).map_err(|e| format!("telegram reply: {e}"))
 }
 
-/// Send `text` as one or more messages (split, never cut). Multi-part
-/// messages get a "(i/n)" suffix so the phone shows they belong together.
-fn tg_send(tok: &str, chat: i64, text: &str) {
-    let parts = split_message(text, TG_CHUNK_CHARS);
+/// Send `text` as one or more HTML messages (split, never cut). Plain text is
+/// escaped and linkified per piece; `raw_html` is sent as written (short
+/// fixed menus only). If Telegram rejects the HTML, the piece is resent as
+/// plain text, so nothing is ever lost. Multi-part messages get "(i/n)".
+fn tg_send_opt(tok: &str, chat: i64, text: &str, raw_html: bool) {
+    let parts = if raw_html { vec![text.to_string()] } else { split_message(text, TG_CHUNK_CHARS) };
     let n = parts.len();
     for (i, p) in parts.into_iter().enumerate() {
-        let body = if n > 1 { format!("{p}\n({}/{n})", i + 1) } else { p };
-        if let Err(e) = tg_call(tok, "sendMessage", &[("chat_id", chat.to_string()), ("text", body)], 15) { eprintln!("fleet bot: sendMessage part {}/{n}: {e}", i + 1); }
+        let plain = if n > 1 { format!("{p}\n({}/{n})", i + 1) } else { p.clone() };
+        let html = if raw_html { plain.clone() } else { linkify(&html_escape(&plain)) };
+        let base = |t: String| vec![("chat_id", chat.to_string()), ("text", t), ("link_preview_options", r#"{"is_disabled":true}"#.to_string())];
+        let mut f = base(html);
+        f.push(("parse_mode", "HTML".into()));
+        let sent = tg_call(tok, "sendMessage", &f, 15).map(|v| v["ok"].as_bool().unwrap_or(false));
+        if !matches!(sent, Ok(true)) {
+            if let Err(e) = tg_call(tok, "sendMessage", &base(plain), 15) { eprintln!("fleet bot: sendMessage part {}/{n}: {e}", i + 1); }
+        }
     }
 }
+fn tg_send(tok: &str, chat: i64, text: &str) { tg_send_opt(tok, chat, text, false) }
 
 /// Map a chat message to fleet args. Destructive verbs need a trailing "yes".
+/// One-tap shortcuts: /wake_mini -> wake mini, /restart_anchor_mini -> restart-anchor mini.
 pub fn parse_command(text: &str) -> Option<Vec<String>> {
     let mut w: Vec<String> = text.split_whitespace().map(|s| s.trim_start_matches('/').split('@').next().unwrap_or("").to_lowercase()).collect();
     if w.is_empty() { return None; }
-    if w[0] == "restart_anchor" { w[0] = "restart-anchor".into(); }
+    if let Some(m) = w[0].strip_prefix("restart_anchor_").map(str::to_string) {
+        w.splice(0..1, ["restart-anchor".to_string(), m]);
+    } else if let Some(m) = w[0].strip_prefix("wake_").map(str::to_string) {
+        w.splice(0..1, ["wake".to_string(), m]);
+    } else if w[0] == "restart_anchor" {
+        w[0] = "restart-anchor".into();
+    }
+    if w.iter().skip(1).any(|s| s.is_empty()) { return None; }
     if w.last().map(|s| s == "yes").unwrap_or(false) { w.pop(); w.push("--yes".into()); }
-    match w[0].as_str() { "status" | "alarms" | "wake" | "up" | "down" | "restart" | "restart-anchor" => Some(w), _ => None }
+    match w[0].as_str() { "status" | "alarms" | "rooms" | "log" | "ping" | "wake" | "up" | "down" | "restart" | "restart-anchor" => Some(w), _ => None }
 }
 
 /// New unauthorized hits in xing-pc-mcp's audit chain since the last call.
@@ -359,11 +442,18 @@ pub fn tail_new_full(file: &std::path::Path, cursor_file: &std::path::Path) -> V
 /// Telegram "/" popup, the menu button list, and /help, so they never drift.
 pub const BOT_COMMANDS: &[(&str, &str)] = &[
     ("status", "All machines: rooms, chain seq, peers"),
+    ("rooms", "Every room with health and its restart name"),
     ("alarms", "Tamper alarms from the mini watcher"),
-    ("wake", "Wake a machine: /wake mini or /wake laptop"),
+    ("log", "Last 10 fleet actions"),
+    ("ping", "Is the bot alive"),
+    ("wake_mini", "Wake the Mac mini (one tap)"),
+    ("wake_laptop", "Wake the laptop (one tap)"),
+    ("wake", "Wake a machine by name: /wake mini"),
     ("up", "Start the atrium supervisor"),
     ("down", "Stop atrium: /down yes"),
-    ("restart", "Restart a room: /restart <room> yes"),
+    ("restart", "Restart a room: /restart fleet-bot yes"),
+    ("restart_anchor_mini", "Restart the mini anchor: add yes"),
+    ("restart_anchor_laptop", "Restart the laptop anchor: add yes"),
     ("restart_anchor", "Restart an anchor: /restart_anchor mini yes"),
     ("approve", "Commit an agent patch locally: /approve 123456"),
     ("reject", "Drop an agent patch: /reject 123456"),
@@ -481,9 +571,16 @@ pub fn menu_button(url: Option<&str>) -> String {
     }
 }
 
-fn bot_help() -> String {
-    let mut s = String::from("ATRIUM fleet\n");
-    for (c, d) in BOT_COMMANDS { s += &format!("/{c} - {d}\n"); }
+/// /help as Telegram HTML: every no-argument command is a tappable /link that
+/// runs on tap; commands that take arguments are in <code>, which copies on
+/// tap so it can be pasted and sent.
+pub fn bot_help() -> String {
+    let mut s = String::from("<b>ATRIUM fleet</b>\nTap a command to run it. Tap a grey line to copy it.\n\n");
+    for (c, d) in BOT_COMMANDS { s += &format!("/{c} - {}\n", html_escape(d)); }
+    s += "\n<b>Copy and send</b>\n";
+    for ex in ["/down yes", "/restart fleet-bot yes", "/restart_anchor_mini yes", "/restart_anchor_laptop yes", "/approve 123456", "/reject 123456"] {
+        s += &format!("<code>{}</code>\n", html_escape(ex));
+    }
     s
 }
 
@@ -516,16 +613,15 @@ impl Fleet {
                 let from = u["message"]["chat"]["id"].as_i64().unwrap_or(0);
                 let text = u["message"]["text"].as_str().unwrap_or("").to_string();
                 if from != chat { self.record(&format!("bot: ignored chat {from}"), false, &text); continue; }
-                let reply = if let Some((approve, id)) = parse_fix_command(&text) {
+                if let Some((approve, id)) = parse_fix_command(&text) {
                     let (ok, t) = self.fix_decide(approve, &id);
-                    format!("{} {} {id}\n{t}", if ok { "OK" } else { "FAILED" }, if approve { "approve" } else { "reject" })
+                    tg_send(&tok, chat, &format!("{} {} {id}\n{t}", if ok { "OK" } else { "FAILED" }, if approve { "approve" } else { "reject" }));
                 } else {
                     match parse_command(&text) {
-                        Some(args) => { let (ok, t) = self.exec(&args); format!("{} {}\n{}", if ok { "OK" } else { "FAILED" }, args.join(" "), t) }
-                        None => bot_help(),
+                        Some(args) => { let (ok, t) = self.exec(&args); tg_send(&tok, chat, &format!("{} {}\n{}", if ok { "OK" } else { "FAILED" }, args.join(" "), t)); }
+                        None => tg_send_opt(&tok, chat, &bot_help(), true),
                     }
-                };
-                tg_send(&tok, chat, &reply);
+                }
             }
             // Between polls (~25 s): push new bad-token hits on the public endpoint.
             if let Some(a) = &self.fc.mcp_audit {
@@ -567,6 +663,28 @@ mod tests {
         assert_eq!(parse_command("/restart_anchor@atrium_bot mini yes"), Some(vec!["restart-anchor".into(), "mini".into(), "--yes".into()]));
         assert_eq!(parse_command("rm -rf /"), None);
         assert_eq!(parse_command("/bash ls"), None);
+    }
+
+    #[test]
+    fn one_tap_shortcuts_expand_and_still_need_yes() {
+        assert_eq!(parse_command("/wake_mini"), Some(vec!["wake".into(), "mini".into()]));
+        assert_eq!(parse_command("/wake_laptop@atrium_bot"), Some(vec!["wake".into(), "laptop".into()]));
+        assert_eq!(parse_command("/restart_anchor_mini"), Some(vec!["restart-anchor".into(), "mini".into()]));
+        assert_eq!(parse_command("/restart_anchor_mini yes"), Some(vec!["restart-anchor".into(), "mini".into(), "--yes".into()]));
+        assert_eq!(parse_command("/wake_"), None);
+        for v in ["rooms", "log", "ping"] { assert_eq!(parse_command(&format!("/{v}")), Some(vec![v.to_string()])); }
+    }
+
+    #[test]
+    fn links_become_tappable_and_html_is_escaped() {
+        assert_eq!(html_escape("a<b>&c"), "a&lt;b&gt;&amp;c");
+        assert_eq!(linkify("see [docs](https://x.ts.net/a?b=1&amp;c=2) now"), "see <a href=\"https://x.ts.net/a?b=1&amp;c=2\">docs</a> now");
+        assert_eq!(linkify("[bad](javascript:alert)"), "[bad](javascript:alert)");
+        assert_eq!(linkify("arr[0] and [x](https://a.b)"), "arr[0] and <a href=\"https://a.b\">x</a>");
+        assert_eq!(linkify("plain https://a.b stays"), "plain https://a.b stays");
+        let h = bot_help();
+        assert!(h.contains("/wake_mini") && h.contains("<code>/restart fleet-bot yes</code>"));
+        assert_eq!(h.matches("<code>").count(), h.matches("</code>").count());
     }
 
     #[test]
@@ -622,7 +740,8 @@ mod tests {
     #[test]
     fn bot_menu_lists_every_verb_and_only_valid_names() {
         let names: Vec<&str> = BOT_COMMANDS.iter().map(|(c, _)| *c).collect();
-        for v in ["status", "alarms", "wake", "up", "down", "restart", "restart_anchor", "help"] { assert!(names.contains(&v), "menu missing /{v}"); }
+        for v in ["status", "alarms", "rooms", "log", "ping", "wake", "wake_mini", "up", "down", "restart", "restart_anchor", "help"] { assert!(names.contains(&v), "menu missing /{v}"); }
+        assert!(BOT_COMMANDS.len() <= 100, "telegram allows at most 100 commands");
         for (c, d) in BOT_COMMANDS {
             assert!(!c.is_empty() && c.len() <= 32 && c.chars().all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_'), "bad telegram command name {c}");
             assert!(!d.is_empty() && d.len() <= 256);
