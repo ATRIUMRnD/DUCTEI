@@ -1,0 +1,44 @@
+# ductei-verify policy. Unknown keys are an error (a typo fails closed).
+# Some floors are hard-coded in policy.rs and cannot be loosened here:
+# C: stays forbidden, git commit/push stay forbidden, check or tests required.
+
+allowed_roots = ['D:\ATRIUM', 'D:\dev', 'D:\player-harness']
+forbidden_prefixes = ['C:\']
+ledger = 'D:\ATRIUM\private\verify\ledger.jsonl'
+
+[limits]
+max_files = 20
+max_file_bytes = 200000
+max_total_bytes = 1000000
+
+[content]
+allow_unsafe = false
+allow_deletions = false        # rewire, don't destroy
+allow_test_removal = false
+# Rejected when newly introduced into a file (secrets, tokens).
+forbid_patterns = ["-----BEGIN", "AKIA", "ghp_", "github_pat_", "sk-ant-", "xoxb-"]
+# Rejected when the count goes up (silencing lints, skipping tests, stubs, process spawning).
+forbid_growth = ["#[allow(", "#[ignore", "todo!(", "unimplemented!(", "std::process::exit", "Command::new"]
+
+[commands]
+# Matched case-insensitively against every command the agent ran or requested.
+forbid = [
+  "git commit", "git push", "git reset --hard", "git clean", "git rebase", "git branch -d",
+  "git tag", "rm -rf", "remove-item", "del /", "format ", "diskpart", "reg delete",
+  "set-executionpolicy", "curl ", "invoke-webrequest", "wget ",
+]
+
+[gates]
+require_check = true
+require_clippy = true
+require_tests = true
+min_tests_passed = 1
+timeout_secs = 900
+jlens_min = 0.5               # a missing score is a reject
+eval_min_delta = 0.01         # a new adapter must beat the old one by this much
+extra = []                    # extra argv lists that must exit 0, e.g. [["python", "scripts/smoke_e2e.py"]]
+
+[breaker]
+max_attempts_per_task = 5
+max_accepts_per_day = 50
+kill_switch = 'D:\ATRIUM\private\verify\STOP'   # if this file exists, everything is rejected
