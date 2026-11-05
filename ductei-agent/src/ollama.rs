@@ -17,6 +17,11 @@
 //! - still empty: an error (reasoning is NEVER used as the answer); the caller then sends
 //!   the deterministic report from raw preset results (`sweep::final_report`)
 //! - older tool results trimmed harder than the newest, so a 7-preset sweep fits.
+//!
+//! Transient-failure hardening (Nov 5 2026): a brain whose model was unloaded mid-request,
+//! whose runner crashed, or whose server did not answer gets one more try after a short
+//! pause before the Chain moves on. LM Studio reloads the model on that retry (complete()
+//! calls lms_ensure_loaded first); Ollama restarts a crashed runner on the next request.
 
 use crate::{Entry, Model, ModelOut};
 use serde_json::{json, Value};
@@ -36,6 +41,8 @@ pub const LAST_RESULT_CHARS: usize = 6000;
 pub const OLDER_RESULT_CHARS: usize = 2500;
 /// Prefix of a reasoning-only fallback report; a Chain moves on to the next brain when it sees it.
 pub const NO_ANSWER_TAG: &str = "[model gave no final answer";
+/// Pause before retrying a brain after a transient failure.
+pub const TRANSIENT_PAUSE_S: u64 = 5;
 
 // Output budget must stay well inside the context window.
 const _: () = assert!(NUM_PREDICT >= 8192 && NUM_PREDICT + 16384 <= NUM_CTX);
@@ -381,11 +388,24 @@ pub fn parse_specs(s: &str) -> Result<Vec<Spec>, String> {
     Ok(out)
 }
 
+/// Errors worth one more try on the same brain: the model was unloaded mid-request, the
+/// runner crashed or the connection dropped, or the server did not answer at all.
+/// Config and reply-shape errors are not transient: retrying them only wastes time.
+pub fn is_transient(e: &str) -> bool {
+    let l = e.to_ascii_lowercase();
+    ["unloaded", "not loaded", "error was encountered while running the model", "read tcp",
+     "connection reset", "connection refused", "no reply from", "eof"]
+        .iter()
+        .any(|k| l.contains(k))
+}
+
 /// Tries each brain in order. Moves on after an error or a reasoning-only answer;
 /// the last brain's labeled fallback is still returned so a failure is never hidden.
+/// A transient error gets one retry on the same brain after `pause_s` seconds first.
 pub struct Chain {
     pub brains: Vec<Box<dyn Model>>,
     pub names: Vec<String>,
+    pub pause_s: u64,
 }
 
 impl Model for Chain {
@@ -393,7 +413,15 @@ impl Model for Chain {
         let n = self.brains.len();
         let mut errs = Vec::new();
         for (i, b) in self.brains.iter_mut().enumerate() {
-            match b.complete(history) {
+            let mut result = b.complete(history);
+            if let Err(e) = &result {
+                if is_transient(e) {
+                    eprintln!("brain {} hit a transient error, retrying once: {e}", self.names[i]);
+                    std::thread::sleep(std::time::Duration::from_secs(self.pause_s));
+                    result = b.complete(history).map_err(|e2| format!("{e} | retry: {e2}"));
+                }
+            }
+            match result {
                 Ok(ModelOut::Text(t)) if t.starts_with(NO_ANSWER_TAG) && i + 1 < n => {
                     errs.push(format!("{}: reasoning only", self.names[i]))
                 }
@@ -423,7 +451,7 @@ pub fn build_chain(specs: &[Spec], charter: &str, presets: &[String], timeout_s:
             }),
         });
     }
-    Chain { brains, names: specs.iter().map(Spec::label).collect() }
+    Chain { brains, names: specs.iter().map(Spec::label).collect(), pause_s: TRANSIENT_PAUSE_S }
 }
 
 // ---------- GPU handoff ----------
@@ -595,20 +623,62 @@ mod tests {
         fn complete(&mut self, _: &[Entry]) -> Result<ModelOut, String> { self.0.clone() }
     }
 
+    /// Fails with each listed error in turn, then answers.
+    struct Flaky { errs: Vec<String>, calls: usize }
+    impl Model for Flaky {
+        fn complete(&mut self, _: &[Entry]) -> Result<ModelOut, String> {
+            self.calls += 1;
+            if self.errs.is_empty() { Ok(ModelOut::Text("report".into())) } else { Err(self.errs.remove(0)) }
+        }
+    }
+
+    fn chain(brains: Vec<Box<dyn Model>>) -> Chain {
+        let names = (0..brains.len()).map(|i| format!("b{i}")).collect();
+        Chain { brains, names, pause_s: 0 }
+    }
+
     #[test]
     fn chain_falls_through_errors_and_reasoning_only() {
-        let mut c = Chain {
-            brains: vec![
-                Box::new(Fixed(Err("down".into()))),
-                Box::new(Fixed(Ok(ModelOut::Text(format!("{NO_ANSWER_TAG}] hmm"))))),
-                Box::new(Fixed(Ok(ModelOut::Text("report".into())))),
-            ],
-            names: vec!["a".into(), "b".into(), "c".into()],
-        };
+        let mut c = chain(vec![
+            Box::new(Fixed(Err("down".into()))),
+            Box::new(Fixed(Ok(ModelOut::Text(format!("{NO_ANSWER_TAG}] hmm"))))),
+            Box::new(Fixed(Ok(ModelOut::Text("report".into())))),
+        ]);
         assert_eq!(c.complete(&[]).unwrap(), ModelOut::Text("report".into()));
-        let mut last = Chain { brains: vec![Box::new(Fixed(Ok(ModelOut::Text(format!("{NO_ANSWER_TAG}] hmm")))))], names: vec!["a".into()] };
+        let mut last = chain(vec![Box::new(Fixed(Ok(ModelOut::Text(format!("{NO_ANSWER_TAG}] hmm")))))]);
         assert!(matches!(last.complete(&[]).unwrap(), ModelOut::Text(t) if t.starts_with(NO_ANSWER_TAG)));
-        let mut none = Chain { brains: vec![Box::new(Fixed(Err("x".into())))], names: vec!["a".into()] };
+        let mut none = chain(vec![Box::new(Fixed(Err("x".into())))]);
         assert!(none.complete(&[]).unwrap_err().contains("all brains failed"));
+    }
+
+    #[test]
+    fn transient_errors_are_recognised() {
+        assert!(is_transient("openai-compat: \"Model unloaded by user or API request.\""));
+        assert!(is_transient("ollama: an error was encountered while running the model: read tcp 127.0.0.1:65453"));
+        assert!(is_transient("no reply from http://127.0.0.1:1234/v1/chat/completions (is the server running?)"));
+        assert!(!is_transient("bad brain line (want kind|base|model[|load key]): x"));
+        assert!(!is_transient("gpt-oss:20b returned an empty answer twice (done_reason: stop)"));
+    }
+
+    #[test]
+    fn transient_error_gets_one_retry_on_the_same_brain() {
+        // Unloaded once, then answers: the first brain recovers, no fallback needed.
+        let mut c = chain(vec![
+            Box::new(Flaky { errs: vec!["openai-compat: Model unloaded by user or API request.".into()], calls: 0 }),
+            Box::new(Fixed(Err("should not be reached".into()))),
+        ]);
+        assert_eq!(c.complete(&[]).unwrap(), ModelOut::Text("report".into()));
+
+        // Transient twice: exactly one retry, then the chain moves on and both errors are kept.
+        let mut c = chain(vec![
+            Box::new(Flaky { errs: vec!["read tcp reset".into(), "read tcp reset again".into()], calls: 0 }),
+            Box::new(Fixed(Ok(ModelOut::Text("second brain".into())))),
+        ]);
+        assert_eq!(c.complete(&[]).unwrap(), ModelOut::Text("second brain".into()));
+
+        // A non-transient error is not retried.
+        let mut c = chain(vec![Box::new(Flaky { errs: vec!["bad config".into(), "never seen".into()], calls: 0 })]);
+        let e = c.complete(&[]).unwrap_err();
+        assert!(e.contains("bad config") && !e.contains("never seen"), "{e}");
     }
 }
