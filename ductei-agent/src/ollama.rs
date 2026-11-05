@@ -309,7 +309,7 @@ pub fn lms_ensure_loaded(model: &str, load_key: Option<&str>) -> Result<(), Stri
         return Ok(());
     }
     let ctx = NUM_CTX.to_string();
-    lms(&["load", load_key.unwrap_or(model), "--identifier", model, "--context-length", &ctx, "--gpu", "max", "-y"]).map(|_| ())
+    lms(&["load", load_key.unwrap_or(model), "--identifier", model, "--context-length", &ctx, "--gpu", "max", "--parallel", "1", "-y"]).map(|_| ())
 }
 
 impl Model for OpenAiCompat {
