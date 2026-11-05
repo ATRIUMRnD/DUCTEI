@@ -2,7 +2,8 @@
 //!
 //! Repos come from D:\ATRIUM\ops\agent\fix-repos.txt, one per line: `name|D:\path\to\repo`.
 //! The repo's git root must also be its cargo root (Cargo.toml at the top). For each repo:
-//! 1. Scratch worktree at HEAD under D:\ATRIUM\private\fix (real checkout untouched).
+//! 1. Scratch worktree at HEAD under D:\ATRIUM\ops\atrium-state\fix (real checkout untouched;
+//!    not under D:\ATRIUM\private, where Controlled Folder Access blocks cargo and rustc).
 //! 2. cargo test there. All green: take the next open task for this repo from
 //!    D:\ATRIUM\ops\agent\tasks.txt (same gate, same patch flow), else report and move on.
 //! 3. First failing test: find its file, ask the brain chain for a whole replacement file.
@@ -24,8 +25,8 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const REPOS: &str = r"D:\ATRIUM\ops\agent\fix-repos.txt";
-const WT_ROOT: &str = r"D:\ATRIUM\private\fix";
-const TARGET: &str = r"D:\ATRIUM\private\fix\target";
+const WT_ROOT: &str = r"D:\ATRIUM\ops\atrium-state\fix";
+const TARGET: &str = r"D:\ATRIUM\ops\atrium-state\fix\target";
 const VERIFY: &str = r"D:\ATRIUM\DUCTEI\target\release\ductei-verify.exe";
 const POLICY: &str = r"D:\ATRIUM\ops\agent\fix-verify.toml";
 const FIXES: &str = r"D:\ATRIUM\ops\atrium-state\agent\fixes";
