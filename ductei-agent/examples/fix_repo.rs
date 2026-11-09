@@ -4,9 +4,12 @@
 //! The repo's git root must also be its cargo root (Cargo.toml at the top). For each repo:
 //! 1. Scratch worktree at HEAD under D:\ATRIUM\ops\atrium-state\fix (real checkout untouched;
 //!    not under D:\ATRIUM\private, where Controlled Folder Access blocks cargo and rustc).
+//!    The path is the same every run (`fix\<name>`), so cargo's build cache stays warm.
 //! 2. cargo test there. All green: take the next open task for this repo from
 //!    D:\ATRIUM\ops\agent\tasks.txt (same gate, same patch flow), else report and move on.
-//! 3. First failing test: find its file, ask the brain chain for a whole replacement file.
+//! 3. First failing test: rerun it alone. Passing alone = flaky, so it is reported and the
+//!    task queue is used instead. Still failing: find its file, ask the brain chain for a
+//!    whole replacement file.
 //! 4. Gate with ductei-verify check-git (fail closed).
 //! 5. Accepted: write a .patch to atrium-state\agent\fixes and one outbox line for the phone.
 //!    Rejected or any error: one outbox line saying why. The worktree is always removed.
@@ -35,8 +38,11 @@ const BRAINS: &str = r"D:\ATRIUM\ops\agent\brains.txt";
 const STOP: &str = r"D:\ATRIUM\private\verify\STOP";
 const TASKS: &str = r"D:\ATRIUM\ops\agent\tasks.txt";
 const TASK_LOG: &str = r"D:\ATRIUM\ops\atrium-state\agent\tasks-state.txt";
-const TEST_TIMEOUT: Duration = Duration::from_secs(900);
-const MAX_SRC: usize = 60_000;
+/// The first run after a cold cache rebuilds the whole workspace; later runs are incremental.
+const TEST_TIMEOUT: Duration = Duration::from_secs(1800);
+/// The model must send the whole file back inside its output budget (ollama::NUM_PREDICT
+/// tokens), so a file much bigger than this comes back cut off.
+const MAX_SRC: usize = 30_000;
 const MAX_REPOS: usize = 8;
 
 struct Repo {
@@ -78,6 +84,12 @@ fn parse_repos(text: &str) -> Result<Vec<Repo>, String> {
 /// Verifier task id: `<name>-<test stem>`, kept within the verifier's 64-char limit.
 fn task_id(name: &str, test: &str) -> String {
     format!("{name}-{}", stem(test)).chars().take(64).collect()
+}
+
+/// Scratch worktree for a repo. Fixed per repo so cargo's path-keyed fingerprints match
+/// between runs and the shared target dir is reused instead of rebuilt.
+fn worktree_path(name: &str) -> String {
+    format!(r"{WT_ROOT}\{name}")
 }
 
 fn hidden(exe: &str) -> Command {
@@ -142,10 +154,6 @@ fn git(dir: &str, args: &[&str]) -> Result<String, String> {
     if ok { Ok(out) } else { Err(format!("git {}: {}", args.join(" "), out.trim())) }
 }
 
-fn now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
-}
-
 fn now_nanos() -> u128 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
 }
@@ -191,6 +199,13 @@ fn locate(wt: &Path, test: &str) -> Option<PathBuf> {
         .or_else(|| hits.first().cloned())
 }
 
+/// Does `test` pass when it is run alone? Used to tell a flaky test from a real failure.
+fn passes_alone(wt: &str, test: &str) -> bool {
+    let mut c = hidden("cargo");
+    c.current_dir(wt).args(["test", "--workspace", "--color", "never", "--", "--exact", test]);
+    matches!(run(c, TEST_TIMEOUT), Ok((true, out)) if failing_tests(&out).is_empty())
+}
+
 fn propose(repo: &Repo, wt: &str) -> Result<String, String> {
     if !Path::new(wt).join("Cargo.toml").exists() {
         return Err("no Cargo.toml at the repo root, skipped (only Rust repos rooted at git root)".into());
@@ -207,6 +222,12 @@ fn propose(repo: &Repo, wt: &str) -> Result<String, String> {
         let tail: String = out.lines().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
         return Err(format!("tests did not pass but no failing test was named (build error?): {tail}"));
     };
+
+    // A test that passes when rerun alone is flaky (timing under load), not a bug the model can
+    // fix. Say so and carry on to the task queue instead of chasing it every hour.
+    if passes_alone(wt, &test) {
+        return queued_task(repo, wt).map(|m| format!("flaky: {test} failed in the full run but passed alone. {m}"));
+    }
 
     // 3. ask the brain chain
     let file = locate(Path::new(wt), &test).ok_or_else(|| format!("could not find the file for {test}"))?;
@@ -322,8 +343,18 @@ fn attempt_task(repo: &Repo, wt: &str, task: &Task) -> Result<String, String> {
     write_patch(repo, wt, &task.id, &task.id, &msg, &format!("task {}", task.id))
 }
 
+/// Clear a worktree a crashed run left at the fixed path, so `worktree add` can reuse it.
+fn clear_stale(repo: &Repo, wt: &str) {
+    let _ = git(&repo.path, &["worktree", "remove", "--force", wt]);
+    if Path::new(wt).exists() {
+        let _ = std::fs::remove_dir_all(wt);
+    }
+    let _ = git(&repo.path, &["worktree", "prune"]);
+}
+
 fn one(repo: &Repo) {
-    let wt = format!(r"{WT_ROOT}\{}-{}", repo.name, now());
+    let wt = worktree_path(&repo.name);
+    clear_stale(repo, &wt);
     if let Err(e) = git(&repo.path, &["worktree", "add", "--detach", &wt, "HEAD"]) {
         return say(&repo.name, &format!("worktree: {e}"));
     }
@@ -331,9 +362,14 @@ fn one(repo: &Repo) {
         Ok(m) => say(&repo.name, &m),
         Err(e) => say(&repo.name, &format!("no fix this run: {e}")),
     }
-    // always clean up the scratch worktree
-    if let Err(e) = git(&repo.path, &["worktree", "remove", "--force", &wt]) {
-        eprintln!("cleanup: {e}");
+    // Always clean up the scratch worktree (the build cache in TARGET is kept). A test binary
+    // that just exited or a scanner can still hold a file for a moment: wait and retry once.
+    if git(&repo.path, &["worktree", "remove", "--force", &wt]).is_err() {
+        std::thread::sleep(Duration::from_secs(5));
+        if let Err(e) = git(&repo.path, &["worktree", "remove", "--force", &wt]) {
+            eprintln!("cleanup: {e}");
+            let _ = std::fs::remove_dir_all(&wt);
+        }
     }
     let _ = git(&repo.path, &["worktree", "prune"]);
 }
@@ -393,5 +429,12 @@ mod tests {
         let t = task_id("ductei", &"x".repeat(200));
         assert!(t.len() <= 64 && t.starts_with("ductei-"));
         assert!(t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    #[test]
+    fn worktree_path_is_stable_per_repo() {
+        assert_eq!(worktree_path("ductei"), worktree_path("ductei"));
+        assert_eq!(worktree_path("ductei"), r"D:\ATRIUM\ops\atrium-state\fix\ductei");
+        assert_ne!(worktree_path("ductei"), worktree_path("brain"));
     }
 }

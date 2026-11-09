@@ -22,6 +22,10 @@
 //! whose runner crashed, or whose server did not answer gets one more try after a short
 //! pause before the Chain moves on. LM Studio reloads the model on that retry (complete()
 //! calls lms_ensure_loaded first); Ollama restarts a crashed runner on the next request.
+//!
+//! Plain mode (Nov 9 2026): a brain built with no presets has no tools (the fix agent). Its
+//! system prompt does not mention run_preset or JSON, and its reply is returned whole as text
+//! (never cut to RAW_REPLY_CHARS, never read as a tool call), so a full replacement file survives.
 
 use crate::{Entry, Model, ModelOut};
 use serde_json::{json, Value};
@@ -50,6 +54,10 @@ const _: () = assert!(NUM_PREDICT >= 8192 && NUM_PREDICT + 16384 <= NUM_CTX);
 const FINAL_NUDGE: &str = "Your last reply was empty. Give your final answer now as exactly one JSON object: \
      {\"say\": \"<short report for Xing>\"} or {\"tool\": \"run_preset\", \"args\": {...}}. No other text.";
 
+/// Nudge for a brain that was given no tools (plain mode): the answer is plain text, not JSON.
+const PLAIN_NUDGE: &str =
+    "Your last reply was empty. Give your final answer now, in exactly the format the request asked for. No other text.";
+
 // ---------- shared prompt building ----------
 
 /// Keep the last `n` chars of `s` (char-safe).
@@ -63,6 +71,14 @@ fn tail(s: &str, n: usize) -> String {
 }
 
 pub fn system_prompt(charter: &str, presets: &[String]) -> String {
+    // No presets = no tools (plain mode). Describing run_preset and a JSON reply here made the
+    // model ask for a tool or wrap its answer instead of returning the file it was asked for.
+    if presets.is_empty() {
+        return format!(
+            "{charter}\n\nYou have no tools here. Answer the request directly in plain text, in exactly the format it \
+             asks for (no JSON wrapper). Keep reasoning brief."
+        );
+    }
     format!(
         "{}\n\nYou act only through one tool: run_preset with args {{\"name\": <preset>, \"cwd\": <folder>}}. \
          cwd must be D:\\ATRIUM or a folder inside it (fleet presets: D:\\ATRIUM; cargo presets: D:\\ATRIUM\\DUCTEI). \
@@ -141,13 +157,22 @@ fn split_think(raw: &str) -> (String, String) {
     }
 }
 
-/// Ollama /api/chat reply.
+/// Ollama /api/chat reply, agent mode (JSON say/tool).
+#[cfg(test)]
 fn read_ollama(v: &Value) -> Result<Reply, String> {
+    read_ollama_as(v, false)
+}
+
+/// Ollama /api/chat reply. `plain`: no tools were offered, so the content is the answer as
+/// written (kept whole, never read as a tool call).
+fn read_ollama_as(v: &Value, plain: bool) -> Result<Reply, String> {
     if let Some(e) = v.get("error").and_then(|e| e.as_str()) {
         return Err(format!("ollama: {e}"));
     }
-    if let Some(tc) = first_tool_call(&v["message"]["tool_calls"]) {
-        return Ok(Reply::Out(tc));
+    if !plain {
+        if let Some(tc) = first_tool_call(&v["message"]["tool_calls"]) {
+            return Ok(Reply::Out(tc));
+        }
     }
     let (inline, content) = split_think(v["message"]["content"].as_str().unwrap_or(""));
     if content.is_empty() {
@@ -158,11 +183,17 @@ fn read_ollama(v: &Value) -> Result<Reply, String> {
             prompt_tokens: v["prompt_eval_count"].as_u64().unwrap_or(0),
         });
     }
-    Ok(Reply::Out(parse_reply(&content)))
+    Ok(Reply::Out(if plain { ModelOut::Text(content) } else { parse_reply(&content) }))
 }
 
-/// OpenAI-compatible /v1/chat/completions reply (LM Studio, llama.cpp, vLLM).
+/// OpenAI-compatible reply, agent mode (JSON say/tool).
+#[cfg(test)]
 fn read_openai(v: &Value) -> Result<Reply, String> {
+    read_openai_as(v, false)
+}
+
+/// OpenAI-compatible /v1/chat/completions reply (LM Studio, llama.cpp, vLLM). `plain` as in read_ollama_as.
+fn read_openai_as(v: &Value, plain: bool) -> Result<Reply, String> {
     if let Some(e) = v.get("error") {
         let m = e.get("message").and_then(|m| m.as_str()).map(str::to_string).unwrap_or_else(|| e.to_string());
         return Err(format!("openai-compat: {m}"));
@@ -172,8 +203,10 @@ fn read_openai(v: &Value) -> Result<Reply, String> {
         return Err("openai-compat reply has no choices".into());
     }
     let msg = &c["message"];
-    if let Some(tc) = first_tool_call(&msg["tool_calls"]) {
-        return Ok(Reply::Out(tc));
+    if !plain {
+        if let Some(tc) = first_tool_call(&msg["tool_calls"]) {
+            return Ok(Reply::Out(tc));
+        }
     }
     let (inline, content) = split_think(msg["content"].as_str().unwrap_or(""));
     if content.is_empty() {
@@ -185,7 +218,7 @@ fn read_openai(v: &Value) -> Result<Reply, String> {
             prompt_tokens: v["usage"]["prompt_tokens"].as_u64().unwrap_or(0),
         });
     }
-    Ok(Reply::Out(parse_reply(&content)))
+    Ok(Reply::Out(if plain { ModelOut::Text(content) } else { parse_reply(&content) }))
 }
 
 /// After the retry also came back empty: always an error. Reasoning is never the answer;
@@ -200,17 +233,29 @@ fn after_empty_retry(model: &str, thinking: &str, done_reason: &str, prompt_toke
     Err(format!("{model} returned an empty answer twice (done_reason: {done_reason}{ctx_note}{think_note})"))
 }
 
-/// One attempt, then one nudged retry, then an error.
+/// One attempt, then one nudged retry, then an error (agent mode nudge).
+#[cfg(test)]
 fn complete_with_retry(
     model: &str,
     ctx: u64,
+    msgs: Vec<Value>,
+    call: &mut dyn FnMut(&[Value]) -> Result<Reply, String>,
+) -> Result<ModelOut, String> {
+    complete_with_nudge(model, ctx, msgs, FINAL_NUDGE, call)
+}
+
+/// One attempt, then one retry with `nudge`, then an error.
+fn complete_with_nudge(
+    model: &str,
+    ctx: u64,
     mut msgs: Vec<Value>,
+    nudge: &str,
     call: &mut dyn FnMut(&[Value]) -> Result<Reply, String>,
 ) -> Result<ModelOut, String> {
     if let Reply::Out(o) = call(&msgs)? {
         return Ok(o);
     }
-    msgs.push(json!({"role": "user", "content": FINAL_NUDGE}));
+    msgs.push(json!({"role": "user", "content": nudge}));
     match call(&msgs)? {
         Reply::Out(o) => Ok(o),
         Reply::Empty { thinking, done_reason, prompt_tokens } => after_empty_retry(model, &thinking, &done_reason, prompt_tokens, ctx),
@@ -249,6 +294,7 @@ pub struct Ollama {
     pub model: String,
     pub charter: String,
     /// Preset names the agent may ask for (shown to the model; enforced by the dispatcher).
+    /// Empty = plain mode: no tools, the reply is plain text.
     pub presets: Vec<String>,
     pub timeout_s: u64,
 }
@@ -258,14 +304,16 @@ impl Model for Ollama {
         let url = format!("{}/api/chat", self.base.trim_end_matches('/'));
         let (model, t) = (self.model.clone(), self.timeout_s);
         let msgs = build_messages(&self.charter, &self.presets, history);
-        complete_with_retry(&self.model, NUM_CTX, msgs, &mut |ms| {
+        let plain = self.presets.is_empty();
+        let nudge = if plain { PLAIN_NUDGE } else { FINAL_NUDGE };
+        complete_with_nudge(&self.model, NUM_CTX, msgs, nudge, &mut |ms| {
             let body = json!({
                 "model": model, "messages": ms, "stream": false,
                 // No "format":"json": with gpt-oss it can yield an empty answer.
                 "think": "low",
                 "options": {"temperature": 0.2, "num_ctx": NUM_CTX, "num_predict": NUM_PREDICT}
             });
-            read_ollama(&post(&url, &body.to_string(), t)?)
+            read_ollama_as(&post(&url, &body.to_string(), t)?, plain)
         })
     }
 }
@@ -282,6 +330,7 @@ pub struct OpenAiCompat {
     /// Manage LM Studio through `lms` (server start, load with NUM_CTX).
     pub manage_lms: bool,
     pub charter: String,
+    /// Empty = plain mode, as for Ollama.
     pub presets: Vec<String>,
     pub timeout_s: u64,
 }
@@ -321,9 +370,11 @@ impl Model for OpenAiCompat {
         let (model, t) = (self.model.clone(), self.timeout_s);
         let msgs = build_messages(&self.charter, &self.presets, history);
         let ctx = if self.manage_lms { NUM_CTX } else { 0 };
-        complete_with_retry(&self.model, ctx, msgs, &mut |ms| {
+        let plain = self.presets.is_empty();
+        let nudge = if plain { PLAIN_NUDGE } else { FINAL_NUDGE };
+        complete_with_nudge(&self.model, ctx, msgs, nudge, &mut |ms| {
             let body = json!({"model": model, "messages": ms, "stream": false, "temperature": 0.2, "max_tokens": NUM_PREDICT, "reasoning_effort": "low"});
-            read_openai(&post(&url, &body.to_string(), t)?)
+            read_openai_as(&post(&url, &body.to_string(), t)?, plain)
         })
     }
 }
@@ -522,6 +573,24 @@ mod tests {
     }
 
     #[test]
+    fn no_tools_means_plain_prompt_and_whole_plain_reply() {
+        let p = system_prompt("charter", &[]);
+        assert!(!p.contains("run_preset") && p.contains("no tools"), "{p}");
+        assert!(system_prompt("charter", &["git_status".to_string()]).contains("run_preset"));
+        // A whole replacement file is far over RAW_REPLY_CHARS and must not be cut.
+        let file = format!("```rust\nfn a() {{ {} }}\n```", "x();".repeat(4000));
+        let v = json!({"message": {"content": file.as_str()}});
+        assert_eq!(read_ollama_as(&v, true).unwrap(), Reply::Out(ModelOut::Text(file.clone())));
+        let v = json!({"choices": [{"message": {"content": file.as_str()}}]});
+        assert_eq!(read_openai_as(&v, true).unwrap(), Reply::Out(ModelOut::Text(file)));
+        // With no tools offered, a tool-shaped reply is only text, never an action.
+        let v = json!({"choices": [{"message": {"content": r#"{"tool":"run_preset","args":{"name":"fleet_up"}}"#}}]});
+        assert!(matches!(read_openai_as(&v, true).unwrap(), Reply::Out(ModelOut::Text(_))));
+        let v = json!({"message": {"content": "", "tool_calls": [{"function": {"name": "run_preset", "arguments": {}}}]}});
+        assert!(matches!(read_ollama_as(&v, true).unwrap(), Reply::Empty { .. }));
+    }
+
+    #[test]
     fn ollama_empty_content_with_thinking_is_detected() {
         let v = json!({"message": {"content": "", "thinking": "I should report alarms"}, "done_reason": "stop", "prompt_eval_count": 9000});
         assert_eq!(read_ollama(&v).unwrap(), Reply::Empty { thinking: "I should report alarms".into(), done_reason: "stop".into(), prompt_tokens: 9000 });
@@ -592,7 +661,7 @@ mod tests {
             Entry::ToolCall { call_id: "b".into(), tool: "run_preset".into(), args: json!({}) },
             Entry::ToolResult { call_id: "b".into(), tool: "run_preset".into(), output: big },
         ];
-        let m = build_messages("", &[], &h);
+        let m = build_messages("", &["git_status".to_string()], &h);
         let older = m[2]["content"].as_str().unwrap().len();
         let newest = m[4]["content"].as_str().unwrap().len();
         assert!(older < 2700 && newest > 6000 && newest < 6200, "older {older}, newest {newest}");
