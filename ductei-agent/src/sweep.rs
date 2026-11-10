@@ -88,6 +88,11 @@ fn summarize(name: &str, out: &str) -> String {
         if l.is_empty() || l.iter().all(|x| x.to_lowercase().contains("no alarms")) {
             return "none".into();
         }
+        // The witness could not be asked (asleep or off). That is "not checked":
+        // not an alarm, and not "none" either.
+        if l.iter().all(|x| x.trim_start().starts_with("UNREACHABLE")) {
+            return format!("not checked: {}", clip(l[0].trim_start().trim_start_matches("UNREACHABLE").trim(), 160));
+        }
         let mut s = format!("ALARM ({} lines)", l.len());
         for x in l.iter().take(ALARM_LINES) {
             s.push_str("\n  ");
@@ -242,6 +247,17 @@ mod tests {
         assert!(t.contains("limen_gpu_tier0: tier0 ok: 24 qubits"), "{t}");
         assert_eq!(fallback_report(&[r("fleet_alarms", "no alarms"), r("git_status", "## timeline\n")]), "fleet_alarms: none\ngit_status: clean");
         assert_eq!(fallback_report(&[]), "no preset results");
+    }
+
+    #[test]
+    fn an_unreachable_witness_is_not_an_alarm_and_not_all_clear() {
+        let out = "[fleet_alarms in D:\\dev exit Some(1)]\nUNREACHABLE mini: asleep or off, alarms not checked (this is not a tamper alarm)\n";
+        let t = fallback_report(&[r("fleet_alarms", out)]);
+        assert!(t.starts_with("fleet_alarms: not checked: mini: asleep or off"), "{t}");
+        assert!(!t.contains("ALARM") && !t.contains("none"), "{t}");
+        // A real alarm next to it still reads as an alarm.
+        let t = fallback_report(&[r("fleet_alarms", "UNREACHABLE mini: asleep\nI3 tamper on ward\n")]);
+        assert!(t.starts_with("fleet_alarms: ALARM (2 lines)"), "{t}");
     }
 
     #[test]
