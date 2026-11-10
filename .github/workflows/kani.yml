@@ -1,0 +1,40 @@
+name: kani
+on: [push, pull_request]
+permissions:
+  contents: read
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  # Model-check the hard invariants in ductei-core/src/proofs.rs for every
+  # input within the harness bounds. The `test` job in ci.yml runs the same
+  # harness bodies as 20,000 random samples; this job is the real proof
+  # (ATRIUM INVARIANTS.md, N1 and N2). Kani is Linux/macOS only, so it runs
+  # here and not on the Windows machines.
+  #
+  # Not a required check until it has gone green once: the harnesses have
+  # not been run under Kani in CI before.
+  prove:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      # Cargo resolves the whole workspace, and ductei-sync pins private
+      # xingxerx/QFLTL (and transitively universal-clock).
+      - name: allow cargo to fetch private QFLTL deps
+        env:
+          QFLTL_READ_TOKEN: ${{ secrets.QFLTL_READ_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/QFLTL".insteadOf https://github.com/xingxerx/QFLTL
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/universal-clock".insteadOf https://github.com/xingxerx/universal-clock
+      - name: install Kani
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+      - name: prove ductei-core invariants
+        run: cargo kani -p ductei-core --features net

@@ -13,6 +13,14 @@ pub const QSW_MAX_SCOPES: u32 = 16;
 pub const QSW_MAX_SCOPE_LEN: u32 = 256;
 /// DUCTEI scope a LIMEN cert summary is relayed under
 pub const CERT_SCOPE: &str = "qallow.semantic.cert";
+/// room is working
+pub const HEALTH_OK: u8 = 0;
+/// room is working but something is wrong; reason is required
+pub const HEALTH_DEGRADED: u8 = 1;
+/// room is not working, could not be checked, or was silent past HEALTH_SILENCE_MS
+pub const HEALTH_DOWN: u8 = 2;
+/// no report inside this window counts as HEALTH_DOWN
+pub const HEALTH_SILENCE_MS: u32 = 5000;
 
 /// QSW handshake header, v1
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -37,4 +45,18 @@ pub struct CertSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_met: Option<bool>,
     pub lamport: u64,
+}
+
+/// N5 health report, one per room. A check that cannot run reports HEALTH_DOWN, never HEALTH_OK.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Health {
+    /// room name as listed in fleet status
+    pub room: String,
+    /// HEALTH_OK, HEALTH_DEGRADED or HEALTH_DOWN
+    pub state: u8,
+    /// plain-English cause; required unless state is HEALTH_OK
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// unix milliseconds when the check ran
+    pub checked_ms: u64,
 }

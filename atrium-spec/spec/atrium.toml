@@ -54,6 +54,31 @@ type = "string"
 value = "qallow.semantic.cert"
 doc = "DUCTEI scope a LIMEN cert summary is relayed under"
 
+# ---- Health states (ATRIUM INVARIANTS.md, N5: nothing fails silently)
+[[const]]
+name = "HEALTH_OK"
+type = "u8"
+value = "0"
+doc = "room is working"
+
+[[const]]
+name = "HEALTH_DEGRADED"
+type = "u8"
+value = "1"
+doc = "room is working but something is wrong; reason is required"
+
+[[const]]
+name = "HEALTH_DOWN"
+type = "u8"
+value = "2"
+doc = "room is not working, could not be checked, or was silent past HEALTH_SILENCE_MS"
+
+[[const]]
+name = "HEALTH_SILENCE_MS"
+type = "u32"
+value = "5000"
+doc = "no report inside this window counts as HEALTH_DOWN"
+
 # ---- QSW v1 hello header (sync_wire.h qsw_hello_t)
 [[struct]]
 name = "QswHello"
@@ -100,3 +125,27 @@ doc = "absent on pre-#37 certs"
 [[struct.field]]
 name = "lamport"
 type = "u64"
+
+# ---- Health report (N5). Health never carries a tamper verdict: integrity
+# alarms are a separate channel, so "unreachable" and "tampered" cannot be
+# confused.
+[[struct]]
+name = "Health"
+doc = "N5 health report, one per room. A check that cannot run reports HEALTH_DOWN, never HEALTH_OK."
+[[struct.field]]
+name = "room"
+type = "string"
+doc = "room name as listed in fleet status"
+[[struct.field]]
+name = "state"
+type = "u8"
+doc = "HEALTH_OK, HEALTH_DEGRADED or HEALTH_DOWN"
+[[struct.field]]
+name = "reason"
+type = "string"
+optional = true
+doc = "plain-English cause; required unless state is HEALTH_OK"
+[[struct.field]]
+name = "checked_ms"
+type = "u64"
+doc = "unix milliseconds when the check ran"

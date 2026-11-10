@@ -12,6 +12,10 @@ QSW_MAX_KEY_LEN: int = 1024
 QSW_MAX_SCOPES: int = 16
 QSW_MAX_SCOPE_LEN: int = 256
 CERT_SCOPE: str = "qallow.semantic.cert"  # DUCTEI scope a LIMEN cert summary is relayed under
+HEALTH_OK: int = 0  # room is working
+HEALTH_DEGRADED: int = 1  # room is working but something is wrong; reason is required
+HEALTH_DOWN: int = 2  # room is not working, could not be checked, or was silent past HEALTH_SILENCE_MS
+HEALTH_SILENCE_MS: int = 5000  # no report inside this window counts as HEALTH_DOWN
 
 
 @dataclass(frozen=True)
@@ -33,3 +37,12 @@ class CertSummary:
     success_probability: float
     lamport: int
     target_met: Optional[bool] = None
+
+
+@dataclass(frozen=True)
+class Health:
+    """N5 health report, one per room. A check that cannot run reports HEALTH_DOWN, never HEALTH_OK."""
+    room: str
+    state: int
+    checked_ms: int
+    reason: Optional[str] = None

@@ -13,6 +13,10 @@
 #define QSW_MAX_SCOPES (16u)
 #define QSW_MAX_SCOPE_LEN (256u)
 #define CERT_SCOPE "qallow.semantic.cert" /* DUCTEI scope a LIMEN cert summary is relayed under */
+#define HEALTH_OK (0u) /* room is working */
+#define HEALTH_DEGRADED (1u) /* room is working but something is wrong; reason is required */
+#define HEALTH_DOWN (2u) /* room is not working, could not be checked, or was silent past HEALTH_SILENCE_MS */
+#define HEALTH_SILENCE_MS (5000u) /* no report inside this window counts as HEALTH_DOWN */
 
 /* QSW handshake header, v1 */
 typedef struct {
@@ -33,5 +37,14 @@ typedef struct {
     bool has_target_met;
     uint64_t lamport;
 } cert_summary_t;
+
+/* N5 health report, one per room. A check that cannot run reports HEALTH_DOWN, never HEALTH_OK. */
+typedef struct {
+    const char * room; /* room name as listed in fleet status */
+    uint8_t state; /* HEALTH_OK, HEALTH_DEGRADED or HEALTH_DOWN */
+    const char * reason; /* optional: see has_<field>; plain-English cause; required unless state is HEALTH_OK */
+    bool has_reason;
+    uint64_t checked_ms; /* unix milliseconds when the check ran */
+} health_t;
 
 #endif /* ATRIUM_SPEC_H */
