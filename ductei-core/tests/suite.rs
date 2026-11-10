@@ -1053,3 +1053,68 @@ fn transport_connect_is_bounded_when_peer_does_not_answer() {
     let (envs, _) = local.replay(0).unwrap();
     assert_eq!(envs.len(), 1);
 }
+
+// ---- log reader/writer robustness: polling a growing log, half-written lines
+
+#[test]
+fn replay_from_cursor_reads_only_new_lines_and_matches_a_full_scan() {
+    let p = tmp("inc.jsonl");
+    let mut log = LogStore::open(&p).unwrap();
+    let mut cursor = 0;
+    for round in 0..5u64 {
+        for i in 0..3u64 { log.append(&env(&format!("k{round}-{i}"), &["qallow.semantic.cert"], 1, round * 3 + i + 1)).unwrap(); }
+        let (new, next) = log.replay(cursor).unwrap();
+        assert_eq!(new.len(), 3, "round {round}");
+        assert_eq!(new[0].key, format!("k{round}-0"));
+        cursor = next;
+    }
+    assert_eq!(cursor, 15);
+    let (all, n) = LogStore::open(&p).unwrap().replay(0).unwrap();
+    assert_eq!((all.len(), n), (15, 15));
+    assert_eq!(log.replay(15).unwrap().0.len(), 0);
+}
+
+#[test]
+fn half_written_last_line_is_left_for_later_not_skipped() {
+    let p = tmp("torn.jsonl");
+    let mut log = LogStore::open(&p).unwrap();
+    log.append(&env("a", &["qallow.semantic.cert"], 1, 1)).unwrap();
+    let full = serde_json::to_string(&env("b", &["qallow.semantic.cert"], 1, 2)).unwrap();
+    let (head, tail) = full.split_at(full.len() / 2);
+    let mut raw = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+    std::io::Write::write_all(&mut raw, head.as_bytes()).unwrap();
+    let (got, cur) = log.replay(0).unwrap();
+    assert_eq!((got.len(), cur), (1, 1), "the unfinished line must not be counted");
+    std::io::Write::write_all(&mut raw, format!("{tail}\n").as_bytes()).unwrap();
+    let (got, cur) = log.replay(cur).unwrap();
+    assert_eq!((got.len(), cur), (1, 2));
+    assert_eq!(got[0].key, "b");
+}
+
+#[test]
+fn reopening_after_a_crash_mid_append_does_not_glue_the_next_entry() {
+    let (p, r) = (tmp("seal.jsonl"), tmp("seal-rej.jsonl"));
+    let a = serde_json::to_string(&env("a", &["qallow.semantic.cert"], 1, 1)).unwrap();
+    std::fs::write(&p, format!("{a}\n{{\"key\":\"half")).unwrap();
+    let mut ch = Channel::open(ScopePolicy::new().allow("qallow.semantic.cert"), &p, &r).unwrap();
+    ch.send(env("b", &["qallow.semantic.cert"], 1, 2)).unwrap();
+    let (got, _) = ch.replay(0).unwrap();
+    assert_eq!(got.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+}
+
+#[test]
+fn a_replaced_log_is_rescanned_not_resumed_from_a_stale_position() {
+    let p = tmp("swap.jsonl");
+    let mut log = LogStore::open(&p).unwrap();
+    for i in 1..=4u64 { log.append(&env(&format!("old{i}"), &["qallow.semantic.cert"], 1, i)).unwrap(); }
+    assert_eq!(log.replay(0).unwrap().1, 4);
+    let mut text = String::new();
+    for i in 1..=6u64 {
+        text.push_str(&serde_json::to_string(&env(&format!("replacement-entry-{i}"), &["qallow.semantic.cert"], 2, i)).unwrap());
+        text.push('\n');
+    }
+    std::fs::write(&p, text).unwrap();
+    let (got, cur) = log.replay(4).unwrap();
+    assert_eq!(cur, 6);
+    assert_eq!(got.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(), ["replacement-entry-5", "replacement-entry-6"]);
+}

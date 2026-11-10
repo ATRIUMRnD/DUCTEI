@@ -29,5 +29,5 @@ path = "src/bin/atrium-keepalive.rs"
 
 [target.'cfg(windows)'.dependencies]
 # Job Objects: a managed room's whole process tree dies with it (and with atrium).
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
 

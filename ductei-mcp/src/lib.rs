@@ -413,7 +413,7 @@ impl ReceiptLog {
         let hash = body.hash();
         let sig = self.signer.sign(&signing_message(&hash));
         let r = Receipt { body, hash: hash.clone(), scheme: self.signer.scheme.as_str().into(), sig };
-        writeln!(self.file, "{}", serde_json::to_string(&r)?)?;
+        ductei_core::write_line(&mut self.file, &serde_json::to_string(&r)?)?;
         // Count only after the line is written, so the flusher never claims
         // durability for a line that is not in the file yet.
         self.written.fetch_add(1, std::sync::atomic::Ordering::Release);
@@ -1484,8 +1484,12 @@ mod tests {
         assert_eq!(on_disk.gate_pid, std::process::id());
     }
 
+    // The clock alone is not unique: tests run in parallel and the Windows clock ticks coarsely, so two
+    // tests could land in the same directory and read each other's receipts. The counter separates them.
     fn tmp() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("ductei-mcp-{}-{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("ductei-mcp-{}-{}-{n}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
         fs::create_dir_all(&d).unwrap();
         d
     }
@@ -1724,11 +1728,13 @@ mod tests {
     #[test]
     fn fast_lane_fsyncs_by_time() {
         let d = tmp();
-        let dur = Durability { sync_every: 1_000, sync_max_ms: 20, background: false };
+        // Wide margins on purpose: with a 20 ms window a loaded machine could take longer than the
+        // window between open and the first record, and the "not yet synced" check failed by accident.
+        let dur = Durability { sync_every: 1_000, sync_max_ms: 400, background: false };
         let mut log = ReceiptLog::open_with(&d, &SignCfg::default(), dur).unwrap();
         log.record(body(0)).unwrap();
         assert_eq!(log.syncs(), 0);
-        std::thread::sleep(std::time::Duration::from_millis(40));
+        std::thread::sleep(std::time::Duration::from_millis(500));
         log.record(body(1)).unwrap();
         assert_eq!((log.syncs(), log.unsynced()), (1, 0), "second record is past sync_max_ms");
     }

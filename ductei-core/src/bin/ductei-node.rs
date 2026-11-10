@@ -64,7 +64,7 @@ fn witness(dir: &Path, name: &str, msg: &str) {
     println!("{line}");
     let _ = std::io::stdout().flush();
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(dir.join("witness.log")) {
-        let _ = writeln!(f, "{line}");
+        let _ = f.write_all(format!("{line}\n").as_bytes());
     }
 }
 
@@ -133,7 +133,7 @@ fn read_history(p: &Path) -> Vec<u64> {
 fn write_history(p: &Path, v: &[u64]) {
     let body: Vec<String> = v.iter().map(|t| t.to_string()).collect();
     if let Ok(mut f) = std::fs::File::create(p) {
-        let _ = writeln!(f, "{}", body.join("\n"));
+        let _ = f.write_all(format!("{}\n", body.join("\n")).as_bytes());
         let _ = f.sync_all();
     }
 }

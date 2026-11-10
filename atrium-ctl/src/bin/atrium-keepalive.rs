@@ -44,7 +44,7 @@ fn publish(dir: &Path, name: &str, v: &serde_json::Value) -> std::io::Result<()>
 
 fn append(dir: &Path, v: &serde_json::Value) {
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(dir.join("events.jsonl")) {
-        let _ = writeln!(f, "{v}");
+        let _ = f.write_all(format!("{v}\n").as_bytes());
     }
 }
 

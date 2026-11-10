@@ -26,7 +26,7 @@ use ductei_core::Envelope;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 pub type Hash = [u8; 32];
@@ -216,7 +216,7 @@ impl Braid {
         b.hash = digest(&b);
         let line = serde_json::to_string(&b).map_err(|e| BraidError::Io(e.to_string()))?;
         let f = self.files.get_mut(&chain).expect("all three chains opened");
-        writeln!(f, "{line}")?;
+        ductei_core::write_line(f, &line)?;
         f.sync_data()?;
         self.heads.insert(chain, Anchor { chain, height, hash: b.hash });
         Ok(b)

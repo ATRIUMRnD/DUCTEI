@@ -50,7 +50,6 @@ pub mod qfltl_transport;
 use ductei_core::transport::{serve_connection, TcpClient, Transport};
 use ductei_core::{Channel, ChannelError, Envelope, LogStore, ScopePolicy};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -181,7 +180,7 @@ impl StateDir {
             "reason": "peer acked 0 (scope denied or failed to apply); not retried",
             "envelope": env,
         });
-        writeln!(f, "{line}")?;
+        ductei_core::write_line(&mut f, &line.to_string())?;
         f.sync_data()
     }
 }

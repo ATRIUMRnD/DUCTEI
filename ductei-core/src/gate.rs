@@ -9,7 +9,6 @@
 use crate::Envelope;
 use std::collections::HashMap;
 use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::Path;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -56,7 +55,7 @@ impl RejectLog {
             "lamport": env.lamport,
             "node_id": env.node_id.to_vec(),
         });
-        writeln!(self.file, "{line}")?;
+        crate::write_line(&mut self.file, &line.to_string())?;
         self.file.sync_data()
     }
 }

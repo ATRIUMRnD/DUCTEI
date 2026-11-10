@@ -221,12 +221,19 @@ impl Fleet {
         if out.is_empty() { "no rooms configured".into() } else { out.trim_end().to_string() }
     }
 
-    /// The N5 report for the supervisor and every room: OK, DEGRADED or DOWN, with the reason.
+    /// The N5 report for the supervisor and every room: OK, DEGRADED or DOWN,
+    /// with the reason, plus the last supervisor stall the bot measured.
     fn health(&self) -> String {
         let st = Status::load(&self.cfg.state);
-        health_reports(&self.cfg, st.as_ref().map_err(|e| e.as_str()), now_ms()).iter()
+        let mut out = health_reports(&self.cfg, st.as_ref().map_err(|e| e.as_str()), now_ms(), &crate::pid_alive).iter()
             .map(|h| format!("{} {}{}", h.room, state_word(h.state), h.reason.as_ref().map(|r| format!(": {r}")).unwrap_or_default()))
-            .collect::<Vec<_>>().join("\n")
+            .collect::<Vec<_>>().join("\n");
+        let stalls = fs::read_to_string(self.dir.join(STALL_LOG)).unwrap_or_default();
+        let n = stalls.lines().filter(|l| !l.trim().is_empty()).count();
+        if let Some(last) = stalls.lines().rev().find(|l| !l.trim().is_empty()) {
+            out += &format!("\nstalls logged: {n}, last: {last}");
+        }
+        out
     }
 
     /// Last `n` lines of the plain actions log (the signed chain stays the record).
@@ -301,6 +308,11 @@ pub const HEAL_CONFIRM_MS: u64 = 2000;
 /// First wait between two starts of the same room's task; doubles per try.
 pub const HEAL_BACKOFF_MIN_MS: u64 = 30_000;
 pub const HEAL_BACKOFF_MAX_MS: u64 = 600_000;
+/// A supervisor whose status stood still at least this long is logged as a stall.
+/// Its 1 s tick plus the bot's 1 s poll make up to ~2 s normal.
+pub const STALL_LOG_MS: u64 = 3000;
+/// One line per stall, in the fleet folder.
+pub const STALL_LOG: &str = "stalls.log";
 
 fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
 
@@ -309,37 +321,67 @@ fn state_word(state: u8) -> &'static str {
 }
 
 /// One report for the supervisor, then one per configured room. Whatever
-/// cannot be checked is HEALTH_DOWN with a reason, never HEALTH_OK: an
-/// unreadable status, a supervisor silent past HEALTH_SILENCE_MS, a room the
-/// supervisor did not report on.
-pub fn health_reports(cfg: &Config, status: Result<&Status, &str>, now_ms: u64) -> Vec<spec::Health> {
+/// cannot be checked is never HEALTH_OK:
+/// - status unreadable, or the supervisor process is gone: everything DOWN.
+/// - supervisor silent past HEALTH_SILENCE_MS but its process still runs: it
+///   is stalled, not dead. Supervisor DEGRADED; each room keeps its last
+///   state, with OK lowered to DEGRADED ("last checked N s ago").
+/// - a room the supervisor did not report on: DOWN.
+///
+/// `sup_alive(pid)` is only asked when the supervisor has gone quiet.
+pub fn health_reports(cfg: &Config, status: Result<&Status, &str>, now_ms: u64, sup_alive: &dyn Fn(u32) -> bool) -> Vec<spec::Health> {
     let mk = |room: &str, state: u8, reason: Option<String>| spec::Health { room: room.to_string(), state, reason, checked_ms: now_ms };
-    let sup_down = match status {
-        Err(e) => Some(format!("status unreadable: {e}")),
-        Ok(s) if s.supervisor_pid == 0 => Some(STOPPED_ON_PURPOSE.to_string()),
+    // (supervisor state, reason, seconds since the last status if stalled)
+    let (sup_state, sup_reason, stale_s) = match status {
+        Err(e) => (spec::HEALTH_DOWN, Some(format!("status unreadable: {e}")), None),
+        Ok(s) if s.supervisor_pid == 0 => (spec::HEALTH_DOWN, Some(STOPPED_ON_PURPOSE.to_string()), None),
         Ok(s) => {
             // status.json carries whole seconds, so allow the rounding.
             let age_ms = now_ms.saturating_sub(s.unix.saturating_mul(1000));
-            (age_ms > u64::from(spec::HEALTH_SILENCE_MS) + 999).then(|| format!("supervisor silent for {} s", age_ms / 1000))
+            if age_ms <= u64::from(spec::HEALTH_SILENCE_MS) + 999 { (spec::HEALTH_OK, None, None) }
+            else if sup_alive(s.supervisor_pid) { (spec::HEALTH_DEGRADED, Some(format!("supervisor stalled {} s, process alive", age_ms / 1000)), Some(age_ms / 1000)) }
+            else { (spec::HEALTH_DOWN, Some(format!("supervisor silent {} s, process gone", age_ms / 1000)), None) }
         }
     };
-    let mut out = vec![match &sup_down {
-        None => mk(SUPERVISOR_ROOM, spec::HEALTH_OK, None),
-        Some(r) => mk(SUPERVISOR_ROOM, spec::HEALTH_DOWN, Some(r.clone())),
-    }];
+    let mut out = vec![mk(SUPERVISOR_ROOM, sup_state, sup_reason)];
     for r in &cfg.room {
         let seen = status.ok().and_then(|s| s.rooms.get(&r.name));
-        out.push(match (&sup_down, seen) {
-            (Some(_), _) => mk(&r.name, spec::HEALTH_DOWN, Some("not checked: the supervisor is not reporting".into())),
-            (None, None) => mk(&r.name, spec::HEALTH_DOWN, Some("no report from the supervisor".into())),
-            (None, Some(x)) => match x.health {
-                Health::Up => mk(&r.name, spec::HEALTH_OK, None),
-                Health::Blocked => mk(&r.name, spec::HEALTH_DEGRADED, Some(if x.note.is_empty() { "blocked".into() } else { x.note.clone() })),
-                Health::Down => mk(&r.name, spec::HEALTH_DOWN, Some(if x.note.is_empty() { "check failed".into() } else { x.note.clone() })),
-            },
+        out.push(match (sup_state, seen) {
+            (spec::HEALTH_DOWN, _) => mk(&r.name, spec::HEALTH_DOWN, Some("not checked: the supervisor is not reporting".into())),
+            (_, None) => mk(&r.name, spec::HEALTH_DOWN, Some("no report from the supervisor".into())),
+            (_, Some(x)) => {
+                let note = |fallback: &str| if x.note.is_empty() { fallback.to_string() } else { x.note.clone() };
+                match (x.health, stale_s) {
+                    (Health::Up, None) => mk(&r.name, spec::HEALTH_OK, None),
+                    (Health::Up, Some(age)) => mk(&r.name, spec::HEALTH_DEGRADED, Some(format!("last checked {age} s ago (supervisor stalled)"))),
+                    (Health::Blocked, _) => mk(&r.name, spec::HEALTH_DEGRADED, Some(note("blocked"))),
+                    (Health::Down, _) => mk(&r.name, spec::HEALTH_DOWN, Some(note("check failed"))),
+                }
+            }
         });
     }
     out
+}
+
+/// Measures how long the supervisor's status stood still, from the bot's
+/// side, without touching the supervisor. Feed it the status `unix` every
+/// poll; when the value finally moves after standing still for at least
+/// STALL_LOG_MS, it returns how long it stood still (ms, accurate to a poll).
+#[derive(Debug, Default)]
+pub struct StallMeter { last: Option<(u64, u64)> }
+
+impl StallMeter {
+    pub fn observe(&mut self, unix: u64, now_ms: u64) -> Option<u64> {
+        match self.last {
+            Some((u, _)) if u == unix => None,
+            Some((_, since)) => {
+                self.last = Some((unix, now_ms));
+                let gap = now_ms.saturating_sub(since);
+                (gap >= STALL_LOG_MS).then_some(gap)
+            }
+            None => { self.last = Some((unix, now_ms)); None }
+        }
+    }
 }
 
 /// What one healer pass decided: alerts as (recovered, text), and the rooms
@@ -361,7 +403,7 @@ impl Healer {
         let mut out = HealStep::default();
         let sup_down = reports.iter().any(|h| h.room == SUPERVISOR_ROOM && h.state != spec::HEALTH_OK);
         for h in reports {
-            // With the supervisor down the rooms are "not checked": one alert, not one per room.
+            // With the supervisor down or stalled the rooms are "not checked": one alert, not one per room.
             if sup_down && h.room != SUPERVISOR_ROOM { continue; }
             let s = self.seen.entry(h.room.clone()).or_insert(Seen { raw: h.state, raw_since: now_ms, ..Default::default() });
             if s.raw != h.state { s.raw = h.state; s.raw_since = now_ms; }
@@ -731,13 +773,25 @@ impl Fleet {
     /// change to the phone, and start the task of an external room that is
     /// down. Each alert and each restart is a receipt on the fleet chain.
     /// `<fleet dir>/heal.off` keeps the alerts and stops the restarts.
+    /// Every supervisor stall of STALL_LOG_MS or more is appended to
+    /// `<fleet dir>/stalls.log`, so the pattern can be read without touching
+    /// the supervisor.
     fn heal_loop(&self, tok: &str, chat: i64) {
         let mut healer = Healer::default();
+        let mut meter = StallMeter::default();
         loop {
             std::thread::sleep(Duration::from_secs(1));
             let st = Status::load(&self.cfg.state);
             let now = now_ms();
-            let step = healer.step(&self.cfg, &health_reports(&self.cfg, st.as_ref().map_err(|e| e.as_str()), now), now);
+            if let Ok(s) = &st {
+                if let Some(ms) = meter.observe(s.unix, now) {
+                    let line = format!("{} stall {} ms, ended at supervisor tick {} chain seq {}\n", now / 1000, ms, s.tick, s.chain_seq);
+                    let _ = fs::OpenOptions::new().create(true).append(true).open(self.dir.join(STALL_LOG))
+                        .and_then(|mut f| std::io::Write::write_all(&mut f, line.as_bytes()));
+                }
+            }
+            let reports = health_reports(&self.cfg, st.as_ref().map_err(|e| e.as_str()), now, &crate::pid_alive);
+            let step = healer.step(&self.cfg, &reports, now);
             for (recovered, text) in &step.alerts {
                 tg_alert(tok, chat, text, false);
                 self.record("heal: alert", *recovered, text);
@@ -973,6 +1027,9 @@ mod tests {
 
     const THREE_ROOMS: &str = "[[room]]\nname = \"sync\"\nprocess = \"s.exe\"\ntask = \"sync-serve\"\n[[room]]\nname = \"ward\"\nprocess = \"w.exe\"\n[[room]]\nname = \"loop\"\nkind = \"managed\"\nexe = \"l.exe\"\n";
 
+    const ALIVE: &dyn Fn(u32) -> bool = &|_| true;
+    const GONE: &dyn Fn(u32) -> bool = &|_| false;
+
     /// Reports with a healthy supervisor and the given state per room.
     fn rep(sync: u8, ward: u8, lp: u8, t: u64) -> Vec<spec::Health> {
         [(SUPERVISOR_ROOM, spec::HEALTH_OK), ("sync", sync), ("ward", ward), ("loop", lp)].iter()
@@ -987,24 +1044,71 @@ mod tests {
         let mut s = Status { unix: now / 1000, supervisor_pid: 7, ..Default::default() };
         s.rooms.insert("sync".into(), room_status(Health::Up, ""));
         s.rooms.insert("ward".into(), room_status(Health::Blocked, "waiting for sync"));
-        let r = health_reports(&cfg, Ok(&s), now);
+        let r = health_reports(&cfg, Ok(&s), now, GONE);
         let get = |n: &str| r.iter().find(|h| h.room == n).unwrap().clone();
         assert_eq!(r.len(), 4, "supervisor line plus one per configured room");
         assert_eq!((get(SUPERVISOR_ROOM).state, get("sync").state, get("sync").reason), (spec::HEALTH_OK, spec::HEALTH_OK, None));
         assert_eq!((get("ward").state, get("ward").reason.as_deref()), (spec::HEALTH_DEGRADED, Some("waiting for sync")));
         assert_eq!(get("loop").state, spec::HEALTH_DOWN, "no report from the supervisor is down, not ok");
         assert!(r.iter().all(|h| h.state == spec::HEALTH_OK || h.reason.is_some()), "every non-OK report says why");
-        // Inside the silence window the supervisor still counts; past it everything is down.
-        assert_eq!(health_reports(&cfg, Ok(&s), now + 5000)[0].state, spec::HEALTH_OK);
-        let r = health_reports(&cfg, Ok(&s), now + 7000);
+        // Inside the silence window the supervisor still counts, and the process is not even asked.
+        let never: &dyn Fn(u32) -> bool = &|_| panic!("pid asked while the supervisor is reporting");
+        assert_eq!(health_reports(&cfg, Ok(&s), now + 5000, never)[0].state, spec::HEALTH_OK);
+        // Past the window with the process gone: everything is down.
+        let r = health_reports(&cfg, Ok(&s), now + 7000, GONE);
         assert!(r.iter().all(|h| h.state == spec::HEALTH_DOWN && h.reason.is_some()));
-        assert!(r[0].reason.as_deref().unwrap().contains("silent for 7 s"), "{:?}", r[0].reason);
+        assert!(r[0].reason.as_deref().unwrap().contains("silent 7 s, process gone"), "{:?}", r[0].reason);
         // Status file gone or torn.
-        let r = health_reports(&cfg, Err("gone"), now);
+        let r = health_reports(&cfg, Err("gone"), now, ALIVE);
         assert!(r.iter().all(|h| h.state == spec::HEALTH_DOWN && h.reason.is_some()));
         // A clean `atrium down` is named as such.
         s.supervisor_pid = 0;
-        assert_eq!(health_reports(&cfg, Ok(&s), now)[0].reason.as_deref(), Some(STOPPED_ON_PURPOSE));
+        assert_eq!(health_reports(&cfg, Ok(&s), now, ALIVE)[0].reason.as_deref(), Some(STOPPED_ON_PURPOSE));
+    }
+
+    #[test]
+    fn a_stalled_but_running_supervisor_is_degraded_not_down() {
+        let cfg = cfg_with(THREE_ROOMS);
+        let now = 1_000_000_000u64;
+        let mut s = Status { unix: now / 1000, supervisor_pid: 7, ..Default::default() };
+        s.rooms.insert("sync".into(), room_status(Health::Up, ""));
+        s.rooms.insert("ward".into(), room_status(Health::Down, "timeline stale"));
+        let r = health_reports(&cfg, Ok(&s), now + 15_000, ALIVE);
+        let get = |n: &str| r.iter().find(|h| h.room == n).unwrap().clone();
+        assert_eq!((get(SUPERVISOR_ROOM).state, get(SUPERVISOR_ROOM).reason.as_deref()), (spec::HEALTH_DEGRADED, Some("supervisor stalled 15 s, process alive")));
+        // Last known OK is not OK any more: it was checked 15 s ago.
+        assert_eq!((get("sync").state, get("sync").reason.as_deref()), (spec::HEALTH_DEGRADED, Some("last checked 15 s ago (supervisor stalled)")));
+        // Last known DOWN stays DOWN; a missing room stays DOWN.
+        assert_eq!((get("ward").state, get("ward").reason.as_deref()), (spec::HEALTH_DOWN, Some("timeline stale")));
+        assert_eq!(get("loop").state, spec::HEALTH_DOWN);
+        // The healer says it once, as DEGRADED, and starts nothing while it is stalled.
+        let mut h = Healer::default();
+        assert_eq!(h.step(&cfg, &health_reports(&cfg, Ok(&s), now, ALIVE), now), HealStep::default());
+        assert_eq!(h.step(&cfg, &health_reports(&cfg, Ok(&s), now + 8_000, ALIVE), now + 8_000), HealStep::default());
+        let st = h.step(&cfg, &health_reports(&cfg, Ok(&s), now + 10_000, ALIVE), now + 10_000);
+        assert_eq!(st.alerts, vec![(false, "HEALTH atrium DEGRADED: supervisor stalled 10 s, process alive".to_string())]);
+        assert!(st.restarts.is_empty(), "rooms are not acted on while the supervisor is stalled");
+        // It ticks again. The rooms are checked again, so their real DOWN
+        // states (ward, and loop with no report) are now said, but no
+        // supervisor line until the recovery has held 2 s.
+        s.unix = (now + 11_000) / 1000;
+        let st = h.step(&cfg, &health_reports(&cfg, Ok(&s), now + 11_000, ALIVE), now + 11_000);
+        assert!(!st.alerts.iter().any(|(_, t)| t.contains("atrium")), "{st:?}");
+        assert!(st.alerts.iter().any(|(_, t)| t == "HEALTH ward DOWN: timeline stale"), "{st:?}");
+        let st = h.step(&cfg, &health_reports(&cfg, Ok(&s), now + 13_000, ALIVE), now + 13_000);
+        assert_eq!(st.alerts.iter().filter(|(rec, t)| *rec && t.starts_with("RECOVERY atrium")).count(), 1, "{st:?}");
+    }
+
+    #[test]
+    fn stall_meter_logs_only_long_stalls_and_how_long() {
+        let mut m = StallMeter::default();
+        assert_eq!(m.observe(100, 0), None, "first sight is the baseline");
+        // Normal 1-2 s ticks seen by a 1 s poll: never a stall.
+        for (u, t) in [(100, 1000), (101, 2000), (101, 3000), (102, 4000), (103, 5000)] { assert_eq!(m.observe(u, t), None, "t={t}"); }
+        // Stands still from t=5000 to t=12000, then moves: one 7 s stall.
+        for t in (6000..12_000).step_by(1000) { assert_eq!(m.observe(103, t), None); }
+        assert_eq!(m.observe(104, 12_000), Some(7000));
+        assert_eq!(m.observe(105, 13_000), None, "measured once, not again");
     }
 
     #[test]
@@ -1053,7 +1157,7 @@ mod tests {
         }
         // Supervisor stops reporting: one alert for it, none per room, and no
         // task is started for rooms that were simply not checked.
-        let dead = |t: u64| health_reports(&cfg, Err("gone"), t);
+        let dead = |t: u64| health_reports(&cfg, Err("gone"), t, GONE);
         assert_eq!(h.step(&cfg, &dead(10_000), 10_000), HealStep::default());
         let s = h.step(&cfg, &dead(12_000), 12_000);
         assert_eq!(s.alerts, vec![(false, "HEALTH atrium DOWN: status unreadable: gone".to_string())]);

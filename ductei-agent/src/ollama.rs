@@ -550,7 +550,7 @@ impl<D: crate::Dispatcher> crate::Dispatcher for GpuHandoff<D> {
 pub fn report(outbox: &std::path::Path, text: &str) -> Result<(), String> {
     let line = text.replace(['\r', '\n'], " ");
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(outbox).map_err(|e| e.to_string())?;
-    writeln!(f, "{line}").map_err(|e| e.to_string())?;
+    f.write_all(format!("{line}\n").as_bytes()).map_err(|e| e.to_string())?;
     f.sync_all().map_err(|e| e.to_string())
 }
 

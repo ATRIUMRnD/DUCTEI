@@ -83,6 +83,33 @@ impl Drop for Tree {
     }
 }
 
+/// (pid, lowercase image name) of every running process, read from one native
+/// snapshot. No child process is started: the supervisor asks this every tick
+/// and the fleet bot every second, and running `tasklist` for it cost 0.3 s to
+/// well over a second each time, enough to stretch a 1 s tick past the point
+/// where status readers call the supervisor dead. Empty on failure.
+#[cfg(windows)]
+pub fn processes() -> Vec<(u32, String)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
+    let mut out = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE { return out; }
+        let mut e: PROCESSENTRY32W = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut e) != 0 {
+            loop {
+                let len = e.szExeFile.iter().position(|&c| c == 0).unwrap_or(e.szExeFile.len());
+                out.push((e.th32ProcessID, String::from_utf16_lossy(&e.szExeFile[..len]).to_ascii_lowercase()));
+                if Process32NextW(snap, &mut e) == 0 { break; }
+            }
+        }
+        CloseHandle(snap);
+    }
+    out
+}
+
 /// Belt and braces for anything that escaped the job (spawned before adopt,
 /// or an unowned tree): `taskkill /T /F` on the root PID.
 pub fn kill_tree_by_pid(pid: u32) {

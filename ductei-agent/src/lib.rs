@@ -144,7 +144,7 @@ fn append_fsync(p: &Path, lines: &[String]) -> Result<(), String> {
     }
     let mut f = OpenOptions::new().create(true).append(true).open(p).map_err(|e| e.to_string())?;
     for l in lines {
-        writeln!(f, "{l}").map_err(|e| e.to_string())?;
+        f.write_all(format!("{l}\n").as_bytes()).map_err(|e| e.to_string())?;
     }
     f.sync_all().map_err(|e| e.to_string())
 }

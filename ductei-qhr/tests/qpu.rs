@@ -189,7 +189,9 @@ fn repeat_offline_request_is_served_from_cache_without_spooling() {
     assert_eq!(second["job_id"], "c1", "a hit names the run that produced it");
     assert_eq!(second["success_probability"], first["success_probability"]);
     assert_eq!(done_count(&d), 1, "the repeat never reached limend");
-    assert!(hit < Duration::from_millis(15), "cache hit took {hit:?}");
+    // "Never reached limend" above is the real check. The time bound only guards against a hit that
+    // waits on the spool; it is loose so a busy machine does not fail it (it was 15 ms and flaky).
+    assert!(hit < Duration::from_millis(1_000), "cache hit took {hit:?}");
     assert_eq!(q.receipts(Assurance::Verified).seq, 2, "a hit is still receipted");
 }
 

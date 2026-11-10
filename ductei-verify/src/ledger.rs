@@ -103,7 +103,8 @@ impl Ledger {
             fs::create_dir_all(dir).map_err(|e| format!("ledger dir: {e}"))?;
         }
         let mut f = OpenOptions::new().create(true).append(true).open(&self.path).map_err(|e| format!("ledger: {e}"))?;
-        writeln!(f, "{line}").map_err(|e| format!("ledger: {e}"))?;
+        // One write call for the whole line: a kill between text and newline would glue the next receipt onto this one.
+        f.write_all(format!("{line}\n").as_bytes()).map_err(|e| format!("ledger: {e}"))?;
         f.sync_all().map_err(|e| format!("ledger fsync: {e}"))?;
         self.receipts.push(r.clone());
         Ok(r)

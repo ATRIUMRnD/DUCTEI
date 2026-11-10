@@ -240,7 +240,7 @@ impl Watcher {
         #[derive(Serialize)]
         struct Logged<'x> { #[serde(flatten)] a: &'x Alarm, cat: &'static str }
         let line = serde_json::to_string(&Logged { a, cat: cat.label() }).unwrap_or_default();
-        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(self.cfg.dir.join("alarms.jsonl")) { let _ = writeln!(f, "{line}"); let _ = f.sync_all(); }
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(self.cfg.dir.join("alarms.jsonl")) { let _ = f.write_all(format!("{line}\n").as_bytes()); let _ = f.sync_all(); }
         eprintln!("atrium-watch: [{}] {} {} {}", cat.label(), a.kind, a.stream, a.detail);
         if cat != Cat::Tamper {
             let k = (a.kind.clone(), a.stream.clone());

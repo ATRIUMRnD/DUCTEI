@@ -310,7 +310,7 @@ fn queued_task(repo: &Repo, wt: &str) -> Result<String, String> {
 fn log_task(id: &str, ev: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(TASK_LOG) {
-        let _ = writeln!(f, "{id}|{ev}");
+        let _ = f.write_all(format!("{id}|{ev}\n").as_bytes());
     }
 }
 

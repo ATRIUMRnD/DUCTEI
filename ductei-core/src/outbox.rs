@@ -2,7 +2,7 @@ use crate::{Envelope};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::fs;
 
@@ -37,7 +37,7 @@ impl Outbox {
     pub fn record_intent(&mut self, env: &Envelope) -> std::io::Result<()> {
         let rec = OutboundRecord::Intent { env: env.clone() };
         let line = serde_json::to_string(&rec).map_err(std::io::Error::other)?;
-        writeln!(self.file, "{line}")?;
+        crate::write_line(&mut self.file, &line)?;
         self.file.sync_data()
     }
 
@@ -50,7 +50,7 @@ impl Outbox {
             ack,
         };
         let line = serde_json::to_string(&rec).map_err(std::io::Error::other)?;
-        writeln!(self.file, "{line}")?;
+        crate::write_line(&mut self.file, &line)?;
         self.file.sync_data()
     }
 
