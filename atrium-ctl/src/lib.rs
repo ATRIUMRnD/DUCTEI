@@ -84,6 +84,15 @@ pub const ANCHOR_SERVER: &str = "atrium";
 fn d_tick() -> u64 { 1000 }
 fn d_beat() -> u64 { 60 }
 
+/// How many ticks early room `idx` (of `n`) books its next beat, so the rooms'
+/// beats land on different ticks instead of all on one. Each beat costs a
+/// signed, fsynced receipt; seven on one tick froze the tick on a slow drive.
+/// Always below `beat_every`, so silence in the chain stays bounded by it.
+pub fn beat_offset(idx: usize, n: usize, beat_every: u64) -> u64 {
+    if n <= 1 || beat_every <= 1 { return 0; }
+    (idx as u64 % n as u64) * beat_every / n as u64
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind { #[default] External, Managed }
@@ -470,6 +479,10 @@ pub struct Supervisor {
     anchors: Option<ductei_core::LogStore>,
     anchor_tx: Option<std::sync::mpsc::Sender<ductei_core::Envelope>>,
     anchor_thread: Option<std::thread::JoinHandle<()>>,
+    /// An `anchor.every` boundary was crossed since the last anchor. Anchors
+    /// are cumulative, so one per tick (the newest head) covers every receipt
+    /// written on that tick, instead of one fsynced anchor per receipt.
+    anchor_pending: bool,
     node: [u8; 16],
     /// Receipts written so far, shared with the self-check thread.
     seq_shared: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -502,7 +515,7 @@ impl Supervisor {
             .map(|r| (r.name.clone(), Managed { child: None, tree: None, backoff: Duration::from_secs(1), next_try: Instant::now(), restarts: 0, spawned: false, started: Instant::now() })).collect();
         let mut node = [0u8; 16];
         node.copy_from_slice(&Sha256::digest(format!("atrium:{}", cfg.state.display()).as_bytes())[..16]);
-        let mut sup = Self { cfg, log, managed, status, tick: 0, last_beat: BTreeMap::new(), anchors: None, anchor_tx: None, anchor_thread: None, node,
+        let mut sup = Self { cfg, log, managed, status, tick: 0, last_beat: BTreeMap::new(), anchors: None, anchor_tx: None, anchor_thread: None, anchor_pending: false, node,
             seq_shared: Default::default(), stop_check: Default::default(), check_thread: None, job: None, _writer_lock: writer_lock };
         sup.seq_shared.store(sup.log.seq, std::sync::atomic::Ordering::SeqCst);
         sup.start_anchoring()?;
@@ -599,6 +612,7 @@ impl Supervisor {
 
     /// Sign the current head, write it locally, then hand it to the pusher.
     fn anchor_now(&mut self) {
+        self.anchor_pending = false;
         let Some(store) = self.anchors.as_mut() else { return };
         let Some(a) = self.log.anchor() else { return };
         let blob = serde_json::to_vec(&a).unwrap_or_default();
@@ -606,6 +620,11 @@ impl Supervisor {
         let env = ductei_core::scoped(&key, &[&ductei_mcp::anchor_scope(ANCHOR_SERVER)], self.node, a.seq + 1, &blob);
         if let Err(e) = store.append(&env) { slog(&self.cfg.state, &format!("anchors.jsonl append failed: {e}")); return; }
         if let Some(tx) = &self.anchor_tx { let _ = tx.send(env); }
+    }
+
+    /// One anchor for everything recorded since the last one, if a boundary was crossed.
+    fn flush_anchor(&mut self) {
+        if self.anchor_pending { self.anchor_now(); }
     }
 
     pub fn state(&self) -> &Path { &self.cfg.state }
@@ -618,7 +637,7 @@ impl Supervisor {
         self.status.chain_head = self.log.head.clone();
         self.seq_shared.store(self.log.seq, std::sync::atomic::Ordering::SeqCst);
         let every = self.cfg.anchor.every;
-        if every > 0 && self.log.seq.is_multiple_of(every) { self.anchor_now(); }
+        if every > 0 && self.log.seq.is_multiple_of(every) { self.anchor_pending = true; }
         Ok(())
     }
 
@@ -669,8 +688,9 @@ impl Supervisor {
         self.tick += 1;
         let procs = process_table();
         let rooms = self.cfg.room.clone();
+        let n_rooms = rooms.len();
         let mut written = 0u64;
-        for r in &rooms {
+        for (idx, r) in rooms.iter().enumerate() {
             let (health, pid, note) = match r.kind {
                 Kind::External => (check_external(r, &procs), None, String::new()),
                 Kind::Managed => {
@@ -735,10 +755,15 @@ impl Supervisor {
                 let call = serde_json::to_vec(r)?;
                 let result = serde_json::to_vec(&self.status.rooms[&r.name])?;
                 self.record(&r.name, HEARTBEAT_SCOPE, verdict, &call, &result)?;
-                self.last_beat.insert(r.name.clone(), self.tick);
+                // Booked a little early per room, so the next beats spread over
+                // the minute instead of landing together on one tick.
+                let early = beat_offset(idx, n_rooms, self.cfg.beat_every);
+                self.last_beat.insert(r.name.clone(), self.tick.saturating_sub(early));
                 written += 1;
             }
         }
+        // One anchor for all of this tick's receipts (the newest head covers them).
+        self.flush_anchor();
         self.status.tick = self.tick;
         self.status.unix = now_unix();
         // Persistence before status: receipts are already fsynced (Durability::default).
@@ -788,6 +813,7 @@ impl Supervisor {
                         None => name.clone().into_bytes(),
                     };
                     self.record(&name, VERIFY_SCOPE, if ok { "pass" } else { "fail" }, &call, detail.as_bytes())?;
+                    self.flush_anchor();
                     slog(&self.cfg.state, &format!("verify {name}: {} {detail}", if ok { "PASS" } else { "FAIL" }));
                     let j = self.job.as_mut().expect("job");
                     if ok { j.pass += 1 } else { j.fail += 1 }
@@ -1009,6 +1035,26 @@ pub fn slog(state: &Path, msg: &str) {
     eprintln!("{line}");
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(state.join("logs").join("atrium.log")) {
         let _ = f.write_all(format!("{line}\n").as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod beat_tests {
+    use super::*;
+
+    #[test]
+    fn beats_spread_over_the_minute_and_stay_bounded() {
+        let n = 7;
+        let offs: Vec<u64> = (0..n).map(|i| beat_offset(i, n, 60)).collect();
+        assert_eq!(offs, vec![0, 8, 17, 25, 34, 42, 51]);
+        // All rooms recorded together at tick 100: their next beats land on different ticks.
+        let next: std::collections::BTreeSet<u64> = offs.iter().map(|o| 100 - o + 60).collect();
+        assert_eq!(next.len(), n, "two rooms still beat on the same tick");
+        // Silence in the chain never exceeds beat_every for any room.
+        assert!(offs.iter().all(|o| *o < 60));
+        assert_eq!(beat_offset(0, 1, 60), 0);
+        assert_eq!(beat_offset(3, 7, 1), 0);
+        assert_eq!(beat_offset(3, 7, 0), 0);
     }
 }
 
