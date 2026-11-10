@@ -10,10 +10,14 @@
 //!   atrium check  <atrium.toml>   read-only chain check against peer anchors; safe any time, any count (exit 0/1)
 //!   atrium down   <atrium.toml>   ask the running supervisor to stop its managed rooms and exit
 
-use atrium_ctl::{slog, Config, Health, Status, Supervisor};
+use atrium_ctl::{is_device_lost, now_unix, slog, Config, Health, Status, Supervisor};
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::time::{Duration, Instant};
+
+/// How often a held supervisor probes for its drive.
+const DRIVE_PROBE: Duration = Duration::from_secs(5);
 
 fn usage() -> ! {
     eprintln!("usage: atrium up|status|verify|check|down <atrium.toml>\n       atrium fleet <atrium.toml> <verb> ...\n{}", atrium_ctl::fleet::USAGE);
@@ -55,6 +59,34 @@ fn main() {
 
 fn stop_file(state: &Path) -> std::path::PathBuf { state.join("stop") }
 
+enum Hold { Back, Stop }
+
+/// The drive is writable again: the state dir exists, the chain file is there,
+/// and a probe file can be written and synced.
+fn drive_back(state: &Path) -> bool {
+    if fs::metadata(state.join("receipts.jsonl")).is_err() { return false; }
+    let probe = state.join(".drive-probe");
+    let ok = fs::OpenOptions::new().create(true).truncate(true).write(true).open(&probe)
+        .and_then(|mut f| { f.write_all(b"probe")?; f.sync_all() }).is_ok();
+    let _ = fs::remove_file(&probe);
+    ok
+}
+
+/// Wait without writing to the chain until the drive answers again (or `down` is asked).
+fn wait_for_drive(state: &Path) -> Hold {
+    let t0 = Instant::now();
+    let mut next_note = Duration::from_secs(60);
+    loop {
+        std::thread::sleep(DRIVE_PROBE);
+        if stop_file(state).exists() { let _ = fs::remove_file(stop_file(state)); return Hold::Stop; }
+        if drive_back(state) { return Hold::Back; }
+        if t0.elapsed() >= next_note {
+            eprintln!("[{}] still waiting for the drive under {} ({}s)", now_unix(), state.display(), t0.elapsed().as_secs());
+            next_note += Duration::from_secs(60);
+        }
+    }
+}
+
 fn up(cfg: Config) -> i32 {
     // One supervisor per state dir.
     if let Ok(s) = Status::load(&cfg.state) {
@@ -66,14 +98,15 @@ fn up(cfg: Config) -> i32 {
     let _ = fs::remove_file(stop_file(&cfg.state));
     let tick = Duration::from_millis(cfg.tick_ms);
     let state = cfg.state.clone();
-    let mut sup = match Supervisor::open(cfg) { Ok(s) => s, Err(e) => { eprintln!("atrium: {e}"); return 70; } };
+    let mut sup = match Supervisor::open(cfg.clone()) { Ok(s) => s, Err(e) => { eprintln!("atrium: {e}"); return 70; } };
     sup.start_selfcheck();
     slog(&state, &format!("up: pid {} chain seq {} head {}", std::process::id(), sup.status().chain_seq, &sup.status().chain_head[..12]));
     let mut last_all_up: Option<bool> = None;
     loop {
         let t0 = Instant::now();
-        match sup.tick() {
-            Ok(_) => {
+        let step = sup.tick().and_then(|_| sup.service_requests());
+        match step {
+            Ok(()) => {
                 let now_up = sup.status().all_up();
                 if last_all_up != Some(now_up) {
                     let down: Vec<&str> = sup.status().rooms.iter().filter(|(_, r)| r.health != Health::Up).map(|(n, _)| n.as_str()).collect();
@@ -81,12 +114,29 @@ fn up(cfg: Config) -> i32 {
                     last_all_up = Some(now_up);
                 }
             }
+            Err(e) if is_device_lost(&e) => {
+                // The drive under the chain went away. Never write through it:
+                // release the chain, wait, reopen (which re-verifies), record the gap.
+                let (from_seq, lost_at, why) = (sup.status().chain_seq, now_unix(), e.to_string());
+                eprintln!("[{lost_at}] drive lost at seq {from_seq} ({why}); holding, no writes until it is back");
+                sup.release();
+                if let Hold::Stop = wait_for_drive(&state) { eprintln!("atrium: down requested while the drive was gone"); return 0; }
+                sup = match Supervisor::open(cfg.clone()) {
+                    Ok(s) => s,
+                    Err(e) => { slog(&state, &format!("drive back but the chain will not reopen, stopping (chain must not drift): {e}")); return 70; }
+                };
+                let lost = now_unix().saturating_sub(lost_at);
+                if let Err(e) = sup.record_gap(from_seq, lost, &why) {
+                    slog(&state, &format!("gap receipt failed, stopping (chain must not drift): {e}"));
+                    let _ = sup.shutdown();
+                    return 74;
+                }
+                sup.start_selfcheck();
+                slog(&state, &format!("drive back after {lost}s; chain reopened and verified at seq {}, gap recorded, resuming", sup.status().chain_seq));
+                last_all_up = None;
+                continue;
+            }
             Err(e) => { slog(&state, &format!("tick failed, stopping (chain must not drift): {e}")); let _ = sup.shutdown(); return 74; }
-        }
-        if let Err(e) = sup.service_requests() {
-            slog(&state, &format!("verify request failed, stopping (chain must not drift): {e}"));
-            let _ = sup.shutdown();
-            return 74;
         }
         if stop_file(&state).exists() {
             slog(&state, "down requested");

@@ -15,13 +15,16 @@
 //! - persistence before status: a receipt is written before status.json moves.
 //! - the supervisor never blocks a tick on a child; checks are bounded.
 //! - a damaged chain is never extended (ReceiptLog refuses at open).
+//! - a lost drive is never written through: the supervisor releases the chain,
+//!   waits, reopens (which re-verifies), and records the gap (see `is_device_lost`).
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::Arc;
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -42,6 +45,8 @@ pub type Report = (String, bool, String);
 pub const PEER_BACKOFF_MIN: Duration = Duration::from_secs(15);
 /// Longest wait between anchor pushes to an unreachable peer.
 pub const PEER_BACKOFF_MAX: Duration = Duration::from_secs(300);
+/// Self-check: a full chain verify every N cheap tail checks (10 s each, so 10 min).
+pub const FULL_CHECK_EVERY: u64 = 60;
 
 // ---------------------------------------------------------------- config
 
@@ -136,6 +141,10 @@ pub struct VerifyStep {
     pub expect_text: Option<String>,
     #[serde(default = "d_vto")]
     pub timeout_secs: u64,
+    /// A step that may fail without failing verify (e.g. fetching from a peer
+    /// that is off on purpose). The failure is still reported, as "skipped".
+    #[serde(default)]
+    pub optional: bool,
 }
 fn d_vto() -> u64 { 900 }
 
@@ -171,6 +180,21 @@ impl Config {
     }
 }
 
+// ---------------------------------------------------------------- device loss
+
+/// The drive under the state dir went away (USB drop, sleep, eject). Windows:
+/// 21 ERROR_NOT_READY, 55 ERROR_DEV_NOT_EXIST, 433 ERROR_NO_SUCH_DEVICE,
+/// 483 ERROR_DEVICE_HARDWARE_ERROR, 1006 ERROR_FILE_INVALID, 1117 ERROR_IO_DEVICE,
+/// 1167 ERROR_DEVICE_NOT_CONNECTED. Only these trigger hold-and-resume; any other
+/// I/O error still stops the supervisor (chain must not drift).
+pub fn is_device_lost(e: &std::io::Error) -> bool {
+    if let Some(code) = e.raw_os_error() {
+        if cfg!(windows) && matches!(code, 21 | 55 | 433 | 483 | 1006 | 1117 | 1167) { return true; }
+    }
+    let m = e.to_string().to_ascii_lowercase();
+    m.contains("device is not ready") || m.contains("device is not connected") || m.contains("no such device")
+}
+
 // ---------------------------------------------------------------- peer backoff
 
 /// Per-peer anchor backoff. An unreachable peer (asleep laptop) is skipped
@@ -198,6 +222,124 @@ impl PeerBackoff {
     }
 }
 
+/// Each peer lane keeps its own outbox, so two lanes never append to one file.
+pub fn peer_outbox(state: &Path, peer: &str) -> PathBuf {
+    let safe: String = peer.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    state.join(format!("anchor-outbox-{safe}.jsonl"))
+}
+
+/// One peer's anchor lane: its own queue, backoff and outbox, so a slow or
+/// asleep peer (handshake timeouts) never delays anchors to the others.
+/// Alarms always go out; of queued anchors only the newest (it covers the rest).
+fn peer_lane(a: &ductei_mcp::AnchorCfg, state_root: &Path, logdir: &Path, peer: &str, rx: Receiver<Arc<ductei_core::Envelope>>) {
+    let outbox = peer_outbox(logdir, peer);
+    let mut backoff = PeerBackoff::default();
+    while let Ok(first) = rx.recv() {
+        let mut batch = vec![first];
+        while let Ok(more) = rx.try_recv() { batch.push(more); }
+        let (alarms, anchors): (Vec<_>, Vec<_>) = batch.into_iter().partition(|e| e.key.contains("/alarm/"));
+        for env in alarms.iter().chain(anchors.last()) {
+            let is_alarm = env.key.contains("/alarm/");
+            if !is_alarm && backoff.skip(peer, Instant::now()) { continue; }
+            match ductei_mcp::push_anchor(a, state_root, peer, env, &outbox) {
+                Ok(1) | Ok(2) => {
+                    if backoff.ok(peer) { slog(logdir, &format!("{peer} answering again; anchors resume at {}", env.key)); }
+                }
+                Ok(code) => slog(logdir, &format!("{} rejected by {peer} (ack {code})", env.key)),
+                Err(e) => {
+                    let wait = backoff.fail(peer, Instant::now());
+                    slog(logdir, &format!("{} push to {peer} failed: {e}; next try in {}s", env.key, wait.as_secs()));
+                }
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------- tail check
+
+/// Where the verified part of receipts.jsonl ends, and the last verified line.
+/// Lets the 10 s self-check read a few KB instead of the whole chain.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Tail {
+    /// Byte offset just past the last verified line.
+    pub end: u64,
+    /// Seq the next line must carry.
+    pub next_seq: u64,
+    /// Hash the next line's `prev` must equal.
+    pub head: String,
+    /// Offset and bytes of the last verified line (re-read to catch a rewrite).
+    pub last_off: u64,
+    pub last_line: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum TailCheck {
+    Ok,
+    /// The file cannot be read right now (drive gone); not evidence of tampering.
+    Unreadable(String),
+    /// The file shrank, a verified line changed, or a new line breaks the chain.
+    Bad(String),
+}
+
+const GENESIS_HEAD: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Build a Tail from the end of the file (reads at most the last 1 MiB).
+/// Call only right after a full verify passed, so the last line is trusted.
+pub fn tail_from_end(path: &Path) -> Result<Tail, String> {
+    let mut f = fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    let len = f.metadata().map_err(|e| e.to_string())?.len();
+    if len == 0 { return Ok(Tail { head: GENESIS_HEAD.into(), ..Default::default() }); }
+    let window = len.min(1 << 20);
+    let start = len - window;
+    f.seek(SeekFrom::Start(start)).map_err(|e| e.to_string())?;
+    let mut buf = Vec::with_capacity(window as usize);
+    f.take(window).read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    let last_nl = buf.iter().rposition(|&b| b == b'\n').ok_or("no complete line in the last 1 MiB")?;
+    let line_start = match buf[..last_nl].iter().rposition(|&b| b == b'\n') {
+        Some(p) => p + 1,
+        None if start == 0 => 0,
+        None => return Err("last line longer than 1 MiB".into()),
+    };
+    let line = &buf[line_start..last_nl];
+    let r: ductei_mcp::Receipt = serde_json::from_slice(line).map_err(|e| format!("last line unparsable: {e}"))?;
+    Ok(Tail { end: start + last_nl as u64 + 1, next_seq: r.body.seq + 1, head: r.hash, last_off: start + line_start as u64, last_line: line.to_vec() })
+}
+
+/// Cheap check: the file has not shrunk, the last verified line is unchanged,
+/// and every new complete line links on (seq, prev, body hash). A line still
+/// being written (no newline yet) is left for the next pass. Signatures are
+/// left to the periodic full verify.
+pub fn tail_check(path: &Path, t: &mut Tail) -> TailCheck {
+    let mut f = match fs::File::open(path) { Ok(f) => f, Err(e) => return TailCheck::Unreadable(e.to_string()) };
+    let len = match f.metadata() { Ok(m) => m.len(), Err(e) => return TailCheck::Unreadable(e.to_string()) };
+    if len < t.end { return TailCheck::Bad(format!("receipts.jsonl shrank from {} to {len} bytes", t.end)); }
+    if !t.last_line.is_empty() {
+        let mut got = vec![0u8; t.last_line.len()];
+        if let Err(e) = f.seek(SeekFrom::Start(t.last_off)).and_then(|_| f.read_exact(&mut got)) { return TailCheck::Unreadable(e.to_string()); }
+        if got != t.last_line { return TailCheck::Bad(format!("verified receipt seq {} at byte {} was rewritten", t.next_seq.saturating_sub(1), t.last_off)); }
+    }
+    let mut buf = Vec::new();
+    if let Err(e) = f.seek(SeekFrom::Start(t.end)).and_then(|_| f.read_to_end(&mut buf)) { return TailCheck::Unreadable(e.to_string()); }
+    let mut pos = 0usize;
+    while let Some(nl) = buf[pos..].iter().position(|&b| b == b'\n') {
+        let line = &buf[pos..pos + nl];
+        let r: ductei_mcp::Receipt = match serde_json::from_slice(line) {
+            Ok(r) => r,
+            Err(e) => return TailCheck::Bad(format!("byte {}: unparsable receipt: {e}", t.end)),
+        };
+        if r.body.seq != t.next_seq { return TailCheck::Bad(format!("seq {}: expected seq {}", r.body.seq, t.next_seq)); }
+        if r.body.prev != t.head { return TailCheck::Bad(format!("seq {}: prev hash mismatch", r.body.seq)); }
+        if r.body.hash() != r.hash { return TailCheck::Bad(format!("seq {}: body hash mismatch", r.body.seq)); }
+        t.last_off = t.end;
+        t.last_line = line.to_vec();
+        t.end += nl as u64 + 1;
+        t.next_seq += 1;
+        t.head = r.hash;
+        pos += nl + 1;
+    }
+    TailCheck::Ok
+}
+
 // ---------------------------------------------------------------- health
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -207,15 +349,7 @@ pub enum Health { Up, Down, Blocked }
 /// Image names currently in the process table (one bounded call per tick).
 pub fn process_table() -> Vec<String> {
     #[cfg(windows)]
-    {
-        let out = Command::new("tasklist").args(["/FO", "CSV", "/NH"]).stdout(Stdio::piped()).stderr(Stdio::null()).output();
-        match out {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).lines()
-                .filter_map(|l| l.trim_start_matches('"').split('"').next().map(|s| s.to_ascii_lowercase()))
-                .collect(),
-            Err(_) => Vec::new(),
-        }
-    }
+    { tree::processes().into_iter().map(|(_, name)| name).collect() }
     #[cfg(not(windows))]
     {
         let out = Command::new("ps").args(["-eo", "comm="]).stdout(Stdio::piped()).stderr(Stdio::null()).output();
@@ -302,11 +436,7 @@ impl Status {
 /// Is a process with this PID running (and is it an atrium binary)?
 pub fn pid_alive(pid: u32) -> bool {
     #[cfg(windows)]
-    {
-        let out = Command::new("tasklist").args(["/FO", "CSV", "/NH", "/FI", &format!("PID eq {pid}")])
-            .stdout(Stdio::piped()).stderr(Stdio::null()).output();
-        out.map(|o| String::from_utf8_lossy(&o.stdout).to_ascii_lowercase().contains("atrium")).unwrap_or(false)
-    }
+    { tree::processes().iter().any(|(p, name)| *p == pid && name.contains("atrium")) }
     #[cfg(not(windows))]
     { Path::new(&format!("/proc/{pid}")).exists() }
 }
@@ -379,10 +509,9 @@ impl Supervisor {
         Ok(sup)
     }
 
-    /// Local anchors.jsonl always; a pusher thread only when peers are set.
-    /// The pusher never blocks a tick: newest anchor wins, older unsent ones
-    /// are superseded (a later head covers them). A peer that stops answering
-    /// is backed off for anchors (see `PeerBackoff`); alarms always try every peer.
+    /// Local anchors.jsonl always; when peers are set, a dispatcher thread fans
+    /// each envelope out to one lane per peer (`peer_lane`). Nothing here blocks
+    /// a tick, and one slow peer never holds up another.
     fn start_anchoring(&mut self) -> Result<(), String> {
         let a = self.cfg.anchor.clone();
         if a.every == 0 { return Ok(()); }
@@ -394,62 +523,63 @@ impl Supervisor {
         if a.peers.is_empty() { return Ok(()); }
         let (tx, rx) = std::sync::mpsc::channel::<ductei_core::Envelope>();
         let state_root = self.cfg.state.join("anchor-state");
-        let outbox = self.cfg.state.join("anchor-outbox.jsonl");
         let logdir = self.cfg.state.clone();
         self.anchor_tx = Some(tx);
         self.anchor_thread = Some(std::thread::spawn(move || {
-            let mut backoff = PeerBackoff::default();
-            while let Ok(first) = rx.recv() {
-                // Alarms always go out; of the anchors only the newest (it covers the rest).
-                let mut batch = vec![first];
-                while let Ok(more) = rx.try_recv() { batch.push(more); }
-                let (alarms, anchors): (Vec<_>, Vec<_>) = batch.into_iter().partition(|e| e.key.contains("/alarm/"));
-                for env in alarms.iter().chain(anchors.last()) {
-                    let is_alarm = env.key.contains("/alarm/");
-                    let mut ok = false;
-                    let mut skipped = 0usize;
-                    for p in &a.peers {
-                        if !is_alarm && backoff.skip(p, Instant::now()) { skipped += 1; continue; }
-                        match ductei_mcp::push_anchor(&a, &state_root, p, env, &outbox) {
-                            Ok(1) | Ok(2) => {
-                                ok = true;
-                                if backoff.ok(p) { slog(&logdir, &format!("{p} answering again; anchors resume at {}", env.key)); }
-                            }
-                            Ok(code) => slog(&logdir, &format!("{} rejected by {p} (ack {code})", env.key)),
-                            Err(e) => {
-                                let wait = backoff.fail(p, Instant::now());
-                                slog(&logdir, &format!("{} push to {p} failed: {e}; next try in {}s", env.key, wait.as_secs()));
-                            }
-                        }
-                    }
-                    // Only shout when no peer at all took it and none was merely backed off.
-                    if !ok && skipped < a.peers.len() { slog(&logdir, &format!("{} unsent to any peer", env.key)); }
-                }
+            let mut lanes = Vec::new();
+            for p in a.peers.clone() {
+                let (ptx, prx) = channel::<Arc<ductei_core::Envelope>>();
+                let (a, state_root, logdir) = (a.clone(), state_root.clone(), logdir.clone());
+                let h = std::thread::spawn(move || peer_lane(&a, &state_root, &logdir, &p, prx));
+                lanes.push((ptx, h));
             }
+            while let Ok(env) = rx.recv() {
+                let env = Arc::new(env);
+                for (ptx, _) in &lanes { let _ = ptx.send(env.clone()); }
+            }
+            // Supervisor closed the queue: let every lane drain, then finish.
+            for (ptx, h) in lanes { drop(ptx); let _ = h.join(); }
         }));
         Ok(())
     }
 
-    /// Live self-check (only under `up`): every 10 s re-read receipts.jsonl
-    /// from disk and compare it with what this process wrote. A file that no
-    /// longer verifies, or holds fewer receipts than were written, is reported
-    /// straight to the anchor peers as `mcp/atrium/alarm/<seq>`, where
-    /// atrium-watch turns it into an alert. Two failures in a row are needed,
-    /// so a line caught mid-write never alarms. Runs off the tick thread.
+    /// Live self-check (only under `up`). Every 10 s a cheap tail check reads
+    /// only what was appended since the last pass (plus the last verified line),
+    /// and every `FULL_CHECK_EVERY` passes the whole chain is verified with
+    /// signatures. A file that shrank, was rewritten, or holds fewer receipts
+    /// than were written is reported to the anchor peers as
+    /// `mcp/atrium/alarm/<seq>`. Two failures in a row are needed. An unreadable
+    /// file (drive gone) is skipped, never reported as tampering.
     pub fn start_selfcheck(&mut self) {
         let Some(tx) = self.anchor_tx.clone() else { return };
         let (state, node, seqa, stop) = (self.cfg.state.clone(), self.node, self.seq_shared.clone(), self.stop_check.clone());
         self.check_thread = Some(std::thread::spawn(move || {
             use std::sync::atomic::Ordering::SeqCst;
+            let path = state.join("receipts.jsonl");
             let (mut fails, mut reported) = (0u32, false);
+            let mut tail: Option<Tail> = None;
+            let mut pass: u64 = 0;
             'outer: loop {
                 for _ in 0..10 { if stop.load(SeqCst) { break 'outer; } std::thread::sleep(Duration::from_secs(1)); }
                 let exp = seqa.load(SeqCst);
-                let trust = VerifyTrust { allow_unpinned: true, ..Default::default() };
-                let problem = match verify_own_chain(&state, &trust) {
-                    Ok(r) if r.ok() && r.receipts >= exp => None,
-                    Ok(r) => Some(format!("receipts.jsonl: {} on disk, {} written; {}", r.receipts, exp, r.errors.join(" | "))),
-                    Err(e) => Some(e),
+                let full = tail.is_none() || pass.is_multiple_of(FULL_CHECK_EVERY);
+                pass += 1;
+                let problem = if full {
+                    let trust = VerifyTrust { allow_unpinned: true, ..Default::default() };
+                    match verify_own_chain(&state, &trust) {
+                        Ok(r) if r.ok() && r.receipts >= exp => { tail = tail_from_end(&path).ok(); None }
+                        Ok(r) => Some(format!("receipts.jsonl: {} on disk, {} written; {}", r.receipts, exp, r.errors.join(" | "))),
+                        Err(_) if fs::metadata(&path).is_err() => continue, // drive gone: not tampering
+                        Err(e) => Some(e),
+                    }
+                } else {
+                    let t = tail.as_mut().expect("tail set after a full pass");
+                    match tail_check(&path, t) {
+                        TailCheck::Ok if t.next_seq >= exp => None,
+                        TailCheck::Ok => Some(format!("receipts.jsonl: {} on disk, {} written", t.next_seq, exp)),
+                        TailCheck::Unreadable(_) => continue,
+                        TailCheck::Bad(p) => { tail = None; Some(p) } // next pass is a full verify
+                    }
                 };
                 match problem {
                     None => { fails = 0; reported = false; }
@@ -490,6 +620,26 @@ impl Supervisor {
         let every = self.cfg.anchor.every;
         if every > 0 && self.log.seq.is_multiple_of(every) { self.anchor_now(); }
         Ok(())
+    }
+
+    /// After a drive loss: one signed heartbeat receipt saying the chain paused
+    /// at `from_seq` for `lost_secs` and why, so the gap is on the record.
+    pub fn record_gap(&mut self, from_seq: u64, lost_secs: u64, why: &str) -> std::io::Result<()> {
+        let call = format!("device-gap: chain paused at seq {from_seq} for {lost_secs}s");
+        self.record("device-gap", HEARTBEAT_SCOPE, "gap", call.as_bytes(), why.as_bytes())?;
+        self.anchor_now();
+        Ok(())
+    }
+
+    /// Give up the chain without writing anything (the drive under it is gone).
+    /// Stops the self-check, closes the anchor queue (lanes finish on their own),
+    /// and drops the log, the writer lock and the managed children's job objects.
+    pub fn release(mut self) {
+        self.stop_check.store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.check_thread.take() { let _ = t.join(); }
+        self.anchor_tx = None;
+        let _ = self.anchor_thread.take(); // detached: a lane may be mid-timeout
+        self.job = None;
     }
 
     fn spawn(&mut self, room: &Room) -> Result<u32, String> {
@@ -820,6 +970,16 @@ fn chain_reports_once(cfg: &Config, own_kid: Option<&str>) -> Vec<Report> {
 }
 
 fn run_step(s: &VerifyStep) -> (bool, String) {
+    let (ok, detail) = run_step_raw(s);
+    optional_outcome(s.optional, ok, detail)
+}
+
+/// An optional step never fails verify; its failure is kept visible as "skipped".
+fn optional_outcome(optional: bool, ok: bool, detail: String) -> (bool, String) {
+    if ok || !optional { (ok, detail) } else { (true, format!("skipped (optional): {detail}")) }
+}
+
+fn run_step_raw(s: &VerifyStep) -> (bool, String) {
     if s.cmd.is_empty() { return (false, "empty cmd".into()); }
     let mut cmd = Command::new(&s.cmd[0]);
     cmd.args(&s.cmd[1..]).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -848,7 +1008,7 @@ pub fn slog(state: &Path, msg: &str) {
     let line = format!("[{}] {msg}", now_unix());
     eprintln!("{line}");
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(state.join("logs").join("atrium.log")) {
-        let _ = writeln!(f, "{line}");
+        let _ = f.write_all(format!("{line}\n").as_bytes());
     }
 }
 
@@ -879,5 +1039,153 @@ mod backoff_tests {
         b.fail("laptop", t0);
         assert!(b.skip("laptop", t0));
         assert!(!b.skip("mini", t0));
+    }
+
+    #[test]
+    fn each_peer_gets_its_own_outbox() {
+        let s = Path::new("D:/x");
+        let a = peer_outbox(s, "100.111.252.86:7421");
+        let b = peer_outbox(s, "100.121.3.55:7421");
+        assert_ne!(a, b);
+        assert_eq!(a, Path::new("D:/x").join("anchor-outbox-100_111_252_86_7421.jsonl"));
+    }
+
+    #[test]
+    fn a_dead_peer_lane_does_not_delay_a_live_one() {
+        // One lane per peer: the lane for an unroutable peer (connect timeout)
+        // must not hold back the queue of another lane. Model: two lanes fed
+        // by one dispatcher; the slow lane sleeps, the fast lane must finish first.
+        let (ftx, frx) = channel::<Arc<u32>>();
+        let (stx, srx) = channel::<Arc<u32>>();
+        let fast = std::thread::spawn(move || { let mut n = 0; while frx.recv().is_ok() { n += 1; } n });
+        let slow = std::thread::spawn(move || { while srx.recv().is_ok() { std::thread::sleep(Duration::from_millis(200)); } });
+        let t0 = Instant::now();
+        for i in 0..5 { let e = Arc::new(i); let _ = ftx.send(e.clone()); let _ = stx.send(e); }
+        drop(ftx);
+        assert_eq!(fast.join().unwrap(), 5);
+        assert!(t0.elapsed() < Duration::from_millis(200), "fast lane waited on the slow one");
+        drop(stx);
+        slow.join().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod device_tests {
+    use super::*;
+
+    #[test]
+    fn drive_loss_errors_are_recognised_and_others_are_not() {
+        #[cfg(windows)]
+        {
+            assert!(is_device_lost(&std::io::Error::from_raw_os_error(21)));
+            assert!(is_device_lost(&std::io::Error::from_raw_os_error(1167)));
+            assert!(!is_device_lost(&std::io::Error::from_raw_os_error(5)), "access denied is not a lost drive");
+            assert!(!is_device_lost(&std::io::Error::from_raw_os_error(112)), "disk full must still stop the supervisor");
+        }
+        assert!(is_device_lost(&std::io::Error::other("The device is not ready. (os error 21)")));
+        assert!(!is_device_lost(&std::io::Error::other("chain broken")));
+    }
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+
+    fn tmp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("atrium-tail-{name}-{}-{}", std::process::id(), now_unix()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn chain(d: &Path, n: u64) -> ReceiptLog {
+        let mut log = ReceiptLog::open_in(d, d, &SignCfg::default(), Durability::default()).unwrap();
+        for i in 0..n { log.record(ReceiptBody::new(format!("r{i}"), HEARTBEAT_SCOPE.into(), "up", i, i, sha256_hex(b"c"), sha256_hex(b"r"))).unwrap(); }
+        log
+    }
+
+    #[test]
+    fn appended_receipts_pass_and_advance() {
+        let d = tmp("append");
+        let mut log = chain(&d, 3);
+        let p = d.join("receipts.jsonl");
+        let mut t = tail_from_end(&p).unwrap();
+        assert_eq!(t.next_seq, 3);
+        for i in 3..6 { log.record(ReceiptBody::new(format!("r{i}"), HEARTBEAT_SCOPE.into(), "up", i, i, sha256_hex(b"c"), sha256_hex(b"r"))).unwrap(); }
+        assert_eq!(tail_check(&p, &mut t), TailCheck::Ok);
+        assert_eq!(t.next_seq, 6);
+        assert_eq!(t.end, fs::metadata(&p).unwrap().len());
+    }
+
+    #[test]
+    fn a_line_still_being_written_is_left_for_later() {
+        let d = tmp("partial");
+        drop(chain(&d, 2));
+        let p = d.join("receipts.jsonl");
+        let mut t = tail_from_end(&p).unwrap();
+        fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(b"{\"v\":1,\"se").unwrap();
+        assert_eq!(tail_check(&p, &mut t), TailCheck::Ok);
+        assert_eq!(t.next_seq, 2);
+    }
+
+    #[test]
+    fn truncation_and_rewrites_are_caught() {
+        let d = tmp("bad");
+        drop(chain(&d, 4));
+        let p = d.join("receipts.jsonl");
+        let text = fs::read_to_string(&p).unwrap();
+        let mut t = tail_from_end(&p).unwrap();
+        // Cut the last line off.
+        let keep: Vec<&str> = text.lines().take(3).collect();
+        fs::write(&p, keep.join("\n") + "\n").unwrap();
+        assert!(matches!(tail_check(&p, &mut t), TailCheck::Bad(m) if m.contains("shrank")));
+        // Same length, last verified line edited.
+        fs::write(&p, &text).unwrap();
+        let mut t = tail_from_end(&p).unwrap();
+        fs::write(&p, text.replace("\"verdict\":\"up\"", "\"verdict\":\"dn\"")).unwrap();
+        assert!(matches!(tail_check(&p, &mut t), TailCheck::Bad(m) if m.contains("rewritten")));
+    }
+
+    #[test]
+    fn a_foreign_line_on_the_end_is_caught() {
+        let d = tmp("foreign");
+        drop(chain(&d, 2));
+        let p = d.join("receipts.jsonl");
+        let mut t = tail_from_end(&p).unwrap();
+        let first = fs::read_to_string(&p).unwrap().lines().next().unwrap().to_string();
+        fs::OpenOptions::new().append(true).open(&p).unwrap().write_all(format!("{first}\n").as_bytes()).unwrap();
+        assert!(matches!(tail_check(&p, &mut t), TailCheck::Bad(m) if m.contains("expected seq 2")));
+    }
+
+    #[test]
+    fn missing_file_is_unreadable_not_tampering() {
+        let d = tmp("gone");
+        let mut t = Tail { end: 10, next_seq: 1, ..Default::default() };
+        assert!(matches!(tail_check(&d.join("receipts.jsonl"), &mut t), TailCheck::Unreadable(_)));
+    }
+}
+
+#[cfg(test)]
+mod optional_step_tests {
+    use super::*;
+
+    #[test]
+    fn optional_failure_is_skipped_not_failed() {
+        let (ok, d) = optional_outcome(true, false, "exit 1".into());
+        assert!(ok && d.starts_with("skipped (optional): exit 1"), "{d}");
+    }
+
+    #[test]
+    fn required_failure_still_fails_and_success_is_untouched() {
+        assert_eq!(optional_outcome(false, false, "exit 1".into()), (false, "exit 1".to_string()));
+        assert_eq!(optional_outcome(true, true, "exit 0".into()), (true, "exit 0".to_string()));
+    }
+
+    #[test]
+    fn optional_defaults_to_false_in_config() {
+        let s: VerifyStep = toml::from_str("name = \"x\"\ncmd = [\"a\"]").unwrap();
+        assert!(!s.optional);
+        let s: VerifyStep = toml::from_str("name = \"x\"\ncmd = [\"a\"]\noptional = true").unwrap();
+        assert!(s.optional);
     }
 }
