@@ -110,11 +110,43 @@ class Proposer:
         self.max_online = max_online
         self.online_file = state_dir / "online-used"
         self.online_used = int(self.online_file.read_text().strip()) if self.online_file.exists() else 0
+        # Byte offset of entry number `cursor` in the log; found on the first tick.
+        self._off: int | None = None
+
+    def _new_entries(self):
+        """Yield (end_offset, entry) for each entry from `cursor` on.
+
+        Reads only the bytes appended since the last tick. The log is
+        append-only and grows without bound, so parsing all of it every
+        tick cost more the longer the loop ran.
+        """
+        if not self.veyn_log.exists():
+            return
+        with self.veyn_log.open("rb") as f:
+            if self._off is None or self._off > os.fstat(f.fileno()).st_size:
+                # First tick, or the log was replaced: walk to the cursor once.
+                off, seen = 0, 0
+                while seen < self.cursor:
+                    line = f.readline()
+                    if not line.endswith(b"\n"):
+                        break
+                    off = f.tell()
+                    if line.strip():
+                        seen += 1
+                if seen < self.cursor:
+                    return  # log is shorter than the cursor: nothing new yet
+                self._off = off
+            f.seek(self._off)
+            while True:
+                line = f.readline()
+                if not line.endswith(b"\n"):
+                    return  # end of file, or a line still being written
+                end = f.tell()
+                if line.strip():
+                    yield end, json.loads(line)
 
     def tick(self) -> None:
-        entries = read_jsonl(self.veyn_log)
-        for i in range(self.cursor, len(entries)):
-            e = entries[i]
+        for end, e in self._new_entries():
             if e.get("scopes") == [REM_SCOPE]:
                 key = f"{REM_SCOPE}|{e['key']}"
                 online = self.online_used < self.max_online
@@ -134,7 +166,8 @@ class Proposer:
                         log(f"propose deferred ({n}x): {r.stderr.strip() or r.stdout.strip()}")
                     return
                 log(r.stdout.strip())
-            self.cursor = i + 1
+            self.cursor += 1
+            self._off = end
             self.cursor_file.write_text(str(self.cursor))
 
 
