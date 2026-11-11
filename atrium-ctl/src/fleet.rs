@@ -42,7 +42,8 @@ pub struct FleetCfg {
     #[serde(default)]
     pub mcp_audit: Option<PathBuf>,
     /// ductei-agent's outbox (one JSON or text line per report). The bot
-    /// forwards every new line, so the agent never holds the bot token.
+    /// forwards the lines that need Xing (see `agent_needs_xing`); the rest
+    /// stay in the outbox and the fleet chain.
     #[serde(default)]
     pub agent_outbox: Option<PathBuf>,
     /// HTTPS URL of the ATRIUM Mini App (matrix rain + command board). When
@@ -291,18 +292,22 @@ pub fn external_task(r: &crate::Room) -> Option<String> {
 
 // ---------------------------------------------------------------- health + healer (N5)
 //
-// Nothing fails silently. Once a second the bot turns the supervisor's
-// status.json into one `spec::Health` per room, tells the phone about every
-// confirmed change, and starts the scheduled task of an external room that is
-// down. Managed rooms are already restarted by the supervisor, and a dead
-// supervisor is the mini witness's job (atrium-watch SILENT): the bot is one
-// of the supervisor's own rooms and dies with it.
+// Nothing fails silently, and the phone only rings for emergencies. Once a
+// second the bot turns the supervisor's status.json into one `spec::Health`
+// per room. The Healer records every confirmed change on the fleet chain and
+// starts the scheduled task of an external room that is down; managed rooms
+// are already restarted by the supervisor. None of that goes to the phone.
+// The Pager sends one message only when something stays broken past its
+// limit (the self-healing had its chance and did not fix it), and one
+// RESOLVED line when a paged problem clears. A dead supervisor is also the
+// mini witness's job (atrium-watch SILENT): the bot is one of the
+// supervisor's own rooms and dies with it.
 
 /// The supervisor's own line in a health report.
 pub const SUPERVISOR_ROOM: &str = "atrium";
 /// Reason on the supervisor line after a clean `atrium down`.
 pub const STOPPED_ON_PURPOSE: &str = "stopped on purpose (atrium down)";
-/// A new state must hold this long before it is announced or acted on, so a
+/// A new state must hold this long before it is recorded or acted on, so a
 /// one-second restart or a status file caught mid-replace is not news.
 pub const HEAL_CONFIRM_MS: u64 = 2000;
 /// First wait between two starts of the same room's task; doubles per try.
@@ -313,6 +318,15 @@ pub const HEAL_BACKOFF_MAX_MS: u64 = 600_000;
 pub const STALL_LOG_MS: u64 = 3000;
 /// One line per stall, in the fleet folder.
 pub const STALL_LOG: &str = "stalls.log";
+/// Page when the supervisor process is gone (or its status unreadable) this long.
+pub const PAGE_SUPERVISOR_DOWN_MS: u64 = 60_000;
+/// Page when the supervisor is alive but has not ticked this long. Short
+/// stalls (slow disk flushes, wake from sleep) heal on their own.
+pub const PAGE_STALL_MS: u64 = 300_000;
+/// Page when a room stays DOWN or DEGRADED this long. By then the supervisor
+/// (managed rooms, backoff up to 30 s) and the healer (external rooms, 30 s
+/// then 60 s, 120 s) have each retried several times.
+pub const PAGE_ROOM_MS: u64 = 300_000;
 
 fn now_ms() -> u64 { std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0) }
 
@@ -384,8 +398,8 @@ impl StallMeter {
     }
 }
 
-/// What one healer pass decided: alerts as (recovered, text), and the rooms
-/// whose task should be started now.
+/// What one healer pass decided: changes as (recovered, text) for the fleet
+/// chain, and the rooms whose task should be started now.
 #[derive(Debug, Default, PartialEq)]
 pub struct HealStep { pub alerts: Vec<(bool, String)>, pub restarts: Vec<String> }
 
@@ -435,6 +449,53 @@ impl Healer {
         }
         out
     }
+}
+
+/// Decides what reaches the phone. Pure (clock passed in), like the Healer.
+/// A problem pages once, only after it has outlasted its limit; a paged
+/// problem sends one RESOLVED line when it clears. Anything that heals
+/// inside its limit sends nothing. A clean `atrium down` never pages.
+/// While the supervisor is not OK its rooms are "not checked", so their
+/// timers are left as they are (neither started nor cleared).
+#[derive(Debug, Default)]
+pub struct Pager { open: BTreeMap<String, (u64, bool)> }
+
+impl Pager {
+    pub fn step(&mut self, reports: &[spec::Health], now_ms: u64) -> Vec<String> {
+        let mut out = Vec::new();
+        let sup = reports.iter().find(|h| h.room == SUPERVISOR_ROOM);
+        let sup_ok = sup.map(|h| h.state == spec::HEALTH_OK).unwrap_or(false);
+        for h in reports {
+            let is_sup = h.room == SUPERVISOR_ROOM;
+            if !sup_ok && !is_sup { continue; }
+            let on_purpose = is_sup && h.reason.as_deref() == Some(STOPPED_ON_PURPOSE);
+            if h.state == spec::HEALTH_OK || on_purpose {
+                if let Some((since, paged)) = self.open.remove(&h.room) {
+                    if paged { out.push(format!("RESOLVED {} is back after {} s", h.room, now_ms.saturating_sub(since) / 1000)); }
+                }
+                continue;
+            }
+            let limit = match (is_sup, h.state) {
+                (true, spec::HEALTH_DOWN) => PAGE_SUPERVISOR_DOWN_MS,
+                (true, _) => PAGE_STALL_MS,
+                _ => PAGE_ROOM_MS,
+            };
+            let e = self.open.entry(h.room.clone()).or_insert((now_ms, false));
+            let age = now_ms.saturating_sub(e.0);
+            if !e.1 && age >= limit {
+                e.1 = true;
+                out.push(format!("EMERGENCY {} {} for {} s, self-healing did not fix it: {}", h.room, state_word(h.state), age / 1000, h.reason.as_deref().unwrap_or("no reason given")));
+            }
+        }
+        out
+    }
+}
+
+/// Agent reports that need Xing: a verified patch waiting for /approve, or a
+/// line the agent marks as an emergency. Routine sweep reports stay in the
+/// outbox and on the fleet chain.
+pub fn agent_needs_xing(line: &str) -> bool {
+    line.contains("/approve") || line.to_ascii_uppercase().contains("EMERGENCY")
 }
 
 // ---------------------------------------------------------------- telegram bot
@@ -550,8 +611,7 @@ fn tg_send_opt(tok: &str, chat: i64, text: &str, raw_html: bool) {
 }
 fn tg_send(tok: &str, chat: i64, text: &str) { tg_send_opt(tok, chat, text, false) }
 
-/// One short health line. Quiet unless `loud` (same rule as atrium-watch:
-/// HEALTH and RECOVERY arrive without a ring; a fix that failed rings).
+/// One short health line. Quiet unless `loud`.
 fn tg_alert(tok: &str, chat: i64, text: &str, loud: bool) {
     let mut f = vec![("chat_id", chat.to_string()), ("text", format!("ATRIUM {text}"))];
     if !loud { f.push(("disable_notification", "true".to_string())); }
@@ -627,7 +687,7 @@ pub const BOT_COMMANDS: &[(&str, &str)] = &[
     ("health", "Every room: OK, DEGRADED or DOWN, with the reason"),
     ("rooms", "Every room with health and its restart name"),
     ("alarms", "Tamper alarms from the mini watcher"),
-    ("log", "Last 10 fleet actions"),
+    ("log", "Last 10 fleet actions (quiet heals and alerts land here)"),
     ("ping", "Is the bot alive"),
     ("wake_mini", "Wake the Mac mini (one tap)"),
     ("wake_laptop", "Wake the laptop (one tap)"),
@@ -769,15 +829,16 @@ pub fn bot_help() -> String {
 
 impl Fleet {
     /// The healer loop (its own thread beside the bot's long poll). Once a
-    /// second: read status.json, build the health reports, send every confirmed
-    /// change to the phone, and start the task of an external room that is
-    /// down. Each alert and each restart is a receipt on the fleet chain.
-    /// `<fleet dir>/heal.off` keeps the alerts and stops the restarts.
-    /// Every supervisor stall of STALL_LOG_MS or more is appended to
-    /// `<fleet dir>/stalls.log`, so the pattern can be read without touching
-    /// the supervisor.
+    /// second: read status.json, build the health reports, record every
+    /// confirmed change on the fleet chain, start the task of an external
+    /// room that is down, and page the phone only for what the Pager calls
+    /// an emergency. `<fleet dir>/heal.off` keeps everything else and stops
+    /// the restarts. Every supervisor stall of STALL_LOG_MS or more is
+    /// appended to `<fleet dir>/stalls.log`, so the pattern can be read
+    /// without touching the supervisor.
     fn heal_loop(&self, tok: &str, chat: i64) {
         let mut healer = Healer::default();
+        let mut pager = Pager::default();
         let mut meter = StallMeter::default();
         loop {
             std::thread::sleep(Duration::from_secs(1));
@@ -793,15 +854,18 @@ impl Fleet {
             let reports = health_reports(&self.cfg, st.as_ref().map_err(|e| e.as_str()), now, &crate::pid_alive);
             let step = healer.step(&self.cfg, &reports, now);
             for (recovered, text) in &step.alerts {
-                tg_alert(tok, chat, text, false);
                 self.record("heal: alert", *recovered, text);
             }
             let off = self.dir.join("heal.off").exists();
             for room in &step.restarts {
-                if off { tg_alert(tok, chat, &format!("HEAL {room}: restart skipped, heal.off is set"), false); continue; }
+                if off { self.record(&format!("heal: {room} restart skipped, heal.off is set"), false, ""); continue; }
                 // Through exec, so it is the same allowlisted verb the phone uses, and it is recorded.
-                let (ok, t) = self.exec(&["restart".to_string(), room.clone(), "--yes".to_string()]);
-                tg_alert(tok, chat, &format!("HEAL {room}: {}", if ok { t } else { format!("restart FAILED: {t}") }), !ok);
+                let _ = self.exec(&["restart".to_string(), room.clone(), "--yes".to_string()]);
+            }
+            for page in pager.step(&reports, now) {
+                let resolved = page.starts_with("RESOLVED");
+                tg_alert(tok, chat, &page, !resolved);
+                self.record("page", resolved, &page);
             }
         }
     }
@@ -857,15 +921,21 @@ impl Fleet {
                     self.record("alert: mcp unauthorized", false, &msg);
                 }
             }
-            // Agent reports (charter goal 0: keep Xing in the loop). Whole lines,
-            // every one of them: long reports are split across messages, never cut.
+            // Agent reports (charter goal 0: keep Xing in the loop). Every line
+            // goes on the fleet chain; only the ones that need Xing (a patch to
+            // approve, an emergency) go to the phone, whole, never cut.
             if let Some(o) = &self.fc.agent_outbox {
                 let lines = tail_new_full(o, &self.dir.join("agent-outbox-cursor"));
                 if !lines.is_empty() {
-                    let mut msg = String::from("ATRIUM agent\n");
-                    for l in &lines { msg += l; msg.push('\n'); }
-                    tg_send(&tok, chat, &msg);
-                    self.record("agent report", true, &msg);
+                    let mut all = String::from("ATRIUM agent\n");
+                    for l in &lines { all += l; all.push('\n'); }
+                    self.record("agent report", true, &all);
+                    let urgent: Vec<&String> = lines.iter().filter(|l| agent_needs_xing(l)).collect();
+                    if !urgent.is_empty() {
+                        let mut msg = String::from("ATRIUM agent\n");
+                        for l in urgent { msg += l; msg.push('\n'); }
+                        tg_send(&tok, chat, &msg);
+                    }
                 }
             }
         }
@@ -962,6 +1032,16 @@ mod tests {
     }
 
     #[test]
+    fn only_agent_lines_that_need_xing_ring_the_phone() {
+        assert!(agent_needs_xing("[brain fix] PATCH 123456 ready: task t1\n/approve 123456 to commit it locally"));
+        assert!(agent_needs_xing(r#"{"text":"PATCH 1 ready\n/approve 000001"}"#));
+        assert!(agent_needs_xing("[ops] emergency: chain alarm on the mini"));
+        assert!(!agent_needs_xing("[brain fix] all tests pass at HEAD, no open tasks"));
+        assert!(!agent_needs_xing("[ops-1794292208]  Hourly Goal Sweep Report:  Alarms: - laptop: node-watchdog DOWN"));
+        assert!(!agent_needs_xing("[ductei fix] no fix this run: tests did not pass"));
+    }
+
+    #[test]
     fn bot_menu_lists_every_verb_and_only_valid_names() {
         let names: Vec<&str> = BOT_COMMANDS.iter().map(|(c, _)| *c).collect();
         for v in ["status", "health", "alarms", "rooms", "log", "ping", "wake", "wake_mini", "up", "down", "restart", "restart_anchor", "help"] { assert!(names.contains(&v), "menu missing /{v}"); }
@@ -1035,6 +1115,11 @@ mod tests {
         [(SUPERVISOR_ROOM, spec::HEALTH_OK), ("sync", sync), ("ward", ward), ("loop", lp)].iter()
             .map(|(n, s)| spec::Health { room: n.to_string(), state: *s, reason: (*s != spec::HEALTH_OK).then(|| "check failed".to_string()), checked_ms: t })
             .collect()
+    }
+
+    /// Reports with only the supervisor line in the given state.
+    fn sup(state: u8, reason: &str, t: u64) -> Vec<spec::Health> {
+        vec![spec::Health { room: SUPERVISOR_ROOM.into(), state, reason: (state != spec::HEALTH_OK).then(|| reason.to_string()), checked_ms: t }]
     }
 
     #[test]
@@ -1163,5 +1248,68 @@ mod tests {
         assert_eq!(s.alerts, vec![(false, "HEALTH atrium DOWN: status unreadable: gone".to_string())]);
         assert!(s.restarts.is_empty());
         assert_eq!(h.step(&cfg, &dead(13_000), 13_000), HealStep::default());
+    }
+
+    // ---- pager: what actually rings the phone ----
+
+    #[test]
+    fn self_healed_outages_and_stalls_never_page() {
+        let (ok, down, deg) = (spec::HEALTH_OK, spec::HEALTH_DOWN, spec::HEALTH_DEGRADED);
+        let mut p = Pager::default();
+        // Today's real pattern: sync down 45 s, node down 62 s, both healed.
+        for t in (0..62_000).step_by(1000) { assert!(p.step(&rep(if t < 45_000 { down } else { ok }, ok, down, t), t).is_empty(), "t={t}"); }
+        assert!(p.step(&rep(ok, ok, ok, 62_000), 62_000).is_empty(), "no RESOLVED for something never paged");
+        // A 140 s supervisor stall (the longest in stalls.log) heals on its own.
+        for t in (100_000..240_000).step_by(1000) { assert!(p.step(&sup(deg, "supervisor stalled", t), t).is_empty(), "t={t}"); }
+        assert!(p.step(&rep(ok, ok, ok, 240_000), 240_000).is_empty());
+        // A clean `atrium down` is never an emergency.
+        for t in (300_000..1_000_000).step_by(10_000) { assert!(p.step(&sup(down, STOPPED_ON_PURPOSE, t), t).is_empty()); }
+    }
+
+    #[test]
+    fn a_room_stuck_down_pages_once_then_resolves_once() {
+        let (ok, down) = (spec::HEALTH_OK, spec::HEALTH_DOWN);
+        let mut p = Pager::default();
+        assert!(p.step(&rep(ok, ok, ok, 0), 0).is_empty());
+        for t in (1000..PAGE_ROOM_MS + 1000).step_by(1000) { assert!(p.step(&rep(down, ok, ok, t), t).is_empty(), "t={t}"); }
+        let at = PAGE_ROOM_MS + 1000;
+        let page = p.step(&rep(down, ok, ok, at), at);
+        assert_eq!(page.len(), 1, "{page:?}");
+        assert!(page[0].starts_with("EMERGENCY sync DOWN for 300 s"), "{page:?}");
+        // Said once, not every second.
+        for t in (at + 1000..at + 600_000).step_by(1000) { assert!(p.step(&rep(down, ok, ok, t), t).is_empty()); }
+        let back = p.step(&rep(ok, ok, ok, at + 600_000), at + 600_000);
+        assert_eq!(back, vec!["RESOLVED sync is back after 900 s".to_string()]);
+        assert!(p.step(&rep(ok, ok, ok, at + 601_000), at + 601_000).is_empty());
+    }
+
+    #[test]
+    fn a_dead_supervisor_pages_after_a_minute_and_a_long_stall_after_five() {
+        let (down, deg) = (spec::HEALTH_DOWN, spec::HEALTH_DEGRADED);
+        let mut p = Pager::default();
+        assert!(p.step(&sup(down, "supervisor silent 10 s, process gone", 0), 0).is_empty());
+        assert!(p.step(&sup(down, "x", PAGE_SUPERVISOR_DOWN_MS - 1), PAGE_SUPERVISOR_DOWN_MS - 1).is_empty());
+        let page = p.step(&sup(down, "supervisor silent 70 s, process gone", PAGE_SUPERVISOR_DOWN_MS), PAGE_SUPERVISOR_DOWN_MS);
+        assert!(page.len() == 1 && page[0].starts_with("EMERGENCY atrium DOWN for 60 s"), "{page:?}");
+        let mut p = Pager::default();
+        assert!(p.step(&sup(deg, "stalled", 0), 0).is_empty());
+        assert!(p.step(&sup(deg, "stalled", PAGE_STALL_MS - 1), PAGE_STALL_MS - 1).is_empty());
+        assert_eq!(p.step(&sup(deg, "stalled", PAGE_STALL_MS), PAGE_STALL_MS).len(), 1);
+    }
+
+    #[test]
+    fn rooms_are_not_timed_while_the_supervisor_is_not_reporting() {
+        let (ok, down, deg) = (spec::HEALTH_OK, spec::HEALTH_DOWN, spec::HEALTH_DEGRADED);
+        let mut p = Pager::default();
+        // Reports with the supervisor stalled and every room listed as not OK.
+        let stalled = |t: u64| {
+            let mut r = rep(down, down, down, t);
+            r[0] = spec::Health { room: SUPERVISOR_ROOM.into(), state: deg, reason: Some("stalled".into()), checked_ms: t };
+            r
+        };
+        for t in (0..PAGE_ROOM_MS * 2).step_by(5000) {
+            for msg in p.step(&stalled(t), t) { assert!(msg.contains("atrium"), "a room was paged while not checked: {msg}"); }
+        }
+        let _ = ok;
     }
 }
