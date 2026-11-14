@@ -92,7 +92,7 @@ pub fn brute_force(qubo: &[((String, String), f64)], max_vars: usize) -> Option<
 
 /// Samples needed to see an optimal bitstring at least once with confidence `conf`.
 pub fn shots_to_optimum(p: f64, conf: f64) -> Option<u64> {
-    if !(p > 0.0 && p <= 1.0) || !(conf > 0.0 && conf < 1.0) { return None; }
+    if !(p > 0.0 && p <= 1.0 && conf > 0.0 && conf < 1.0) { return None; }
     if p >= 1.0 { return Some(1); }
     Some(((1.0 - conf).ln() / (1.0 - p).ln()).ceil().max(1.0) as u64)
 }
