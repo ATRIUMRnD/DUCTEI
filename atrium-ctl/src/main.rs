@@ -245,7 +245,18 @@ fn down(cfg: &Config) -> i32 {
     let deadline = Instant::now() + Duration::from_secs(15);
     while Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(250));
-        if !stop_file(&cfg.state).exists() { println!("atrium: stopped"); return 0; }
+        if !stop_file(&cfg.state).exists() {
+            // The stop is acknowledged before the process ends. Wait for it to
+            // exit, so the writer lock is free for whatever runs next (verify, up).
+            let gone = Instant::now() + Duration::from_secs(30);
+            while atrium_ctl::pid_alive(s.supervisor_pid) && Instant::now() < gone { std::thread::sleep(Duration::from_millis(100)); }
+            if atrium_ctl::pid_alive(s.supervisor_pid) {
+                eprintln!("atrium: supervisor pid {} acknowledged the stop but is still running after 30s", s.supervisor_pid);
+                return 1;
+            }
+            println!("atrium: stopped");
+            return 0;
+        }
     }
     eprintln!("atrium: supervisor did not acknowledge in 15s");
     1
