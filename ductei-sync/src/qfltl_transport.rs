@@ -17,6 +17,7 @@
 //!   looked up by the exact `--peer` string it dials;
 //! - `<state>/qfltl/known_clients/<label>.pub`: clients this node's serve
 //!   accepts.
+//!
 //! A key pinned as a server is never accepted as a client, and the reverse.
 //! The pre-split `known_peers/` directory is ignored (the CLI warns).
 //! Re-pinning a name to a different key needs an explicit `replace`.
@@ -181,7 +182,7 @@ mod keystore {
 }
 
 fn keystore_err(e: String) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, e)
+    io::Error::other(e)
 }
 
 fn tmp_sibling(path: &Path) -> PathBuf {
@@ -305,7 +306,7 @@ pub fn load_or_generate_identity(state_dir: impl AsRef<Path>) -> io::Result<KemK
             match write_new_atomic(&target, &bytes) {
                 Ok(()) => fresh,
                 Err(e) if e.kind() == io::ErrorKind::AlreadyExists => read_identity(&dir)?
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "identity vanished during creation"))?,
+                    .ok_or_else(|| io::Error::other("identity vanished during creation"))?,
                 Err(e) => return Err(e),
             }
         }
@@ -455,7 +456,7 @@ fn transcript(fp_c: &[u8], fp_s: &[u8], ct1: &[u8], ek_e: &[u8], ct2: &[u8], ct3
 }
 
 fn send_record(w: &mut impl Write, ch: &mut SecureChannel, data: &[u8]) -> io::Result<()> {
-    let rec = ch.seal(data).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let rec = ch.seal(data).map_err(io::Error::other)?;
     write_raw_frame(w, &rec)?;
     w.flush()
 }
@@ -611,6 +612,13 @@ pub struct EncryptedStream<S> {
     read_pos: usize,
 }
 
+// Shows only the type name, so no key or stream state can end up in a log.
+impl<S> std::fmt::Debug for EncryptedStream<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptedStream").finish_non_exhaustive()
+    }
+}
+
 impl<S> EncryptedStream<S> {
     fn new(inner: S, channel: SecureChannel) -> Self {
         Self {
@@ -636,7 +644,7 @@ impl<S: Write> Write for EncryptedStream<S> {
         let rec = self
             .channel
             .seal(&buf[..n])
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+            .map_err(io::Error::other)?;
         write_raw_frame(&mut self.inner, &rec)?;
         Ok(n)
     }
@@ -814,7 +822,7 @@ mod tests {
         let client_kp = KemKeypair::generate();
         let wrong = KemKeypair::generate().public_bytes();
         let (c, h) = with_server(server_kp, vec![client_kp.public_bytes()], |_| ());
-        let err = client_handshake(c, &client_kp, &wrong).err().expect("must fail");
+        let err = client_handshake(c, &client_kp, &wrong).expect_err("must fail");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert!(h.join().unwrap().is_err(), "server must not accept either");
     }
@@ -826,9 +834,9 @@ mod tests {
         let client_kp = KemKeypair::generate();
         let (c, h) = with_server(server_kp, vec![], |_| ());
         // From the client's side this looks exactly like a wrong pin.
-        let err = client_handshake(c, &client_kp, &server_pub).err().expect("must fail");
+        let err = client_handshake(c, &client_kp, &server_pub).expect_err("must fail");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
-        let err = h.join().unwrap().err().expect("server must refuse");
+        let err = h.join().unwrap().expect_err("server must refuse");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
     }
 
@@ -842,7 +850,7 @@ mod tests {
         // Knows the real client's public key (so its fingerprint) but not its
         // private key: cannot recover ss2, so key confirmation fails.
         let r = client_handshake_as(c, &impostor, real_client.fingerprint(), &server_pub);
-        assert_eq!(r.err().expect("must fail").kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(r.expect_err("must fail").kind(), io::ErrorKind::PermissionDenied);
         assert!(h.join().unwrap().is_err(), "server must not hand an impostor a session");
     }
 
@@ -977,7 +985,7 @@ mod tests {
 
         let c = TcpStream::connect(proxy_addr).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let err = client_handshake(c, &client_kp, &server_pub).err().expect("must fail");
+        let err = client_handshake(c, &client_kp, &server_pub).expect_err("must fail");
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
         assert!(h.join().unwrap().is_err(), "server must not accept a spliced handshake");
         let _ = p.join();

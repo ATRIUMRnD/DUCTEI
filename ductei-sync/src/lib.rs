@@ -228,7 +228,7 @@ pub fn push_once(state: &StateDir, peer: &str) -> std::io::Result<PushReport> {
         Some(a) => a,
         None => return Ok(PushReport { interrupted: true, ..Default::default() }),
     };
-    let client = match TcpClient::connect_timeout(&addr, CONNECT_TIMEOUT) {
+    let client = match TcpClient::connect_timeout(addr, CONNECT_TIMEOUT) {
         Ok(c) => c.with_outbox_path(state.outbox()),
         Err(_) => return Ok(PushReport { interrupted: true, ..Default::default() }),
     };
