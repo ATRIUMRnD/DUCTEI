@@ -98,6 +98,15 @@ pub struct JobReceipt {
     /// why persist_state is not OS_PERSIST_QALLOW
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub persist_reason: Option<String>,
+    /// chain position a signed head anchor was written for; absent when not anchored
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_seq: Option<u64>,
+    /// comma list of peers that acknowledged the anchor
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_peers: Option<String>,
+    /// why some or all peers do not hold the anchor
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor_reason: Option<String>,
     /// unix milliseconds; also the envelope's lamport
     pub issued_ms: u64,
     /// submit to chain entry written

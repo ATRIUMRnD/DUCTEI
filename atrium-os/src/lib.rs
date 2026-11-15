@@ -30,7 +30,7 @@ pub mod base;
 pub use spec::{JobReceipt, JobRequest};
 
 use ductei_core::{scoped, Channel, LogStore, ScopePolicy, SessionBound};
-use ductei_mcp::{sha256_hex, Durability, Receipt, Scheme, SignCfg, Signer, VerifyTrust};
+use ductei_mcp::{anchor_scope, sha256_hex, Anchor, Durability, Receipt, Scheme, SignCfg, Signer, VerifyTrust};
 use ductei_qhr::lanes::{CpuLane, LlmLane};
 use ductei_qhr::qpu::{safe_job_id, QpuConfig, QpuLane};
 use ductei_qhr::{Assurance, Job, Lane, LaneId, Qhr, Report, Status};
@@ -66,6 +66,10 @@ pub struct OsConfig {
     /// other key (or no key), and `receipt` checks pin to it.
     #[serde(default)]
     pub pubkey_fingerprint: Option<String>,
+    /// Where the chain head is anchored after each job. Absent: no anchors,
+    /// so a cut-off tail of the chain cannot be detected.
+    #[serde(default)]
+    pub anchor: Option<OsAnchorCfg>,
     /// Register the local LLM lane (Ollama on this machine).
     #[serde(default)]
     pub llm: bool,
@@ -93,6 +97,44 @@ pub struct PersistCfg {
     pub out: Option<PathBuf>,
 }
 
+fn yes() -> bool { true }
+fn default_anchor_timeout_ms() -> u64 { 1500 }
+fn default_anchor_server() -> String { "atrium".into() }
+
+/// After every job the signed head of the chain it wrote to is recorded in
+/// `dir/anchors.jsonl` and pushed to the peers, the same way the supervisor
+/// anchors its own chain (same peers, same scope, same QFLTL transport).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OsAnchorCfg {
+    /// Local anchors.jsonl, one outbox per peer, and the peer-down markers.
+    pub dir: PathBuf,
+    /// DUCTEI anchor peers (host:port). Each must allow scope `mcp:<server>:anchor`.
+    #[serde(default)]
+    pub peers: Vec<String>,
+    /// State root that holds `qfltl/` (this machine's identity and the pinned
+    /// peer keys). Default: `dir`. Point it at the supervisor's anchor-state
+    /// to reuse the identity the peers already pin.
+    #[serde(default)]
+    pub identity: Option<PathBuf>,
+    /// QFLTL-encrypted pushes, never plaintext. Default true.
+    #[serde(default = "yes")]
+    pub encrypt: bool,
+    #[serde(default = "default_anchor_timeout_ms")]
+    pub connect_timeout_ms: u64,
+    /// Peer exports (their accepted.jsonl, copied here) that `receipt` checks
+    /// the chain against, on top of the local anchors.jsonl.
+    #[serde(default)]
+    pub files: Vec<PathBuf>,
+    /// Scope name on the peer. Default "atrium" (the scope the peers already allow).
+    #[serde(default = "default_anchor_server")]
+    pub server: String,
+}
+
+/// A peer that just failed is skipped for this long, so a machine that is off
+/// costs one timeout every few minutes and not one per job.
+const PEER_DOWN_SKIP: std::time::Duration = std::time::Duration::from_secs(300);
+
 #[derive(Deserialize)]
 struct OsFile { os: OsConfig }
 
@@ -118,6 +160,7 @@ impl OsConfig {
             if let Some(s) = &p.store { dirs.push(("persist.store", s.as_path())); }
             if let Some(o) = &p.out { dirs.push(("persist.out", o.as_path())); }
         }
+        if let Some(a) = &self.anchor { dirs.push(("anchor.dir", a.dir.as_path())); }
         for (what, dir) in dirs {
             let probe = Task { id: what.into(), intent: "atrium-os config path".into(), kind: Kind::Chat, criticality: 0, private: true, effects: vec![Effect::Write(dir.to_path_buf())] };
             if let Verdict::Deny(r) = Canon::default().check(&probe, &[]) { return Err(format!("[os] {what} refused: {r}")); }
@@ -256,6 +299,9 @@ fn receipt_from(job: &Job, r: &Report, scheme: &str, fingerprint: Option<String>
         persist_state: spec::OS_PERSIST_NONE,
         persist_key: None,
         persist_reason: None,
+        anchor_seq: None,
+        anchor_peers: None,
+        anchor_reason: None,
         issued_ms: now_ms(),
         elapsed_us: r.elapsed_us,
     })
@@ -268,6 +314,9 @@ pub fn issued_bytes(rc: &JobReceipt) -> Result<Vec<u8>, String> {
     c.persist_state = spec::OS_PERSIST_NONE;
     c.persist_key = None;
     c.persist_reason = None;
+    c.anchor_seq = None;
+    c.anchor_peers = None;
+    c.anchor_reason = None;
     serde_json::to_vec(&c).map_err(|e| e.to_string())
 }
 
@@ -333,8 +382,50 @@ impl Os {
         let report = self.qhr.submit(&job, approvals)?;
         self.qhr.flush().map_err(|e| format!("receipt flush failed, result withheld: {e}"))?;
         let mut rc = receipt_from(&job, &report, self.scheme, self.fingerprint.clone())?;
+        self.anchor(job.assurance, &mut rc);
         self.persist(&mut rc);
         Ok(rc)
+    }
+
+    /// Sign the head of the chain this job just extended, write it to the
+    /// local anchors.jsonl, then push it to every peer at once. Local write
+    /// first, so an anchor is never in flight without a record of it. A peer
+    /// that does not answer is named in the receipt and skipped for a while;
+    /// the next job's anchor covers this one when the peer is back.
+    fn anchor(&mut self, assurance: Assurance, rc: &mut JobReceipt) {
+        let Some(ac) = self.cfg.anchor.clone() else {
+            rc.anchor_reason = Some("no [os.anchor] table: a cut-off chain tail cannot be detected".into());
+            return;
+        };
+        let Some(a) = self.qhr.receipts(assurance).anchor() else {
+            rc.anchor_reason = Some("the chain has no entry to anchor".into());
+            return;
+        };
+        let env = match anchor_envelope(&ac, &rc.chain, &a, rc.issued_ms) {
+            Ok(e) => e,
+            Err(e) => { rc.anchor_reason = Some(format!("the anchor could not be written locally: {e}")); return; }
+        };
+        rc.anchor_seq = Some(a.seq);
+        if ac.peers.is_empty() {
+            rc.anchor_reason = Some("no anchor peers configured: the anchor is on this machine only".into());
+            return;
+        }
+        let mcp_cfg = ductei_mcp::AnchorCfg { every: 1, peers: ac.peers.clone(), connect_timeout_ms: ac.connect_timeout_ms, allow_public_peers: false, encrypt: ac.encrypt };
+        let identity = ac.identity.clone().unwrap_or_else(|| ac.dir.clone());
+        let pushes: Vec<(String, std::thread::JoinHandle<Result<(), String>>)> = ac.peers.iter().map(|peer| {
+            let (cfg, identity, dir, peer, env) = (mcp_cfg.clone(), identity.clone(), ac.dir.clone(), peer.clone(), env.clone());
+            let name = peer.clone();
+            (name, std::thread::spawn(move || push_one(&cfg, &identity, &dir, &peer, &env)))
+        }).collect();
+        let (mut held, mut missed) = (Vec::new(), Vec::new());
+        for (peer, h) in pushes {
+            match h.join().unwrap_or_else(|_| Err("push thread panicked".into())) {
+                Ok(()) => held.push(peer),
+                Err(e) => missed.push(format!("{peer}: {e}")),
+            }
+        }
+        if !held.is_empty() { rc.anchor_peers = Some(held.join(",")); }
+        if !missed.is_empty() { rc.anchor_reason = Some(missed.join("; ")); }
     }
 
     fn persist(&mut self, rc: &mut JobReceipt) {
@@ -363,6 +454,48 @@ impl Os {
             Err(e) => rc.persist_reason = Some(format!("Qallow did not confirm: {e}")),
         }
     }
+}
+
+fn peer_file(dir: &Path, what: &str, peer: &str) -> PathBuf {
+    let safe: String = peer.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '_' }).collect();
+    dir.join(format!("{what}-{safe}"))
+}
+
+/// Build the anchor envelope and append it to `dir/anchors.jsonl`.
+fn anchor_envelope(ac: &OsAnchorCfg, chain: &str, a: &Anchor, lamport: u64) -> Result<ductei_core::Envelope, String> {
+    let at = |e: std::io::Error| format!("{}: {e}", ac.dir.display());
+    fs::create_dir_all(&ac.dir).map_err(at)?;
+    let node = ductei_mcp::load_or_create_node_id(&ac.dir).map_err(at)?;
+    let blob = serde_json::to_vec(a).map_err(|e| e.to_string())?;
+    let key = format!("mcp/{}/os-anchor/{chain}/{}", ac.server, a.seq);
+    let env = scoped(&key, &[&anchor_scope(&ac.server)], node, lamport, &blob);
+    LogStore::open(ac.dir.join("anchors.jsonl")).and_then(|mut s| s.append(&env)).map_err(at)?;
+    Ok(env)
+}
+
+/// One peer: skipped if it failed in the last few minutes, else pushed with
+/// the shared anchor transport. Ack 1 (applied) or 2 (already held) both mean
+/// the peer has it.
+fn push_one(cfg: &ductei_mcp::AnchorCfg, identity: &Path, dir: &Path, peer: &str, env: &ductei_core::Envelope) -> Result<(), String> {
+    let down = peer_file(dir, "down", peer);
+    if let Some(age) = fs::metadata(&down).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()) {
+        if age < PEER_DOWN_SKIP { return Err(format!("skipped, it did not answer {} s ago", age.as_secs())); }
+    }
+    let outbox = peer_file(dir, "outbox", peer).with_extension("jsonl");
+    match ductei_mcp::push_anchor(cfg, identity, peer, env, &outbox) {
+        Ok(1) | Ok(2) => { let _ = fs::remove_file(&down); Ok(()) }
+        Ok(ack) => Err(format!("refused the anchor (ack {ack})")),
+        Err(e) => { let _ = fs::write(&down, e.as_bytes()); Err(e) }
+    }
+}
+
+/// Every anchor this config can see: the local anchors.jsonl plus the peer exports.
+fn known_anchors(cfg: &OsConfig) -> Vec<Anchor> {
+    let Some(ac) = &cfg.anchor else { return Vec::new() };
+    std::iter::once(ac.dir.join("anchors.jsonl")).chain(ac.files.iter().cloned())
+        .filter(|f| f.is_file())
+        .flat_map(|f| ductei_mcp::anchors_in(&f).unwrap_or_default())
+        .collect()
 }
 
 /// Run the existing relay once over this crate's channel, then read the
@@ -449,6 +582,18 @@ pub fn verify_receipt(cfg: &OsConfig, rc: &JobReceipt, request: Option<&JobReque
     }
     // Also keeps a hostile chain name from being joined onto the state path.
     if rc.chain != "verified" && rc.chain != "fast" { return Err(vec![format!("unknown chain {:?}", rc.chain)]); }
+
+    // The chain is also checked against every anchor this config can see: the
+    // newest one signed by the trusted key must be in the file, or the tail was cut.
+    let anchors = known_anchors(cfg);
+    let mut with_anchors = VerifyTrust { pubkey: trust.pubkey.clone(), fingerprint: trust.fingerprint.clone(), allow_unpinned: trust.allow_unpinned, anchors: trust.anchors.clone(), pinned_head: trust.pinned_head.clone() };
+    with_anchors.anchors.extend(anchors.iter().cloned());
+    let trust = &with_anchors;
+    if let Some(seq) = rc.anchor_seq {
+        if !anchors.iter().any(|a| a.seq == seq && a.head == rc.qhr_receipt) {
+            errs.push(format!("the receipt says it was anchored at seq {seq}, but no anchor for it is on this machine"));
+        }
+    }
 
     match ductei_qhr::verify_state(&cfg.state, &rc.chain, trust) {
         Err(e) => return Err(vec![format!("the chain check could not run: {e}")]),

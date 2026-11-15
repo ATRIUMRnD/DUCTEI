@@ -8,7 +8,7 @@
 //!       Prints the receipt as JSON. Exit 0 done, 2 needs approval,
 //!       3 denied or refused, 4 lane error or missed deadline, 1 not submitted.
 //!   atrium-os receipt <config.toml> <receipt.json> [--job <job.json>]
-//!                     [--fingerprint <hex> | --pubkey <file> | --allow-unpinned]
+//!                     [--fingerprint <hex> | --pubkey <file> | --allow-unpinned] [--anchor-file <peer accepted.jsonl>]
 //!       Check a receipt against the signed chain and the persisted copy.
 //!       The pin defaults to [os] pubkey_fingerprint. Exit 0 valid, 1 not.
 //!   atrium-os health  <config.toml>
@@ -66,6 +66,8 @@ fn cmd_receipt(args: &[String]) -> Result<i32, String> {
     let mut trust = VerifyTrust { fingerprint: arg(args, "--fingerprint").or_else(|| cfg.pubkey_fingerprint.clone()), ..Default::default() };
     if let Some(p) = arg(args, "--pubkey") { trust.pubkey = Some(std::fs::read(&p).map_err(|e| format!("--pubkey {p}: {e}"))?); }
     trust.allow_unpinned = args.iter().any(|a| a == "--allow-unpinned");
+    // A peer's export of what it accepted: proves the chain tail was not cut on this machine.
+    if let Some(f) = arg(args, "--anchor-file") { trust.anchors.extend(ductei_mcp::anchors_in(Path::new(&f))?); }
 
     match verify_receipt(&cfg, &rc, req.as_ref(), &trust) {
         Ok(c) => {
@@ -78,7 +80,12 @@ fn cmd_receipt(args: &[String]) -> Result<i32, String> {
                 s if s == spec::OS_PERSIST_CHANNEL => "in the DUCTEI channel log",
                 _ => "in the QHR chain only",
             };
-            println!("VALID  job {} verdict {} | {} chain seq {} of {} | {signed} | stored {stored}", rc.job_id, rc.verdict, rc.chain, c.seq, c.chain_receipts);
+            let anchored = match (rc.anchor_seq, &rc.anchor_peers) {
+                (Some(_), Some(peers)) => format!("anchored on {peers}"),
+                (Some(_), None) => "anchored on this machine only".to_string(),
+                (None, _) => "not anchored".to_string(),
+            };
+            println!("VALID  job {} verdict {} | {} chain seq {} of {} | {signed} | stored {stored} | {anchored}", rc.job_id, rc.verdict, rc.chain, c.seq, c.chain_receipts);
             for w in &c.warnings { println!("  warn  {w}"); }
             Ok(0)
         }

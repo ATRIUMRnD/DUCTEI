@@ -56,3 +56,6 @@ class JobReceipt:
     signer_fingerprint: Optional[str] = None
     persist_key: Optional[str] = None
     persist_reason: Optional[str] = None
+    anchor_seq: Optional[int] = None
+    anchor_peers: Optional[str] = None
+    anchor_reason: Optional[str] = None

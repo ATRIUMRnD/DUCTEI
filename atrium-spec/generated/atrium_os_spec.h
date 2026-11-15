@@ -64,6 +64,12 @@ typedef struct {
     bool has_persist_key;
     const char * persist_reason; /* optional: see has_<field>; why persist_state is not OS_PERSIST_QALLOW */
     bool has_persist_reason;
+    uint64_t anchor_seq; /* optional: see has_<field>; chain position a signed head anchor was written for; absent when not anchored */
+    bool has_anchor_seq;
+    const char * anchor_peers; /* optional: see has_<field>; comma list of peers that acknowledged the anchor */
+    bool has_anchor_peers;
+    const char * anchor_reason; /* optional: see has_<field>; why some or all peers do not hold the anchor */
+    bool has_anchor_reason;
     uint64_t issued_ms; /* unix milliseconds; also the envelope's lamport */
     uint64_t elapsed_us; /* submit to chain entry written */
 } job_receipt_t;

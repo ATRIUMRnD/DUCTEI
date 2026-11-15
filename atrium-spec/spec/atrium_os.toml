@@ -212,6 +212,21 @@ type = "string"
 optional = true
 doc = "why persist_state is not OS_PERSIST_QALLOW"
 [[struct.field]]
+name = "anchor_seq"
+type = "u64"
+optional = true
+doc = "chain position a signed head anchor was written for; absent when not anchored"
+[[struct.field]]
+name = "anchor_peers"
+type = "string"
+optional = true
+doc = "comma list of peers that acknowledged the anchor"
+[[struct.field]]
+name = "anchor_reason"
+type = "string"
+optional = true
+doc = "why some or all peers do not hold the anchor"
+[[struct.field]]
 name = "issued_ms"
 type = "u64"
 doc = "unix milliseconds; also the envelope's lamport"

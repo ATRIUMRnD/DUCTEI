@@ -9,6 +9,8 @@ description = "ATRIUM OS: the one job door. QHR pre-flight, LIMEN route, signed 
 [features]
 # ML-DSA signing of the QHR receipt chain (same key handling as the gate and QHR).
 sign = ["ductei-qhr/sign"]
+# Push chain-head anchors over the QFLTL transport (never plaintext when anchor.encrypt).
+qfltl = ["ductei-mcp/qfltl"]
 
 [dependencies]
 ductei-qhr = { path = "../ductei-qhr" }

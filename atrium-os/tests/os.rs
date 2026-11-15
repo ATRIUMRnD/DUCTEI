@@ -25,6 +25,7 @@ fn cfg(d: &Path, persist: bool) -> OsConfig {
         spool: Some(d.join("spool")),
         persist: persist.then(|| PersistCfg { channel: d.join("os").join("ductei"), qallow_relay: None, qallow_cli: None, store: None, out: None }),
         pubkey_fingerprint: None,
+        anchor: None,
         llm: false,
         weighter: "uniform".into(),
     }
@@ -235,4 +236,63 @@ fn a_signed_receipt_verifies_under_its_pin_and_fails_under_another() {
     assert!(Os::open(good).is_ok());
     let mut bad = c.clone(); bad.pubkey_fingerprint = Some("cd".repeat(32));
     assert!(Os::open(bad).err().unwrap().contains("is not the key [os] pins"));
+}
+
+fn anchored(d: &Path, peers: &[&str]) -> OsConfig {
+    let mut c = cfg(d, false);
+    c.anchor = Some(atrium_os::OsAnchorCfg {
+        dir: d.join("os").join("anchor"),
+        peers: peers.iter().map(|p| p.to_string()).collect(),
+        identity: None,
+        encrypt: false,
+        connect_timeout_ms: 300,
+        files: vec![],
+        server: "atrium".into(),
+    });
+    c
+}
+
+#[test]
+fn every_job_anchors_the_chain_head_and_a_cut_tail_is_caught() {
+    let d = dir("anchor");
+    let c = anchored(&d, &[]);
+    let mut os = Os::open(c.clone()).unwrap();
+    let first = os.submit(&req("a-1", "cpu.echo", "one"), &[]).unwrap();
+    let second = os.submit(&req("a-2", "cpu.echo", "two"), &[]).unwrap();
+    drop(os);
+    assert_eq!((first.anchor_seq, second.anchor_seq), (Some(0), Some(1)));
+    assert!(second.anchor_reason.as_deref().unwrap().contains("this machine only"), "{:?}", second.anchor_reason);
+
+    let ok = verify_receipt(&c, &first, None, &unpinned()).unwrap();
+    assert!(!ok.warnings.iter().any(|w| w.starts_with("no anchor")), "an anchored chain is checked against its anchor: {:?}", ok.warnings);
+    verify_receipt(&c, &second, None, &unpinned()).unwrap();
+
+    // Cut the last entry off the chain. The first receipt is still intact, but
+    // the anchor proves an entry after it existed.
+    let log = d.join("state/verified/receipts.jsonl");
+    let text = std::fs::read_to_string(&log).unwrap();
+    let kept: Vec<&str> = text.lines().take(1).collect();
+    std::fs::write(&log, format!("{}\n", kept[0])).unwrap();
+    let errs = verify_receipt(&c, &first, None, &unpinned()).unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("TRUNCATED")), "{errs:?}");
+
+    // A receipt that claims an anchor nobody wrote is refused.
+    let mut lie = first.clone();
+    lie.anchor_seq = Some(7);
+    let errs = verify_receipt(&c, &lie, None, &unpinned()).unwrap_err();
+    assert!(errs.iter().any(|e| e.contains("no anchor for it")), "{errs:?}");
+}
+
+#[test]
+fn a_peer_that_is_off_is_named_then_skipped_and_never_blocks_the_job() {
+    let d = dir("peerdown");
+    // Loopback port 9 (discard): nothing listens, the connect is refused at once.
+    let c = anchored(&d, &["127.0.0.1:9"]);
+    let mut os = Os::open(c.clone()).unwrap();
+    let one = os.submit(&req("p-1", "cpu.echo", "one"), &[]).unwrap();
+    assert_eq!((one.verdict.as_str(), one.anchor_seq, one.anchor_peers.as_deref()), ("done", Some(0), None));
+    assert!(one.anchor_reason.as_deref().unwrap().starts_with("127.0.0.1:9: "), "{:?}", one.anchor_reason);
+    let two = os.submit(&req("p-2", "cpu.echo", "two"), &[]).unwrap();
+    assert!(two.anchor_reason.as_deref().unwrap().contains("skipped"), "{:?}", two.anchor_reason);
+    verify_receipt(&c, &two, None, &unpinned()).unwrap();
 }
