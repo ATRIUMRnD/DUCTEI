@@ -636,6 +636,10 @@ pub struct VerifyTrust {
     /// `(seq, hash)` the operator copied by hand (`--anchor seq:hash`). Trusted
     /// as-is, since it came from the operator, not from a file.
     pub pinned_head: Option<(u64, String)>,
+    /// Under a pin (`pubkey` or `fingerprint`), an unsigned receipt is an
+    /// error. This allows unsigned receipts up to and including this seq, for
+    /// a chain that was started before signing was turned on.
+    pub unsigned_through: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -763,8 +767,12 @@ pub fn verify_chain(dir: &Path, trust: &VerifyTrust, mut check: impl FnMut(&Rece
                 }
                 _ => rep.errors.push(format!("seq {s}: signed with {} but no matching public key / sig", r.scheme)),
             }
-        } else if !r.body.kid.is_empty() {
-            rep.errors.push(format!("seq {s}: unsigned receipt carries kid"));
+        } else {
+            if !r.body.kid.is_empty() { rep.errors.push(format!("seq {s}: unsigned receipt carries kid")); }
+            let pinned = trust.fingerprint.is_some() || (trust.pubkey.is_some() && !trust.allow_unpinned);
+            if pinned && !trust.unsigned_through.is_some_and(|t| s <= t) {
+                rep.errors.push(format!("seq {s}: unsigned receipt under a pinned key"));
+            }
         }
         check(&r, &mut rep);
         expect_seq = s + 1;
@@ -1850,6 +1858,29 @@ mod tests {
         assert_eq!(Signer::effective_store(&c).unwrap(), KeyStore::Plaintext);
     }
 
+    #[test]
+    fn a_pin_refuses_an_unsigned_chain_unless_allowed_up_to_a_seq() {
+        // Entry 157: a writer swaps in an unsigned chain; a pinned verify must fail.
+        let d = tmp();
+        {
+            let mut g = Gate::open(&cfg(&["echo"], 10), &d).unwrap();
+            g.on_client_line(&call(1, "echo"));
+            g.on_server_line(r#"{"jsonrpc":"2.0","id":1,"result":1}"#).unwrap();
+            g.on_client_line(&call(2, "nope"));
+        }
+        let pin = Some("00".repeat(32));
+        let rep = verify_receipts(&d, &VerifyTrust { fingerprint: pin.clone(), ..Default::default() }).unwrap();
+        assert!(!rep.ok());
+        assert!(rep.errors.iter().any(|e| e.contains("unsigned receipt under a pinned key")), "{:?}", rep.errors);
+        // Allowed through seq 1 (a chain started before signing): ok.
+        let rep = verify_receipts(&d, &VerifyTrust { fingerprint: pin.clone(), unsigned_through: Some(1), ..Default::default() }).unwrap();
+        assert!(rep.ok(), "{:?}", rep.errors);
+        // Allowed only through seq 0: seq 1 still fails.
+        let rep = verify_receipts(&d, &VerifyTrust { fingerprint: pin, unsigned_through: Some(0), ..Default::default() }).unwrap();
+        assert!(rep.errors.iter().any(|e| e.contains("seq 1: unsigned receipt under a pinned key")), "{:?}", rep.errors);
+        // No pin, integrity only: unchanged, still ok.
+        assert!(verify_receipts(&d, &VerifyTrust { allow_unpinned: true, ..Default::default() }).unwrap().ok());
+    }
     #[cfg(feature = "sign")]
     mod signed {
         use super::*;

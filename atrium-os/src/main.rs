@@ -63,7 +63,7 @@ fn cmd_receipt(args: &[String]) -> Result<i32, String> {
         Some(p) => Some(parse_request(&read(&p)?).map_err(|e| format!("{p}: {e}"))?),
         None => None,
     };
-    let mut trust = VerifyTrust { fingerprint: arg(args, "--fingerprint").or_else(|| cfg.pubkey_fingerprint.clone()), ..Default::default() };
+    let mut trust = VerifyTrust { fingerprint: arg(args, "--fingerprint").or_else(|| cfg.pubkey_fingerprint.clone()), unsigned_through: cfg.unsigned_through, ..Default::default() };
     if let Some(p) = arg(args, "--pubkey") { trust.pubkey = Some(std::fs::read(&p).map_err(|e| format!("--pubkey {p}: {e}"))?); }
     trust.allow_unpinned = args.iter().any(|a| a == "--allow-unpinned");
     // A peer's export of what it accepted: proves the chain tail was not cut on this machine.

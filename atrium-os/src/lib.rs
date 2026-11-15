@@ -66,6 +66,10 @@ pub struct OsConfig {
     /// other key (or no key), and `receipt` checks pin to it.
     #[serde(default)]
     pub pubkey_fingerprint: Option<String>,
+    /// Under the pin, allow unsigned receipts up to and including this seq:
+    /// for a chain whose first entries were written before signing was on.
+    #[serde(default)]
+    pub unsigned_through: Option<u64>,
     /// Where the chain head is anchored after each job. Absent: no anchors,
     /// so a cut-off tail of the chain cannot be detected.
     #[serde(default)]
@@ -586,7 +590,7 @@ pub fn verify_receipt(cfg: &OsConfig, rc: &JobReceipt, request: Option<&JobReque
     // The chain is also checked against every anchor this config can see: the
     // newest one signed by the trusted key must be in the file, or the tail was cut.
     let anchors = known_anchors(cfg);
-    let mut with_anchors = VerifyTrust { pubkey: trust.pubkey.clone(), fingerprint: trust.fingerprint.clone(), allow_unpinned: trust.allow_unpinned, anchors: trust.anchors.clone(), pinned_head: trust.pinned_head.clone() };
+    let mut with_anchors = VerifyTrust { pubkey: trust.pubkey.clone(), fingerprint: trust.fingerprint.clone(), allow_unpinned: trust.allow_unpinned, anchors: trust.anchors.clone(), pinned_head: trust.pinned_head.clone(), unsigned_through: trust.unsigned_through };
     with_anchors.anchors.extend(anchors.iter().cloned());
     let trust = &with_anchors;
     if let Some(seq) = rc.anchor_seq {

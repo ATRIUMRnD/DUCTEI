@@ -1010,7 +1010,7 @@ fn chain_reports_once(cfg: &Config, own_kid: Option<&str>) -> Vec<Report> {
     anchors.retain(|a| Some(a.kid.as_str()) == own_kid);
     let n_anchors = anchors.len();
     let top = anchors.iter().map(|a| a.seq).max();
-    let trust = VerifyTrust { pubkey: None, fingerprint: None, allow_unpinned: true, anchors, pinned_head: None };
+    let trust = VerifyTrust { pubkey: None, fingerprint: None, allow_unpinned: true, anchors, pinned_head: None, unsigned_through: None };
     let (ok, detail) = match verify_own_chain(&cfg.state, &trust) {
         Ok(rep) => {
             let ok = rep.ok() && anchor_err.is_none() && (cfg.anchor_files.is_empty() || n_anchors > 0);

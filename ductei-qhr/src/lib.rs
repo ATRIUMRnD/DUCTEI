@@ -347,7 +347,7 @@ pub const VERDICTS: [&str; 6] = ["done", "denied", "needs_approval", "refused", 
 /// the state root; when the caller pinned nothing, it is read from there and
 /// the report carries the gate's "unpinned" warning.
 pub fn verify_state(state: &Path, chain: &str, trust: &ductei_mcp::VerifyTrust) -> Result<ductei_mcp::VerifyReport, String> {
-    let mut t = ductei_mcp::VerifyTrust { pubkey: trust.pubkey.clone(), fingerprint: trust.fingerprint.clone(), allow_unpinned: trust.allow_unpinned, anchors: trust.anchors.clone(), pinned_head: trust.pinned_head.clone() };
+    let mut t = ductei_mcp::VerifyTrust { pubkey: trust.pubkey.clone(), fingerprint: trust.fingerprint.clone(), allow_unpinned: trust.allow_unpinned, anchors: trust.anchors.clone(), pinned_head: trust.pinned_head.clone(), unsigned_through: trust.unsigned_through };
     if t.pubkey.is_none() {
         if let Some((_, pk)) = ductei_mcp::Signer::load_public(state)? {
             if t.fingerprint.is_none() && !t.allow_unpinned {

@@ -25,6 +25,7 @@ fn cfg(d: &Path, persist: bool) -> OsConfig {
         spool: Some(d.join("spool")),
         persist: persist.then(|| PersistCfg { channel: d.join("os").join("ductei"), qallow_relay: None, qallow_cli: None, store: None, out: None }),
         pubkey_fingerprint: None,
+        unsigned_through: None,
         anchor: None,
         llm: false,
         weighter: "uniform".into(),

@@ -27,7 +27,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 const DEFAULT_STATE: &str = r"D:\dev\ductei-qhr-state";
-const USAGE: &str = "usage: qhr verify <state> [--pubkey <file> | --fingerprint <hex> | --allow-unpinned] [--anchor <seq>:<hash>] [--anchor-file <file>]\n       qhr submit <state> --job <job.json> [--spool <dir>] [--approve a,b] [--weighter uniform|evidence]\n       qhr fingerprint <state>\n       qhr prefetch --spool <dir> --request <request.json>";
+const USAGE: &str = "usage: qhr verify <state> [--pubkey <file> | --fingerprint <hex> | --allow-unpinned] [--unsigned-through <seq>] [--anchor <seq>:<hash>] [--anchor-file <file>]\n       qhr submit <state> --job <job.json> [--spool <dir>] [--approve a,b] [--weighter uniform|evidence]\n       qhr fingerprint <state>\n       qhr prefetch --spool <dir> --request <request.json>";
 
 fn cmd_prefetch(args: &[String]) -> Result<i32, String> {
     let spool = arg(args, "--spool").ok_or(USAGE)?;
@@ -57,6 +57,7 @@ fn trust_from(args: &[String]) -> Result<VerifyTrust, String> {
     if let Some(p) = arg(args, "--pubkey") { t.pubkey = Some(std::fs::read(&p).map_err(|e| format!("--pubkey {p}: {e}"))?); }
     if let Some(f) = arg(args, "--fingerprint") { t.fingerprint = Some(f); }
     if args.iter().any(|a| a == "--allow-unpinned") { t.allow_unpinned = true; }
+    if let Some(n) = arg(args, "--unsigned-through") { t.unsigned_through = Some(n.parse().map_err(|_| "--unsigned-through wants a seq number")?); }
     if let Some(a) = arg(args, "--anchor") {
         let (s, h) = a.split_once(':').ok_or("--anchor wants <seq>:<hash>")?;
         t.pinned_head = Some((s.parse().map_err(|_| "--anchor: bad seq")?, h.to_string()));

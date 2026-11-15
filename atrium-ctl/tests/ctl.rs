@@ -56,7 +56,7 @@ fn external_down_then_managed_blocked_then_runs() {
     assert_eq!(st.rooms["free"].health, Health::Down);
     assert!(!s.join("pids.json").exists());
     // The chain verifies with atrium's own scope rule.
-    let trust = VerifyTrust { pubkey: None, fingerprint: None, allow_unpinned: true, anchors: Vec::new(), pinned_head: None };
+    let trust = VerifyTrust { pubkey: None, fingerprint: None, allow_unpinned: true, anchors: Vec::new(), pinned_head: None, unsigned_through: None };
     let rep = verify_own_chain(&s, &trust).unwrap();
     assert!(rep.ok(), "{:?}", rep.errors);
     assert!(rep.receipts >= 5);
@@ -139,7 +139,7 @@ fn queued_verify_runs_beside_live_rooms_and_check_reads_in_parallel() {
     assert!(!req.join("verify-1.running").exists());
     assert_eq!(Status::load(&s).unwrap().rooms["free"].health, Health::Up, "rooms stayed up during verify");
     sup.shutdown().unwrap();
-    let trust = VerifyTrust { pubkey: None, fingerprint: None, allow_unpinned: true, anchors: Vec::new(), pinned_head: None };
+    let trust = VerifyTrust { pubkey: None, fingerprint: None, allow_unpinned: true, anchors: Vec::new(), pinned_head: None, unsigned_through: None };
     let rep = verify_own_chain(&s, &trust).unwrap();
     assert!(rep.ok(), "one writer, clean chain: {:?}", rep.errors);
 }
@@ -160,7 +160,7 @@ fn second_writer_is_refused_by_os_lock_and_repair_is_signed() {
     // Lock is released with the writer; the chain still verifies.
     let again = Supervisor::open(cfg(&s, "", ""));
     assert!(again.is_ok(), "lock released on drop");
-    let trust = VerifyTrust { pubkey: None, fingerprint: None, allow_unpinned: true, anchors: Vec::new(), pinned_head: None };
+    let trust = VerifyTrust { pubkey: None, fingerprint: None, allow_unpinned: true, anchors: Vec::new(), pinned_head: None, unsigned_through: None };
     assert!(verify_own_chain(&s, &trust).unwrap().ok());
 }
 
