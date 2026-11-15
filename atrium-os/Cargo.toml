@@ -1,0 +1,24 @@
+[package]
+name = "atrium-os"
+version = "0.1.0"
+edition = "2021"
+license = "Elastic-2.0"
+publish = false
+description = "ATRIUM OS: the one job door. QHR pre-flight, LIMEN route, signed receipt, Qallow persist, one receipt that verifies"
+
+[features]
+# ML-DSA signing of the QHR receipt chain (same key handling as the gate and QHR).
+sign = ["ductei-qhr/sign"]
+
+[dependencies]
+ductei-qhr = { path = "../ductei-qhr" }
+ductei-router = { path = "../ductei-router" }
+ductei-mcp = { path = "../ductei-mcp" }
+ductei-core = { path = "../ductei-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[[bin]]
+name = "atrium-os"
+path = "src/main.rs"

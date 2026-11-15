@@ -105,6 +105,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "atrium-os"
+version = "0.1.0"
+dependencies = [
+ "ductei-core",
+ "ductei-mcp",
+ "ductei-qhr",
+ "ductei-router",
+ "serde",
+ "serde_json",
+ "toml",
+]
+
+[[package]]
 name = "atrium-spec"
 version = "0.1.0"
 dependencies = [

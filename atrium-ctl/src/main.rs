@@ -22,13 +22,30 @@ use std::time::{Duration, Instant};
 const DRIVE_PROBE: Duration = Duration::from_secs(5);
 
 fn usage() -> ! {
-    eprintln!("usage: atrium up|status|verify|check|down|watchdog <atrium.toml>\n       atrium fleet <atrium.toml> <verb> ...\n{}", atrium_ctl::fleet::USAGE);
+    eprintln!("usage: atrium up|status|verify|check|down|watchdog <atrium.toml>\n       atrium submit <atrium.toml> <job.json> | receipt <atrium.toml> <receipt.json> | os-health <atrium.toml>   (atrium-os)\n       atrium fleet <atrium.toml> <verb> ...\n{}", atrium_ctl::fleet::USAGE);
     std::process::exit(64);
+}
+
+/// The job door lives in atrium-os (its own crate and licence, nothing linked
+/// in here). The front door only hands the verb to the atrium-os binary that
+/// sits next to it and passes its exit code through.
+fn forward_os(a: &[String]) -> i32 {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p.with_file_name(if cfg!(windows) { "atrium-os.exe" } else { "atrium-os" }),
+        Err(e) => { eprintln!("atrium: cannot locate atrium-os: {e}"); return 69; }
+    };
+    let verb = if a[1] == "os-health" { "health" } else { a[1].as_str() };
+    match std::process::Command::new(&exe).arg(verb).args(&a[2..]).status() {
+        Ok(s) => s.code().unwrap_or(70),
+        Err(e) => { eprintln!("atrium: {} did not start: {e}", exe.display()); 69 }
+    }
 }
 
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     if a.len() < 3 { usage(); }
+    // Before Config::load: the OS verbs read only the [os] table of the file they are given.
+    if matches!(a[1].as_str(), "submit" | "receipt" | "os-health") { std::process::exit(forward_os(&a)); }
     let cfg = match Config::load(Path::new(&a[2])) { Ok(c) => c, Err(e) => { eprintln!("atrium: {e}"); std::process::exit(65); } };
     let code = match a[1].as_str() {
         "up" => up(cfg),
