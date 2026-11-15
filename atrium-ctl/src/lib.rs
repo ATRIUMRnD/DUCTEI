@@ -204,6 +204,35 @@ pub fn is_device_lost(e: &std::io::Error) -> bool {
     m.contains("device is not ready") || m.contains("device is not connected") || m.contains("no such device")
 }
 
+// ---------------------------------------------------------------- busy files
+
+/// How long a write waits for a file another program holds open: 40 tries, 50 ms apart.
+pub const BUSY_TRIES: u32 = 40;
+pub const BUSY_WAIT: Duration = Duration::from_millis(50);
+
+/// Another program (a backup copy, antivirus, the indexer) has the file open
+/// without sharing it. Windows: 5 ERROR_ACCESS_DENIED (replacing a file a
+/// reader holds), 32 ERROR_SHARING_VIOLATION, 33 ERROR_LOCK_VIOLATION. These
+/// clear when the other program closes the file, so they are worth waiting for.
+pub fn is_busy(e: &std::io::Error) -> bool {
+    cfg!(windows) && matches!(e.raw_os_error(), Some(5 | 32 | 33))
+}
+
+/// Run one file operation, waiting out a busy file for up to
+/// BUSY_TRIES * BUSY_WAIT (2 s). Any other error returns at once, and a file
+/// that stays busy returns its last error, so the caller still stops loudly.
+pub fn retry_busy<T>(mut op: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    let mut last = None;
+    for _ in 0..BUSY_TRIES {
+        match op() {
+            Ok(v) => return Ok(v),
+            Err(e) if is_busy(&e) => { last = Some(e); std::thread::sleep(BUSY_WAIT); }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last.expect("BUSY_TRIES is at least 1"))
+}
+
 // ---------------------------------------------------------------- peer backoff
 
 /// Per-peer anchor backoff. An unreachable peer (asleep laptop) is skipped
@@ -423,15 +452,11 @@ impl Status {
     pub fn store(&self, state: &Path) -> std::io::Result<()> {
         let tmp = state.join("status.json.tmp");
         let dst = state.join("status.json");
-        fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        let mut last = None;
-        for _ in 0..5 {
-            match fs::rename(&tmp, &dst) {
-                Ok(()) => return Ok(()),
-                Err(e) => { last = Some(e); std::thread::sleep(Duration::from_millis(20)); }
-            }
-        }
-        Err(last.expect("rename attempted"))
+        // A backup or scanner can hold either file for longer than a moment, so both
+        // steps wait out a busy file (see `retry_busy`). The log names the file.
+        let bytes = serde_json::to_vec_pretty(self)?;
+        retry_busy(|| fs::write(&tmp, &bytes)).inspect_err(|e| slog(state, &format!("status.json.tmp could not be written: {e}")))?;
+        retry_busy(|| fs::rename(&tmp, &dst)).inspect_err(|e| slog(state, &format!("status.json could not be replaced: {e}")))
     }
     /// True when another, still-running supervisor wrote this recently.
     /// `supervisor_pid == 0` means the last supervisor shut down cleanly.
@@ -769,7 +794,9 @@ impl Supervisor {
         // Persistence before status: receipts are already fsynced (Durability::default).
         self.status.store(&self.cfg.state)?;
         let pids: BTreeMap<&String, u32> = self.managed.iter().filter_map(|(n, m)| m.child.as_ref().map(|c| (n, c.id()))).collect();
-        fs::write(self.cfg.state.join("pids.json"), serde_json::to_vec(&pids)?)?;
+        let pids_path = self.cfg.state.join("pids.json");
+        let pids_bytes = serde_json::to_vec(&pids)?;
+        retry_busy(|| fs::write(&pids_path, &pids_bytes)).inspect_err(|e| slog(&self.cfg.state, &format!("pids.json could not be written: {e}")))?;
         Ok(written)
     }
 
@@ -1035,6 +1062,69 @@ pub fn slog(state: &Path, msg: &str) {
     eprintln!("{line}");
     if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(state.join("logs").join("atrium.log")) {
         let _ = f.write_all(format!("{line}\n").as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod busy_tests {
+    use super::*;
+
+    fn dir(name: &str) -> PathBuf {
+        let d = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("target").join("test-sandbox").join(format!("busy-{name}-{}-{}", std::process::id(), now_unix()));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn other_errors_return_at_once_and_success_passes_through() {
+        let mut calls = 0;
+        let r: std::io::Result<()> = retry_busy(|| { calls += 1; Err(std::io::Error::from_raw_os_error(112)) });
+        assert!(r.is_err());
+        assert_eq!(calls, 1, "disk full is not a busy file, no waiting");
+        assert_eq!(retry_busy(|| Ok::<_, std::io::Error>(7)).unwrap(), 7);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn a_file_that_stays_busy_fails_after_the_bounded_wait() {
+        let mut calls = 0u32;
+        let t = Instant::now();
+        let r: std::io::Result<()> = retry_busy(|| { calls += 1; Err(std::io::Error::from_raw_os_error(32)) });
+        assert_eq!(r.unwrap_err().raw_os_error(), Some(32));
+        assert_eq!(calls, BUSY_TRIES);
+        assert!(t.elapsed() >= BUSY_WAIT * (BUSY_TRIES - 1));
+    }
+
+    /// The backup case: a copy tool opens status.json and pids.json without sharing
+    /// them while the supervisor ticks. The write must wait, not fail.
+    #[cfg(windows)]
+    #[test]
+    fn status_store_and_plain_write_wait_out_an_exclusive_reader() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let d = dir("reader");
+        Status { tick: 1, ..Default::default() }.store(&d).unwrap();
+        let pids = d.join("pids.json");
+        fs::write(&pids, b"{}").unwrap();
+        for name in ["status.json", "pids.json"] {
+            let p = d.join(name);
+            let (tx, rx) = channel();
+            let holder = std::thread::spawn(move || {
+                let f = fs::OpenOptions::new().read(true).share_mode(0).open(&p).unwrap();
+                tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(400));
+                drop(f);
+            });
+            rx.recv().unwrap();
+            if name == "status.json" {
+                Status { tick: 2, ..Default::default() }.store(&d).unwrap();
+                assert_eq!(Status::load(&d).unwrap().tick, 2);
+            } else {
+                retry_busy(|| fs::write(&pids, b"{\"loop\":1}")).unwrap();
+                assert_eq!(fs::read(&pids).unwrap(), b"{\"loop\":1}");
+            }
+            holder.join().unwrap();
+        }
+        let _ = fs::remove_dir_all(&d);
     }
 }
 
