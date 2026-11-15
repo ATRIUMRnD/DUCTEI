@@ -97,6 +97,19 @@ pub fn shots_to_optimum(p: f64, conf: f64) -> Option<u64> {
     Some(((1.0 - conf).ln() / (1.0 - p).ln()).ceil().max(1.0) as u64)
 }
 
+/// A job id names files in the spool (`pending/{id}.json`, `certs/{id}.json`),
+/// so it must be a plain file stem. Without this check an id such as
+/// `..\..\x` would be joined onto the spool path and written outside it.
+pub fn safe_job_id(id: &str) -> Result<(), String> {
+    const RESERVED: [&str; 22] = ["CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+                                  "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"];
+    let stem = id.split('.').next().unwrap_or("").to_ascii_uppercase();
+    let ok = !id.is_empty() && id.len() <= 96 && !id.starts_with('.')
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !RESERVED.contains(&stem.as_str());
+    if ok { Ok(()) } else { Err(format!("job id {id:?} is not a safe file name: use 1 to 96 of A-Z a-z 0-9 . _ - with no leading dot")) }
+}
+
 /// Mirror of what limend's `_request_from_json` reads. Unknown keys are
 /// rejected here so a typo cannot silently drop a constraint.
 #[derive(Deserialize)]
@@ -126,6 +139,7 @@ impl QpuLane {
 
     /// Returns the variable count after validating the request.
     fn validate(&self, job: &Job) -> Result<usize, String> {
+        safe_job_id(&job.task.id)?;
         let r: Request = serde_json::from_str(&job.payload).map_err(|e| format!("qpu.run payload is not a limend request: {e}"))?;
         if r.qubo.is_empty() { return Err("qubo is empty".into()); }
         let mut vars = std::collections::BTreeSet::new();
@@ -152,6 +166,23 @@ impl QpuLane {
                 .unwrap_or(false)
     }
     fn cache_path(&self, key: &str) -> PathBuf { self.dir("qhr-cache").join(format!("{key}.json")) }
+
+    /// The cert for `id`, wherever it is now. When a ductei-limen-relay tails
+    /// the same spool (the live loop), it archives each cert into certs/sent/
+    /// once it is on the channel, possibly between two reads here. `None`: no
+    /// cert yet. `Some(Err)`: seen but not readable this instant; poll again.
+    fn cert_text(&self, id: &str) -> Option<Result<String, String>> {
+        let name = format!("{id}.json");
+        let mut last = None;
+        for p in [self.dir("certs").join(&name), self.dir("certs").join("sent").join(&name)] {
+            if !p.exists() { continue; }
+            match read_settled(&p) {
+                Ok(t) => return Some(Ok(t)),
+                Err(e) => last = Some(Err(e)),
+            }
+        }
+        last
+    }
     fn prefetch_id(key: &str) -> String { format!("prefetch-{}", &key[..16]) }
 
     /// Spool `payload` now, under a key-derived id, and return without waiting.
@@ -179,8 +210,7 @@ impl QpuLane {
             v["cached"] = true.into();
             return serde_json::to_string(&v).ok();
         }
-        let cert = self.dir("certs").join(format!("{}.json", Self::prefetch_id(key)));
-        let c = CertSummary::from_json(&read_settled(&cert).ok()?).ok()?;
+        let c = CertSummary::from_json(&self.cert_text(&Self::prefetch_id(key))?.ok()?).ok()?;
         let detail = self.detail(&c, r);
         self.store(key, &detail);
         let mut v = detail;
@@ -255,9 +285,8 @@ impl Lane for QpuLane {
             if let Some(hit) = self.cached(k, &req) { return Ok(hit); }
         }
         let pending = self.dir("pending").join(format!("{id}.json"));
-        let cert = self.dir("certs").join(format!("{id}.json"));
         let failed = self.dir("failed").join(format!("{id}.json"));
-        if cert.exists() || failed.exists() || pending.exists() {
+        if self.cert_text(id).is_some() || failed.exists() || pending.exists() {
             return Err(format!("job id {id:?} already exists in the spool; ids must be fresh"));
         }
         // Set job_id inside the request so limend keys its files by it.
@@ -266,8 +295,7 @@ impl Lane for QpuLane {
         publish(&self.dir("pending"), id, &v)?;
 
         loop {
-            if cert.exists() {
-                let text = read_settled(&cert)?;
+            if let Some(Ok(text)) = self.cert_text(id) {
                 let c = CertSummary::from_json(&text).map_err(|e| format!("cert for {id} unreadable: {e}"))?;
                 let detail = self.detail(&c, &req);
                 if let Some(k) = &key { self.store(k, &detail); }

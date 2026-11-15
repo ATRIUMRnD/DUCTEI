@@ -291,3 +291,46 @@ fn brute_force_and_shots_math() {
     assert_eq!(shots_to_optimum(0.5, 0.99), Some(7));
     assert_eq!(shots_to_optimum(0.0, 0.99), None);
 }
+
+#[test]
+fn a_job_id_that_would_escape_the_spool_is_refused_before_anything_is_written() {
+    let d = dir("escape");
+    let mut cfg = QpuConfig::new(d.join("spool")); cfg.est_job_secs = 0;
+    let mut q = open(&d, cfg);
+    // pending/..\..\escaped.json resolves to <d>/escaped.json, outside the spool.
+    for bad in ["..\\..\\escaped", "../../escaped", "a/b", ".hidden", "nul", ""] {
+        let r = q.submit(&qjob(bad, SMOKE_QUBO, 3_000), &[]).unwrap();
+        assert!(matches!(&r.status, Status::Refused(e) if e.contains("not a safe file name")), "{bad:?}: {:?}", r.status);
+    }
+    assert!(!d.join("escaped.json").exists() && !d.join("escaped.json.part").exists(), "nothing may be written outside the spool");
+    assert_eq!(std::fs::read_dir(d.join("spool/pending")).unwrap().count(), 0);
+}
+
+/// The live loop: a ductei-limen-relay on the same spool moves each cert into
+/// certs/sent/ as soon as it is on the channel. The lane must still find it.
+#[test]
+fn a_cert_archived_by_a_relay_on_the_same_spool_is_still_found() {
+    let d = dir("shared");
+    std::fs::create_dir_all(d.join("spool/certs/sent")).unwrap();
+    fake_limend(d.join("spool"), Duration::from_millis(20), None, Duration::from_secs(5));
+    // The relay: archives every cert the moment it sees one.
+    let spool = d.join("spool");
+    std::thread::spawn(move || {
+        let t = Instant::now();
+        while t.elapsed() < Duration::from_secs(5) {
+            for e in std::fs::read_dir(spool.join("certs")).unwrap().filter_map(Result::ok) {
+                let p = e.path();
+                if p.is_file() { let _ = std::fs::rename(&p, spool.join("certs/sent").join(p.file_name().unwrap())); }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+    let mut cfg = QpuConfig::new(d.join("spool")); cfg.est_job_secs = 0;
+    let mut q = open(&d, cfg);
+    let r = q.submit(&qjob("shared1", SMOKE_QUBO, 3_000), &[]).unwrap();
+    assert!(matches!(&r.status, Status::Done(out) if out.contains("statevector")), "{:?}", r.status);
+    // A used id stays used, even though its cert now lives in certs/sent/.
+    assert!(d.join("spool/certs/sent/shared1.json").exists());
+    let again = q.submit(&qjob("shared1", r#"{"qubo":[[["a","a"],-1.0]],"credit_budget":0.0,"fidelity_target":0.9}"#, 3_000), &[]).unwrap();
+    assert!(matches!(&again.status, Status::LaneError(e) if e.contains("ids must be fresh")), "{:?}", again.status);
+}
