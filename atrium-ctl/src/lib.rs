@@ -435,6 +435,10 @@ pub struct Status {
     pub chain_seq: u64,
     pub chain_head: String,
     pub rooms: BTreeMap<String, RoomStatus>,
+    /// Set only when the supervisor stopped itself on a fatal error: why.
+    /// `supervisor_pid == 0` with no reason is a clean `atrium down`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fatal: Option<String>,
 }
 
 impl Status {
@@ -891,7 +895,13 @@ impl Supervisor {
     }
 
     /// Stop every managed child, record it, and leave status marking them down.
-    pub fn shutdown(&mut self) -> std::io::Result<()> {
+    pub fn shutdown(&mut self) -> std::io::Result<()> { self.stop(None) }
+
+    /// Same as `shutdown`, but status keeps the reason, so a crash never reads
+    /// as a deliberate `atrium down` (the watchdog and the pager both act on it).
+    pub fn shutdown_fatal(&mut self, why: &str) -> std::io::Result<()> { self.stop(Some(why)) }
+
+    fn stop(&mut self, fatal: Option<&str>) -> std::io::Result<()> {
         // A verify still in flight is answered, so its caller never hangs.
         if let Some(j) = self.job.take() {
             let dir = self.cfg.state.join("requests");
@@ -906,13 +916,17 @@ impl Supervisor {
                 tree::kill_tree_by_pid(c.id());
                 let _ = c.kill();
                 let _ = c.wait();
-                if let Some(s) = self.status.rooms.get_mut(&n) { s.health = Health::Down; s.pid = None; s.note = "stopped by atrium down".into(); }
+                if let Some(s) = self.status.rooms.get_mut(&n) { s.health = Health::Down; s.pid = None; s.note = if fatal.is_some() { "stopped: the supervisor hit a fatal error".into() } else { "stopped by atrium down".into() }; }
                 let result = serde_json::to_vec(&self.status.rooms[&n])?;
-                self.record(&n, HEARTBEAT_SCOPE, "stopped", n.as_bytes(), &result)?;
+                // On a fatal stop the chain may be the very thing that failed:
+                // keep stopping rooms and still write the fatal mark below.
+                let r = self.record(&n, HEARTBEAT_SCOPE, "stopped", n.as_bytes(), &result);
+                if fatal.is_none() { r?; }
             }
         }
         self.status.unix = now_unix();
         self.status.supervisor_pid = 0;
+        self.status.fatal = fatal.map(str::to_string);
         self.status.store(&self.cfg.state)?;
         let _ = fs::remove_file(self.cfg.state.join("pids.json"));
         // Self-check releases its sender first, or the pusher never drains.

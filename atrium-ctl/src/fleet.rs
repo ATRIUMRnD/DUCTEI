@@ -307,6 +307,8 @@ pub fn external_task(r: &crate::Room) -> Option<String> {
 pub const SUPERVISOR_ROOM: &str = "atrium";
 /// Reason on the supervisor line after a clean `atrium down`.
 pub const STOPPED_ON_PURPOSE: &str = "stopped on purpose (atrium down)";
+/// Start of the reason on the supervisor line after a fatal stop (never "on purpose").
+pub const FATAL_STOP: &str = "stopped on a fatal error";
 /// A new state must hold this long before it is recorded or acted on, so a
 /// one-second restart or a status file caught mid-replace is not news.
 pub const HEAL_CONFIRM_MS: u64 = 2000;
@@ -348,7 +350,10 @@ pub fn health_reports(cfg: &Config, status: Result<&Status, &str>, now_ms: u64, 
     // (supervisor state, reason, seconds since the last status if stalled)
     let (sup_state, sup_reason, stale_s) = match status {
         Err(e) => (spec::HEALTH_DOWN, Some(format!("status unreadable: {e}")), None),
-        Ok(s) if s.supervisor_pid == 0 => (spec::HEALTH_DOWN, Some(STOPPED_ON_PURPOSE.to_string()), None),
+        Ok(s) if s.supervisor_pid == 0 => match &s.fatal {
+            None => (spec::HEALTH_DOWN, Some(STOPPED_ON_PURPOSE.to_string()), None),
+            Some(why) => (spec::HEALTH_DOWN, Some(format!("{FATAL_STOP}: {why}")), None),
+        },
         Ok(s) => {
             // status.json carries whole seconds, so allow the rounding.
             let age_ms = now_ms.saturating_sub(s.unix.saturating_mul(1000));
@@ -942,9 +947,194 @@ impl Fleet {
     }
 }
 
+// ---------------------------------------------------------------- watchdog (outside the supervisor)
+//
+// The bot and its pager are rooms of the supervisor and die with it, and the
+// atrium task never sees a failure (conhost --headless exits 0 whatever the
+// child returns). So `atrium watchdog <config>` is a one-shot pass run every
+// minute by its own scheduled task: when the supervisor is dead and was not
+// stopped on purpose it starts the atrium task, at most WATCHDOG_MAX_STARTS an
+// hour, with one phone line per start and one when it gives up. A clean
+// `atrium down` is left alone, and a stalled but running supervisor stays the
+// pager's job.
+
+pub const WATCHDOG_MAX_STARTS: usize = 3;
+pub const WATCHDOG_WINDOW_MS: u64 = 3_600_000;
+/// Same bar as the pager: silent and gone this long before anything is done.
+pub const WATCHDOG_DEAD_MS: u64 = PAGE_SUPERVISOR_DOWN_MS;
+/// After a start, the supervisor gets this long to come up before the next judgement.
+pub const WATCHDOG_GRACE_MS: u64 = 120_000;
+const WATCHDOG_STATE: &str = "watchdog.json";
+const WATCHDOG_LOG: &str = "watchdog.log";
+const ATRIUM_TASK: &str = "atrium";
+
+/// Kept in `<fleet.dir>/watchdog.json` between passes.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, Deserialize)]
+pub struct WatchdogState {
+    /// When each start in the last hour happened (ms).
+    #[serde(default)]
+    pub starts_ms: Vec<u64>,
+    /// The give-up line was sent; stays quiet until the supervisor is healthy again.
+    #[serde(default)]
+    pub gave_up: bool,
+    /// First pass that could not read status.json in this spell.
+    #[serde(default)]
+    pub unreadable_since_ms: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum WatchAct { Nothing, Start { why: String, n: usize }, GiveUp { why: String } }
+
+/// What one watchdog pass should do. Pure (clock and process check passed in).
+/// `task_running`: the atrium task is still running, so a start would be ignored.
+pub fn watchdog_decide(status: Result<&Status, &str>, now_ms: u64, task_running: bool, alive: &dyn Fn(u32) -> bool, st: &mut WatchdogState) -> WatchAct {
+    st.starts_ms.retain(|t| now_ms.saturating_sub(*t) < WATCHDOG_WINDOW_MS);
+    if status.is_ok() { st.unreadable_since_ms = None; }
+    let dead = match status {
+        // Clean `atrium down`: never restart. A fatal stop: restart.
+        Ok(s) if s.supervisor_pid == 0 => s.fatal.as_ref().map(|w| format!("{FATAL_STOP}: {w}")),
+        Ok(s) => {
+            let age = now_ms.saturating_sub(s.unix.saturating_mul(1000));
+            if age <= WATCHDOG_DEAD_MS { st.gave_up = false; None }
+            else if alive(s.supervisor_pid) { None } // stalled, not dead: the pager's job
+            else { Some(format!("supervisor gone, last status {} s ago", age / 1000)) }
+        }
+        Err(e) => {
+            let since = *st.unreadable_since_ms.get_or_insert(now_ms);
+            (now_ms.saturating_sub(since) >= WATCHDOG_DEAD_MS).then(|| format!("status unreadable: {e}"))
+        }
+    };
+    let Some(why) = dead else { return WatchAct::Nothing };
+    if task_running { return WatchAct::Nothing; }
+    if st.starts_ms.last().is_some_and(|t| now_ms.saturating_sub(*t) < WATCHDOG_GRACE_MS) { return WatchAct::Nothing; }
+    if st.starts_ms.len() >= WATCHDOG_MAX_STARTS {
+        if st.gave_up { return WatchAct::Nothing; }
+        st.gave_up = true;
+        return WatchAct::GiveUp { why };
+    }
+    st.starts_ms.push(now_ms);
+    WatchAct::Start { why, n: st.starts_ms.len() }
+}
+
+impl Fleet {
+    /// One watchdog pass. Exit 0, or 74 when its own state cannot be saved.
+    pub fn watchdog(&self) -> i32 {
+        let _ = fs::create_dir_all(&self.dir);
+        let sp = self.dir.join(WATCHDOG_STATE);
+        let mut st: WatchdogState = fs::read_to_string(&sp).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or_default();
+        let before = st.clone();
+        let status = Status::load(&self.cfg.state);
+        let q = |a: &[&str]| run(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>(), Duration::from_secs(15));
+        let running = q(&["schtasks", "/Query", "/TN", ATRIUM_TASK, "/FO", "CSV", "/NH"]).1.contains("\"Running\"");
+        let act = watchdog_decide(status.as_ref().map_err(String::as_str), now_ms(), running, &crate::pid_alive, &mut st);
+        let text = match &act {
+            WatchAct::Nothing => None,
+            WatchAct::Start { why, n } => {
+                let (c, t) = q(&["schtasks", "/Run", "/TN", ATRIUM_TASK]);
+                Some(if c == 0 { format!("watchdog: supervisor was down ({why}); started the atrium task, try {n} of {WATCHDOG_MAX_STARTS} this hour") }
+                     else { format!("watchdog: supervisor was down ({why}); starting the atrium task FAILED (try {n} of {WATCHDOG_MAX_STARTS}): {}", t.trim()) })
+            }
+            WatchAct::GiveUp { why } => Some(format!("watchdog: supervisor still down ({why}) after {WATCHDOG_MAX_STARTS} starts this hour; giving up until it is healthy again. Start it by hand with fleet up.")),
+        };
+        if let Some(t) = &text {
+            self.watchdog_log(t);
+            match self.fc.telegram_env.as_deref().map(tg_env) {
+                Some(Ok((tok, chat))) => tg_alert(&tok, chat, t, true),
+                Some(Err(e)) => self.watchdog_log(&format!("no phone line: {e}")),
+                None => self.watchdog_log("no phone line: [fleet] telegram_env is not set"),
+            }
+        }
+        if st != before {
+            let bytes = serde_json::to_vec(&st).unwrap_or_default();
+            if let Err(e) = crate::retry_busy(|| fs::write(&sp, &bytes)) { self.watchdog_log(&format!("state not saved: {e}")); return 74; }
+        }
+        0
+    }
+
+    fn watchdog_log(&self, msg: &str) {
+        use std::io::Write;
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(self.dir.join(WATCHDOG_LOG)) {
+            let _ = writeln!(f, "[{}] {msg}", now_unix());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- watchdog: each test kills the supervisor a different way ----
+
+    fn st_at(unix_s: u64, pid: u32, fatal: Option<&str>) -> Status {
+        Status { unix: unix_s, supervisor_pid: pid, fatal: fatal.map(str::to_string), ..Default::default() }
+    }
+
+    #[test]
+    fn watchdog_leaves_a_clean_down_a_healthy_and_a_stalled_supervisor_alone() {
+        let now = 10_000_000u64;
+        let mut w = WatchdogState::default();
+        let clean = st_at(now / 1000 - 600, 0, None);
+        assert_eq!(watchdog_decide(Ok(&clean), now, false, GONE, &mut w), WatchAct::Nothing, "atrium down is never undone");
+        let healthy = st_at(now / 1000, 7, None);
+        assert_eq!(watchdog_decide(Ok(&healthy), now, false, GONE, &mut w), WatchAct::Nothing);
+        let stalled = st_at(now / 1000 - 600, 7, None);
+        assert_eq!(watchdog_decide(Ok(&stalled), now, false, ALIVE, &mut w), WatchAct::Nothing, "stalled is the pager's job");
+        assert!(w.starts_ms.is_empty());
+    }
+
+    #[test]
+    fn watchdog_restarts_a_fatal_stop_three_times_then_gives_up_once() {
+        let mut now = 10_000_000u64;
+        let mut w = WatchdogState::default();
+        let fatal = st_at(now / 1000, 0, Some("tick failed: os error 32"));
+        let WatchAct::Start { why, n } = watchdog_decide(Ok(&fatal), now, false, GONE, &mut w) else { panic!("fatal stop must start") };
+        assert_eq!(n, 1);
+        assert!(why.starts_with(FATAL_STOP) && why.contains("os error 32"), "{why}");
+        // Inside the grace window nothing happens, and a running task is never started twice.
+        assert_eq!(watchdog_decide(Ok(&fatal), now + 60_000, false, GONE, &mut w), WatchAct::Nothing);
+        now += WATCHDOG_GRACE_MS;
+        assert_eq!(watchdog_decide(Ok(&fatal), now, true, GONE, &mut w), WatchAct::Nothing);
+        assert!(matches!(watchdog_decide(Ok(&fatal), now, false, GONE, &mut w), WatchAct::Start { n: 2, .. }));
+        now += WATCHDOG_GRACE_MS;
+        assert!(matches!(watchdog_decide(Ok(&fatal), now, false, GONE, &mut w), WatchAct::Start { n: 3, .. }));
+        now += WATCHDOG_GRACE_MS;
+        assert!(matches!(watchdog_decide(Ok(&fatal), now, false, GONE, &mut w), WatchAct::GiveUp { .. }));
+        assert_eq!(watchdog_decide(Ok(&fatal), now + WATCHDOG_GRACE_MS, false, GONE, &mut w), WatchAct::Nothing, "give-up is said once");
+        // An hour after the first start the window frees a slot, but give-up holds until healthy.
+        now = 10_000_000 + WATCHDOG_WINDOW_MS + 1;
+        assert!(matches!(watchdog_decide(Ok(&fatal), now, false, GONE, &mut w), WatchAct::Start { .. }), "a slot is free again");
+        let healthy = st_at(now / 1000, 9, None);
+        assert_eq!(watchdog_decide(Ok(&healthy), now, false, GONE, &mut w), WatchAct::Nothing);
+        assert!(!w.gave_up, "healthy again resets the give-up");
+    }
+
+    #[test]
+    fn watchdog_restarts_a_crash_that_left_no_mark_and_waits_out_an_unreadable_status() {
+        let now = 10_000_000u64;
+        let mut w = WatchdogState::default();
+        // A panic or kill leaves the old pid in status.json and the process gone.
+        let crashed = st_at(now / 1000 - 90, 7, None);
+        assert!(matches!(watchdog_decide(Ok(&crashed), now, false, GONE, &mut w), WatchAct::Start { n: 1, .. }));
+        // Inside the pager's bar the same status is not dead yet.
+        let mut w = WatchdogState::default();
+        assert_eq!(watchdog_decide(Ok(&st_at(now / 1000 - 30, 7, None)), now, false, GONE, &mut w), WatchAct::Nothing);
+        // Unreadable status counts only after it stays unreadable for the bar.
+        assert_eq!(watchdog_decide(Err("gone"), now, false, GONE, &mut w), WatchAct::Nothing);
+        assert_eq!(watchdog_decide(Err("gone"), now + 30_000, false, GONE, &mut w), WatchAct::Nothing);
+        assert!(matches!(watchdog_decide(Err("gone"), now + WATCHDOG_DEAD_MS, false, GONE, &mut w), WatchAct::Start { .. }));
+    }
+
+    #[test]
+    fn a_fatal_stop_is_never_reported_as_on_purpose() {
+        let cfg = cfg_with(THREE_ROOMS);
+        let s = st_at(1_000_000, 0, Some("tick failed: disk full"));
+        let r = health_reports(&cfg, Ok(&s), 1_000_000_000, ALIVE);
+        let why = r[0].reason.as_deref().unwrap();
+        assert!(why.starts_with(FATAL_STOP) && why.contains("disk full") && why != STOPPED_ON_PURPOSE, "{why}");
+        // Old status files (no `fatal` field) still read as a clean down.
+        let old: Status = serde_json::from_str(r#"{"unix":1,"tick":0,"supervisor_pid":0,"chain_seq":0,"chain_head":"","rooms":{}}"#).unwrap();
+        assert_eq!(health_reports(&cfg, Ok(&old), 1_000_000_000, ALIVE)[0].reason.as_deref(), Some(STOPPED_ON_PURPOSE));
+    }
     #[test]
     fn commands_map_to_the_allowlist_only() {
         assert_eq!(parse_command("/status"), Some(vec!["status".to_string()]));

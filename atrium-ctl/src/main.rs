@@ -9,6 +9,8 @@
 //!                                 with a live supervisor the request is queued to it, so rooms stay up
 //!   atrium check  <atrium.toml>   read-only chain check against peer anchors; safe any time, any count (exit 0/1)
 //!   atrium down   <atrium.toml>   ask the running supervisor to stop its managed rooms and exit
+//!   atrium watchdog <atrium.toml> one pass: start the atrium task if the supervisor died
+//!                                 without `atrium down` (max 3 an hour, one phone line each)
 
 use atrium_ctl::{is_device_lost, now_unix, slog, Config, Health, Status, Supervisor};
 use std::fs;
@@ -20,7 +22,7 @@ use std::time::{Duration, Instant};
 const DRIVE_PROBE: Duration = Duration::from_secs(5);
 
 fn usage() -> ! {
-    eprintln!("usage: atrium up|status|verify|check|down <atrium.toml>\n       atrium fleet <atrium.toml> <verb> ...\n{}", atrium_ctl::fleet::USAGE);
+    eprintln!("usage: atrium up|status|verify|check|down|watchdog <atrium.toml>\n       atrium fleet <atrium.toml> <verb> ...\n{}", atrium_ctl::fleet::USAGE);
     std::process::exit(64);
 }
 
@@ -42,6 +44,8 @@ fn main() {
             }
         }
         "down" => down(&cfg),
+        // One pass, run every minute by its own scheduled task (see fleet::watchdog_decide).
+        "watchdog" => atrium_ctl::fleet::Fleet::new(cfg).watchdog(),
         "fleet" => {
             // fleet `down` re-invokes this binary with the same config.
             std::env::set_var("ATRIUM_CONFIG", &a[2]);
@@ -128,7 +132,7 @@ fn up(cfg: Config) -> i32 {
                 let lost = now_unix().saturating_sub(lost_at);
                 if let Err(e) = sup.record_gap(from_seq, lost, &why) {
                     slog(&state, &format!("gap receipt failed, stopping (chain must not drift): {e}"));
-                    let _ = sup.shutdown();
+                    let _ = sup.shutdown_fatal(&format!("gap receipt failed: {e}"));
                     return 74;
                 }
                 sup.start_selfcheck();
@@ -136,7 +140,7 @@ fn up(cfg: Config) -> i32 {
                 last_all_up = None;
                 continue;
             }
-            Err(e) => { slog(&state, &format!("tick failed, stopping (chain must not drift): {e}")); let _ = sup.shutdown(); return 74; }
+            Err(e) => { slog(&state, &format!("tick failed, stopping (chain must not drift): {e}")); let _ = sup.shutdown_fatal(&format!("tick failed: {e}")); return 74; }
         }
         if stop_file(&state).exists() {
             slog(&state, "down requested");
@@ -154,6 +158,7 @@ fn status(cfg: &Config) -> i32 {
     let s = match Status::load(&cfg.state) { Ok(s) => s, Err(e) => { eprintln!("atrium: no status ({e})"); return 3; } };
     let live = s.live(Duration::from_secs(10));
     println!("supervisor pid {} {} | tick {} | chain seq {} head {}", s.supervisor_pid, if live { "live" } else { "STALE" }, s.tick, s.chain_seq, &s.chain_head[..12.min(s.chain_head.len())]);
+    if let (false, Some(why)) = (live, &s.fatal) { println!("  last stop was FATAL: {why}"); }
     for (n, r) in &s.rooms {
         let h = match r.health { Health::Up => "up", Health::Down => "DOWN", Health::Blocked => "blocked" };
         println!("  {n:<16} {h:<8} pid {:<7} restarts {:<3} {}", r.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()), r.restarts, r.note);
