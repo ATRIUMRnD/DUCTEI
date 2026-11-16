@@ -1,160 +1,152 @@
-# DUCTEI v0.1.0 — channel layer for LIMEN / Qallow / VEYN
+# DUCTEI
 
-Licensed under Apache-2.0 (see `LICENSE`).
+**Governed plumbing for AI agents and the systems they touch.** DUCTEI is a Rust workspace that puts a checked, recorded channel between things that should not trust each other by default: an agent and its tools, one machine and another, a job and the hardware that runs it.
 
-Governance: ownership map, hard invariants, and build order for this
-repo and its siblings (LIMEN, Qallow, VEYN) live in
-[ATRIUM](https://github.com/xingxerx/ATRIUM) — read `AGENTS.md` there
-first.
+Three ideas run through every crate:
 
-Channel, not merger. Per-repo adapters over shared structs.
+- **Deny by default.** Nothing crosses the channel unless a scope policy allows it. A refused call never reaches the other side.
+- **Record before you act.** Every message is written to an append-only, fsynced log before it is acknowledged or forwarded.
+- **Prove it afterwards.** Actions leave hash-chained receipts, optionally signed with a post-quantum signature (ML-DSA), that anyone holding the public key can re-verify.
+
+About 23,000 lines of Rust across 18 crates, with over 370 tests. Built and run by one person.
+
+---
+
+## Start here: the tool-call gate
+
+`ductei-mcp-gate` sits between any MCP (Model Context Protocol) client and any MCP server. The agent keeps working as before, but every tool call now passes a policy and leaves a receipt.
+
+```
+  MCP client  --stdio-->  ductei-mcp-gate  --stdio-->  real MCP server
+  (the agent)                   |
+                                |-- policy          one scope per tool, deny by default
+                                |-- channel.jsonl   call saved before it is forwarded,
+                                |                   result saved before it is returned
+                                |-- denied.jsonl    calls that never reached the server
+                                `-- receipts.jsonl  hash-chained, optionally ML-DSA signed
+```
+
+What that buys you:
+
+- **The server never sees a denied call**, and the agent is never shown a tool it may not use.
+- **The agent never sees a result the gate could not save.**
+- **Every call, result and refusal is one line on a tamper-evident timeline.**
+- **A cut-off log is caught too.** The gate signs its latest position every few receipts and sends that to a second machine, so deleting the end of the log is detectable.
+- **Whoever can write the log folder cannot rewrite history.** The verifier takes its key from you, not from the folder.
+
+```powershell
+cargo build -p ductei-mcp --release --features sign
+```
+
+```powershell
+.\target\release\ductei-mcp-gate.exe verify .\ductei --fingerprint 0000000000000000000000000000000000000000000000000000000000000000
+```
+
+Replace the zeros with the fingerprint the gate prints on its first signed run. Config format, key pinning and anchoring are covered in [ductei-mcp/README.md](ductei-mcp/README.md).
+
+---
+
+## Running in practice
+
+This is not a demo. The author's own machines have run on it daily since October 2026. As of mid November 2026:
+
+- One gate instance has recorded over **150,000 signed receipts** for a live MCP server. The whole chain is re-verified every night against a pinned key.
+- A supervisor (`atrium`) watches seven long-running services and records every state change on its own signed chain, currently over **88,000 receipts**.
+- Both chains are anchored to a second machine that runs a live witness (`atrium-watch`). It raises an alarm on a rollback, a fork, a bad signature or silence.
+- A nightly job takes the stack down, verifies every chain, runs the end-to-end tests and brings it back up. A failed check is a failed night.
+- A job door (`atrium-os`) takes one request through policy, routing, execution and storage, and returns a single receipt that can be checked against the signed chain.
+
+---
 
 ## Design rules
-0. Deny-by-default selective-broadcast scopes, first-class envelope
-   fields, checked at the channel boundary at `send()`. One forbidden
-   scope poisons the whole envelope. Receivers never filter.
-1. Channel-side persistence. Append-only fsynced JSONL log with
-   `replay(cursor)`. Nothing is acked before it is in the log.
-2. Bounded sessions only (`SessionBound`); unbounded unrepresentable.
-3. Causal-delta gate: pre-sync filter on (lamport, node_id) per
-   (key, scope-set). Stale/out-of-order deltas rejected, logged to a
-   JSONL reject log, never applied or re-broadcast. Ties break
-   deterministically by node_id. Gate state rebuilds from the accepted
-   log on restart.
 
-## Hard invariants
-- LIMEN credentials and quantum link traffic never enter payloads.
-  Closed adapter types; serde drops unknown fields (`api_token`,
-  `qpu_instance`) before anything reaches the channel.
-- Byte-level wire compatibility with Qallow `sync_wire.c` (proto v1).
-  Conformance oracle must pass after every change.
+1. **Scopes are deny by default.** They are first-class fields on every envelope, checked at the channel boundary on send. One forbidden scope rejects the whole envelope. Receivers never filter.
+2. **Persistence before acknowledgement.** The log is append-only and fsynced. Nothing is acked before it is in the log.
+3. **Bounded sessions only.** A session without a limit cannot be expressed in the types.
+4. **Stale updates are refused.** An ordering gate rejects out-of-order or repeated updates, logs the refusal, and rebuilds its state from the log after a restart.
+5. **Credentials never enter a payload.** Adapter types are closed. Unknown fields such as API tokens are dropped before anything reaches the channel.
+6. **Nothing fails silently.** A missed deadline, a refused call and a lost peer are outcomes with receipts, the same as a success.
 
-## Crates
-| crate | role |
+---
+
+## What is in the workspace
+
+**Channel and transport**
+
+| Crate | Role |
 |---|---|
-| `ductei-core` | Scope, ScopePolicy, Envelope, LogStore, Channel, SessionBound, `gate` (causal-delta), `transport` (TCP), `grpc` (feature), `quic` (feature), `pq` (feature: ML-KEM-768) |
-| `ductei-limen` | LIMEN cert JSON -> `qallow.semantic.cert` envelopes (closed type) |
-| `ductei-qallow` | Envelope <-> Qallow QSW proto v1/v2 bytes (pure Rust, byte-compatible); `ingest` (Qallow-side merge seam) |
-| `ductei-veyn` | VEYN sensor/actuator events -> scoped envelopes. Narrow deny-by-default scopes (`veyn.rem_event`, `veyn.hrv`, `veyn.sensor.*`, `veyn.actuator.watch`); `Adapter` applies a per-scope `CoalescePolicy` (HRV sampled to 1/min) before conversion so raw firehose stays inside VEYN |
-| `ductei-sync` | Peer sync agent (feature `net`, off by default): `serve` persists peers' envelopes into `inbound/`, `push` ships this node's own envelopes to every peer (full mesh, origin-only, persistence-first ack, IP allow-list). State-dir contract in `ductei-sync/src/lib.rs`. First producer: brain corrections (`scripts/smoke_brain_sync.py`) |
-| `conformance/` | Rust emitter + C verifier linking Qallow's real `sync_wire.c` |
+| `ductei-core` | Scopes, envelopes, the append-only log, the channel, bounded sessions, the ordering gate, TCP transport (gRPC and QUIC behind features) |
+| `ductei-sync` | Peer sync between machines over a mutually authenticated, post-quantum (ML-KEM-768) encrypted link |
+| `ductei-braid` | Three hash-chained ledgers that anchor each other |
 
-## Transport
-TCP, length-prefixed frames (u32 LE len | JSON envelope), matching the
-incremental-decoder pattern, on by default. Vendor-neutral `Transport`
-trait so other transports can slot in behind it. Inbound path per frame:
-scope policy -> causal gate -> fsynced JSONL append -> ack byte.
-Ack is tri-state: 1=applied (new write persisted), 2=stale/already-present
-(receipt success), 0=rejected (scope-denied/malformed; never applied).
-QSW wire translation for
-Qallow ingestion lives in `ductei-qallow` unchanged.
+**Gates and receipts**
 
-Local-first behavior: if a peer is unreachable (connect fails), delivery
-degrades to the local `Channel` (`LocalFallback`). If connect succeeds but a
-later write/read/ack I/O error occurs, there is no LocalFallback (receiver
-persistence is unknown). Record a durable outbound intent and retry the
-identical envelope triple after restart; see `ductei_core::outbox::Outbox`.
-Default Outbox path: `DUCTEI_OUTBOX_PATH` when set, else `$XDG_STATE_HOME/ductei/outbox.jsonl`,
-else `$HOME/.ductei/outbox.jsonl` (created on first use).
+| Crate | Role |
+|---|---|
+| `ductei-mcp` | The tool-call gate for MCP servers, the receipt log and its verifier |
+| `ductei-router` | Task router: policy gate, deterministic tier choice, receipt. It decides and records, and never executes |
+| `ductei-verify` | Fail-closed gate for machine-written code changes: static checks, then build, lint and tests, with a kill switch and a ledger |
 
-Two more `Transport` impls exist behind opt-in Cargo features, same
-persistence-first ack contract, same `Channel` on the receiving side:
-- **`grpc`** (`ductei_core::grpc`): `tonic`, envelope JSON rides unchanged
-  inside a one-RPC proto service (`ChannelService.SendEnvelope`); gRPC
-  supplies framing/multiplexing/TLS only.
-- **`quic`** (`ductei_core::quic`): `quinn` + `rustls`. QUIC requires TLS,
-  so there's no CA here — the server presents a self-signed cert
-  (`generate_self_signed`) that clients pin by DER bytes out-of-band.
+**Runtime**
 
-## Post-quantum transport crypto
-The ML-KEM-768 transport encryption lives in QFLTL's `qfltl-crypto` crate and is used by `ductei-sync --features qfltl` (mutually authenticated, forward-secret handshake; see `ductei-sync/src/qfltl_transport.rs`). The earlier unused `ductei_core::pq` wrapper was removed so the stack has one ML-KEM implementation.
+| Crate | Role |
+|---|---|
+| `atrium-ctl` | Supervisor for long-running services, with a signed heartbeat chain and remote control verbs |
+| `atrium-os` | The job door: one request in, one verifiable receipt out |
+| `atrium-watch` | Live witness that runs on a second machine and alarms on tampering or silence |
+| `ductei-qhr`, `qhr-sched`, `qhr-cell` | Local job runtime: pre-flight checks, deadlines, speculative branches with a verified commit |
+| `ductei-agent` | Small agent loop where an idle agent is only its history on disk, and each turn is saved before a tool is dispatched |
 
-## QSW proto v2
-`ductei_qallow::v2`: scopes as a length-prefixed native wire field instead
-of v1's comma-joined key-prefix shim (which corrupts a scope name
-containing a comma). Lives alongside v1 unchanged — v1 stays byte-compatible
-with Qallow's real `sync_wire.c` and keeps passing the conformance oracle;
-the C-side counterpart (`qsw_decode_v2` / `qsw_decode_v2_envelope_body`,
-`QSW_PROTO_VER_V2 = 2`) now exists in Qallow's `sync_wire.c` (ATRIUM
-harness-roadmap/05). The conformance job verifies a Rust-emitted v2 stream
-through the real C decoder, including a comma inside a scope name.
-`qallow ingest` auto-negotiates the version and rebuilds the v1 shim key
-(`scopes.join(",") + "|" + key`) for merge, so a record lands under the
-same LMDB key regardless of proto version.
+**Adapters and tools**
 
-## Qallow-side ingestion (real, and gated)
-`ductei-qallow-relay` hands QSW v1 frames to a real `qallow ingest`
-process, which calls Qallow's `ql_persist_merge_blob()` into LMDB
-(Qallow@0a546b3 onward). Since Qallow@2b0009e (ATRIUM Task 4) that gate
-is kernel-level: it refuses, before any write, an envelope with
-`schema_ver < 2`, an open/broadcast scope, a zero session id or bound,
-a reserved key prefix (`env/ cred/ secret/ token/ password/`), or a
-malformed payload. `ductei_qallow::persist` is DUCTEI's side of that
-contract: `for_persist()` re-frames an accepted envelope with
-`schema_ver = 2` and wraps its blob in the persist-v2 header
-(`u16 ver=2 | u16 scope_code | u64 session_id | u64 session_bound |
-u32 data_len | data`). The relay's bounded session
-(`max_envelopes = 1`) is what gets written as `session_bound`, so
-invariant 5 is an on-disk fact, not a relay promise. `qallow get`
-returns only `data`, so readers see the producer's bytes unchanged.
-The QSW v1 wire frame itself is untouched and still passes the
-conformance oracle. `ductei_qallow::ingest` (the `QallowSink` seam and
-`MemorySink`) remains for DUCTEI's own tests.
+| Crate | Role |
+|---|---|
+| `ductei-limen` | Carries quantum job certificates from [LIMEN](https://github.com/xingxerx/LIMEN) as scoped envelopes |
+| `ductei-qallow` | Byte-compatible wire format for the Qallow C store, with a gated ingest path |
+| `ductei-veyn` | Sensor and actuator events as narrowly scoped envelopes |
+| `atrium-spec` | Contract compiler: one spec file emits matching Rust, C and Python types, so a renamed field fails the build instead of the nightly run |
+| `qsw-inspect` | Decode and diff the wire format from the command line |
 
-## One app: the closed loop
-`scripts/smoke_loop.py` runs the whole ecosystem as one loop with one
-shared LMDB store: VEYN REM cue -> `DucteiBridge` -> ductei-qallow-relay
--> LMDB -> `qallow propose` (Qallow reads the cue from durable state and
-writes a LIMEN route request) -> limend -> ductei-limen-relay ->
-ductei-qallow-relay -> the same LMDB. Four scenarios, 41 checks, five
-invariants asserted inline; CI job `e2e-smoke-loop`.
-`scripts/atrium_up.py` runs the same loop as long-lived processes from
-one command (optionally booting the real VEYN daemon and firing a
-watch-shaped `/oneiro/watch` OSC cue).
+---
 
-## Test status (2026-07-13)
-- `cargo test --workspace`: 16/16 pass (default features: TCP transport only)
-  - v0.1.1 suite: scope deny-by-default, poisoned envelope, restart
-    survival, credential drop, unbounded-session unrepresentable,
-    session bound enforced with exit always available
-  - Build 0: in-order accept / stale reject, tie-break determinism,
-    replay-after-restart consistency
-  - Build 1: two-node loopback (accept, stale nack, scope-denied nack,
-    persistence-first ack)
-  - Build 2: synthetic OSC/EEG event -> VEYN adapter -> gate ->
-    transport -> second node log -> QSW bytes roundtrip intact, then
-    through the Qallow ingestion seam (`ingest_envelope` -> `MemorySink`)
-  - QSW proto v2: multi-scope roundtrip, comma-in-scope-name survival
-  - Phase 3: REM/HRV get narrow scopes (`veyn.rem_event`, `veyn.hrv`)
-    distinct from the broader per-source scopes; simulated 1 Hz HRV
-    stream coalesced to 1/min by `Adapter`; simulated high-frequency
-    REM triggers pass through uncoalesced (discrete events, not sampled)
-- `cargo test --workspace --all-features`: 19/19 pass, adding:
-  - gRPC two-node loopback (accept, scope-denied nack) over `tonic`
-  - QUIC two-node loopback (accept, scope-denied nack) over `quinn`,
-    self-signed cert pinned by DER bytes
-  - ML-KEM-768 encapsulate/decapsulate shared-secret agreement
-- Conformance oracle: PASS (Qallow's C `qsw_decode()` fed one byte at a
-  time accepts the Rust HELLO/HELLO_ACK/ENVELOPE/BATCH_END/BYE stream) —
-  unaffected by any of the above; v1 encode/decode functions untouched
+## How it is checked
 
-## Run conformance
-```
-cargo build -p conformance-emitter
-./target/debug/emit /tmp/stream.bin
-gcc -I<qallow>/include -o conformance/verify conformance/verify.c <qallow>/src/mind/sync_wire.c
-./conformance/verify /tmp/stream.bin
+- **Unit and integration tests** across the workspace: `cargo test --workspace`.
+- **Four end-to-end jobs in CI**, including a closed loop that runs a sensor event through the channel, a C datastore, a quantum routing daemon and back.
+- **Model checking.** Nine [Kani](https://github.com/model-checking/kani) proof harnesses cover the core channel and the wire format.
+- **A conformance oracle.** The Rust encoder's output is fed one byte at a time through the real C decoder it must interoperate with.
+- **The nightly run described above**, against live data rather than fixtures.
+
+```powershell
+cargo test --workspace
 ```
 
-## Known gaps
-- Outside DUCTEI, blocking the full loop: the LIMEN README patch is
-  unapplied, and ML-KEM has no evaluated LIMEN-side counterpart yet
-  (DUCTEI's own `pq` feature adds ML-KEM-768 for transport key exchange,
-  independent of that).
+```powershell
+cargo clippy --workspace --all-targets -- -D warnings
+```
 
-## Roadmap
-- QSW proto v2 adoption on the Qallow side — DONE locally (C decoder +
-  ingest negotiation + merge-key parity; ATRIUM harness-roadmap/05);
-  CI step lands with this repo's commit, after Qallow's
-- gRPC/QUIC used as the default transport for cross-network peers once a
-  peer-provisioning story (cert distribution, service discovery) exists
+---
+
+## What this does not claim
+
+- **A receipt proves integrity, order and authorship.** It does not prove the tool did the right thing.
+- **Anchoring needs the second machine to be online.** While it is off, anchors queue and catch up later, and a cut log is not detectable for that window.
+- **One maintainer, one deployment.** It has not been load tested or independently audited.
+- **The operations tooling is Windows first.** The core crates are portable and CI runs on Linux.
+- **gRPC and QUIC transports are opt-in** and have seen less use than TCP.
+
+---
+
+## More detail
+
+- Transport, wire format versions, the C ingest contract and the closed loop: [docs/DESIGN.md](docs/DESIGN.md)
+- The tool-call gate: [ductei-mcp/README.md](ductei-mcp/README.md)
+- Reporting a vulnerability: [SECURITY.md](SECURITY.md)
+
+## License
+
+Apache-2.0 (see [LICENSE](LICENSE)), except `atrium-os`, which is under the Elastic License 2.0.
+
+---
+
+*DUCTEI, pronounced DUCK-tay: from Latin ductus and Greek eimai, "the channel that persists".*
