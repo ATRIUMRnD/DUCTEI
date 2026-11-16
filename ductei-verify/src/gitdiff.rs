@@ -21,7 +21,12 @@ fn git(wt: &str, args: &[&str]) -> Result<String, String> {
 }
 
 fn change(wt: &str, rel: &str, kind: ChangeKind) -> Result<Change, String> {
-    let path = format!("{}\\{}", wt.trim_end_matches(['\\', '/']), rel.replace('/', "\\"));
+    // Join with the platform's own separator: a hard-coded backslash only works on Windows.
+    let mut joined = std::path::PathBuf::from(wt.trim_end_matches(['\\', '/']));
+    for part in rel.split('/') {
+        joined.push(part);
+    }
+    let path = joined.to_string_lossy().into_owned();
     let content = if kind == ChangeKind::Delete {
         String::new()
     } else {
