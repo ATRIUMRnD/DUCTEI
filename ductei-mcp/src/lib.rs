@@ -1680,7 +1680,7 @@ mod tests {
     #[test]
     fn anchor_peers_must_be_tailnet_or_loopback() {
         let ok = ["127.0.0.1:1", "100.64.0.1:1", "100.127.255.254:1", "[::1]:1", "[fd7a:115c:a1e0::1]:1"];
-        let bad = ["100.128.0.1:1", "8.8.8.8:1", "192.168.1.5:1", "[2001:db8::1]:1"];
+        let bad = ["100.128.0.1:1", "8.8.8.8:1", "192.168.0.5:1", "[2001:db8::1]:1"];
         for a in ok { assert!(peer_allowed(&a.parse().unwrap()), "{a}"); }
         for a in bad { assert!(!peer_allowed(&a.parse().unwrap()), "{a}"); }
         let env = scoped("k", &["s"], [0; 16], 0, b"x");

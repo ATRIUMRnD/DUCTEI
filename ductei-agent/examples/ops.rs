@@ -42,7 +42,7 @@ fn brain_specs() -> Result<Vec<ollama::Spec>, String> {
     if let Ok(s) = std::fs::read_to_string(BRAINS_FILE) {
         return ollama::parse_specs(&s).map_err(|e| format!("{BRAINS_FILE}: {e}"));
     }
-    let base = std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://100.106.147.75:11434".into());
+    let base = std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:11434".into());
     let model = std::env::var("ATRIUM_AGENT_MODEL").unwrap_or_else(|_| "gpt-oss:20b".into());
     ollama::parse_specs(&format!("ollama|{base}|{model}"))
 }

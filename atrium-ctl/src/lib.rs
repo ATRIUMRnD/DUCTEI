@@ -1194,10 +1194,10 @@ mod backoff_tests {
     #[test]
     fn each_peer_gets_its_own_outbox() {
         let s = Path::new("D:/x");
-        let a = peer_outbox(s, "100.111.252.86:7421");
-        let b = peer_outbox(s, "100.121.3.55:7421");
+        let a = peer_outbox(s, "100.64.0.11:7421");
+        let b = peer_outbox(s, "100.64.0.12:7421");
         assert_ne!(a, b);
-        assert_eq!(a, Path::new("D:/x").join("anchor-outbox-100_111_252_86_7421.jsonl"));
+        assert_eq!(a, Path::new("D:/x").join("anchor-outbox-100_64_0_11_7421.jsonl"));
     }
 
     #[test]

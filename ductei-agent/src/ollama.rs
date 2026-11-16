@@ -289,7 +289,7 @@ fn post(url: &str, body: &str, timeout_s: u64) -> Result<Value, String> {
 // ---------- Ollama ----------
 
 pub struct Ollama {
-    /// e.g. http://100.106.147.75:11434
+    /// e.g. http://100.64.0.10:11434
     pub base: String,
     pub model: String,
     pub charter: String,
@@ -675,14 +675,14 @@ mod tests {
 
     #[test]
     fn specs_parse_and_refuse_off_tailnet_hosts() {
-        let s = parse_specs("# comment\nollama|http://100.106.147.75:11434|atrium-ops\nlmstudio|http://127.0.0.1:1234|atrium-ops|lmstudio-community/Qwen2.5-14B-Instruct-GGUF;ollama|http://100.106.147.75:11434|gpt-oss:20b").unwrap();
+        let s = parse_specs("# comment\nollama|http://100.64.0.10:11434|atrium-ops\nlmstudio|http://127.0.0.1:1234|atrium-ops|lmstudio-community/Qwen2.5-14B-Instruct-GGUF;ollama|http://100.64.0.10:11434|gpt-oss:20b").unwrap();
         assert_eq!(s.len(), 3);
         assert_eq!(s[1].kind, Kind::LmStudio);
         assert_eq!(s[1].lms_load.as_deref(), Some("lmstudio-community/Qwen2.5-14B-Instruct-GGUF"));
         assert!(parse_specs("ollama|http://8.8.8.8:11434|m").is_err());
-        assert!(parse_specs("ollama|https://100.106.147.75:11434|m").is_err());
+        assert!(parse_specs("ollama|https://100.64.0.10:11434|m").is_err());
         assert!(parse_specs("ollama|http://100.200.1.1:11434|m").is_err());
-        assert!(parse_specs("ollama|http://100.106.147.75.evil.com|m").is_err());
+        assert!(parse_specs("ollama|http://100.64.0.10.evil.com|m").is_err());
         assert!(parse_specs("mystery|http://127.0.0.1:1|m").is_err());
         assert!(parse_specs("# nothing").is_err());
     }

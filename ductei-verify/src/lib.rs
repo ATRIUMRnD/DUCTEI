@@ -261,8 +261,8 @@ mod tests {
     #[test]
     fn c_drive_is_rejected_before_any_build() {
         let mut c = cand();
-        c.worktree = r"C:\Users\xing\x".into();
-        c.changes[0].path = r"C:\Users\xing\x\src\lib.rs".into();
+        c.worktree = r"C:\Users\dev\x".into();
+        c.changes[0].path = r"C:\Users\dev\x\src\lib.rs".into();
         let (v, m) = run(&policy("cdrive"), &c);
         assert!(!v.accepted && has(&v, "forbidden prefix"));
         assert!(m.calls.is_empty());

@@ -113,8 +113,8 @@ mod tests {
     #[test] fn commit_push_and_c_write_detected() {
         let e = shell_effects(r#"git add . && git commit -m "x" && git push origin main"#);
         assert!(e.contains(&Effect::Commit) && e.contains(&Effect::Push));
-        let e = shell_effects(r#"Set-Content C:\Users\xing\a.txt "hi""#);
-        assert_eq!(e, vec![Effect::Write(PathBuf::from(r"C:\Users\xing\a.txt"))]);
+        let e = shell_effects(r#"Set-Content C:\Users\dev\a.txt "hi""#);
+        assert_eq!(e, vec![Effect::Write(PathBuf::from(r"C:\Users\dev\a.txt"))]);
         assert!(matches!(Canon::default().check(&Task { id: "t".into(), intent: "".into(), kind: Kind::Code, criticality: 1, private: false, effects: e }, &[]), Verdict::Deny(_)));
     }
     #[test] fn wsl_path_maps_to_drive_and_plain_read_passes() {

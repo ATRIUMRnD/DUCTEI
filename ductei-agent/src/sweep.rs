@@ -283,8 +283,8 @@ mod tests {
         assert!(final_report(Ok("  ".into()), &res).contains("fleet_alarms: none"));
         let e = final_report(Err("gpt-oss:20b returned an empty answer twice".into()), &res);
         assert!(e.starts_with("LLM gave no report") && e.contains("fleet_alarms: none"), "{e}");
-        let o = offline_report("http://100.106.147.75:11434", &res);
-        assert!(o.starts_with("LLM offline (http://100.106.147.75:11434), raw report:\n"), "{o}");
+        let o = offline_report("http://100.64.0.10:11434", &res);
+        assert!(o.starts_with("LLM offline (http://100.64.0.10:11434), raw report:\n"), "{o}");
     }
 
     #[test]
