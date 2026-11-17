@@ -158,8 +158,15 @@ fn second_writer_is_refused_by_os_lock_and_repair_is_signed() {
     assert_eq!(h, sha256_hex(b"quarantined line\n"));
     drop(first);
     // Lock is released with the writer; the chain still verifies.
-    let again = Supervisor::open(cfg(&s, "", ""));
-    assert!(again.is_ok(), "lock released on drop");
+    // On Unix, a child process that another test is starting at this moment can hold a
+    // copy of the lock for an instant (between fork and exec), so allow a short wait.
+    let mut again = Supervisor::open(cfg(&s, "", ""));
+    for _ in 0..40 {
+        if again.is_ok() { break; }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        again = Supervisor::open(cfg(&s, "", ""));
+    }
+    if let Err(e) = &again { panic!("lock released on drop, but reopen failed: {e}"); }
     let trust = VerifyTrust { pubkey: None, fingerprint: None, allow_unpinned: true, anchors: Vec::new(), pinned_head: None, unsigned_through: None };
     assert!(verify_own_chain(&s, &trust).unwrap().ok());
 }
