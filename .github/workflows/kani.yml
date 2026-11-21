@@ -12,11 +12,11 @@ jobs:
   # (ATRIUM INVARIANTS.md, N1 and N2). Kani is Linux/macOS only, so it runs
   # here and not on the Windows machines.
   #
-  # Not a required check until it has gone green once: the harnesses have
-  # not been run under Kani in CI before.
+  # Each harness runs on its own so the log shows which one is slow or
+  # failing. Not a required check until it has gone green once.
   prove:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -37,4 +37,39 @@ jobs:
           cargo install --locked kani-verifier
           cargo kani setup
       - name: prove ductei-core invariants
-        run: cargo kani -p ductei-core --features net
+        run: |
+          for h in scope_policy_is_deny_by_default session_budget_admit_respects_bounds session_budget_sequence_never_exceeds_bound ack_applied_only_after_accept; do
+            echo "::group::$h"
+            cargo kani -p ductei-core --features net --harness "$h"
+            echo "::endgroup::"
+          done
+
+  # The base64 round-trip harness is an encoding check, not one of the hard
+  # invariants. Under Kani it ran for the full 45 minutes without finishing
+  # in four CI runs (Nov 2026), which cancelled the invariant proofs with it.
+  # It runs here on its own and does not fail the workflow until it has been
+  # made to finish. It is NOT proven yet; the sampled test in ci.yml still
+  # covers it with 20,000 random inputs.
+  prove-encoding:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      - name: allow cargo to fetch private QFLTL deps
+        env:
+          QFLTL_READ_TOKEN: ${{ secrets.QFLTL_READ_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/QFLTL".insteadOf https://github.com/xingxerx/QFLTL
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/universal-clock".insteadOf https://github.com/xingxerx/universal-clock
+      - name: install Kani
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+      - name: try the base64 round-trip harness
+        run: cargo kani -p ductei-core --features net --harness blob_base64_round_trips
