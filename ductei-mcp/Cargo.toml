@@ -24,7 +24,9 @@ sha2 = "0.10"
 getrandom = "0.2"
 zeroize = "1"
 ductei-sync = { path = "../ductei-sync", features = ["qfltl"], optional = true }
-pqcrypto-mldsa = { version = "0.1", optional = true }
+# avx2 is left off on purpose: RUSTSEC-2026-0586 (the AVX2 verifier accepts signatures
+# FIPS 204 rejects on x86_64 Linux and macOS). The reference path is used instead.
+pqcrypto-mldsa = { version = "0.1", optional = true, default-features = false, features = ["std", "neon"] }
 pqcrypto-traits = { version = "0.3", optional = true }
 
 [target.'cfg(windows)'.dependencies]
