@@ -1,0 +1,21 @@
+[package]
+name = "atrium-watch"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "atrium-watch: live witness on an anchor peer; alarms within seconds on rollback, fork, bad signature, unknown signer or silence"
+
+[features]
+default = ["sign"]
+sign = ["ductei-mcp/sign"]
+
+[dependencies]
+ductei-mcp = { path = "../ductei-mcp" }
+ductei-core = { path = "../ductei-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+[[bin]]
+name = "atrium-watch"
+path = "src/main.rs"

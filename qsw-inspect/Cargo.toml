@@ -1,0 +1,14 @@
+[package]
+name = "qsw-inspect"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Field-level decoder and differ for QSW (Qallow Sync Wire) v1/v2 streams"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ductei-qallow = { path = "../ductei-qallow" }
+
+[dev-dependencies]
+ductei-core = { path = "../ductei-core" }

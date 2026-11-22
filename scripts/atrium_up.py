@@ -33,7 +33,7 @@ idempotent by job id anyway.
 Cues:
   --inject          push one REM cue through the exact production
                     DucteiBridge path (ductei_bridge_smoke) at startup
-  --osc-cue         send an Øneiro-shaped /oneiro/watch OSC packet
+  --osc-cue         send a watch-shaped /oneiro/watch OSC packet
                     (stage "REM") to the VEYN daemon's OSC port; needs
                     --veyn-daemon
 
@@ -98,20 +98,66 @@ def send_osc_cue(port: int, device_id: str) -> None:
 
 # --- Proposer ---------------------------------------------------------------
 class Proposer:
-    def __init__(self, qallow: Path, store: Path, spool: Path, veyn_log: Path, state_dir: Path):
+    def __init__(self, qallow: Path, store: Path, spool: Path, veyn_log: Path, state_dir: Path,
+                 max_online: int = 0):
         self.qallow, self.store, self.spool, self.veyn_log = qallow, store, spool, veyn_log
         self.cursor_file = state_dir / "propose-cursor"
         self.cursor = int(self.cursor_file.read_text().strip()) if self.cursor_file.exists() else 0
         self.retry: dict[str, int] = {}
+        # Hardware spend cap: at most max_online cues are proposed with
+        # --online over the life of this root (persisted, so a restart
+        # never resets it). Everything past the cap stays offline.
+        self.max_online = max_online
+        self.online_file = state_dir / "online-used"
+        self.online_used = int(self.online_file.read_text().strip()) if self.online_file.exists() else 0
+        # Byte offset of entry number `cursor` in the log; found on the first tick.
+        self._off: int | None = None
+
+    def _new_entries(self):
+        """Yield (end_offset, entry) for each entry from `cursor` on.
+
+        Reads only the bytes appended since the last tick. The log is
+        append-only and grows without bound, so parsing all of it every
+        tick cost more the longer the loop ran.
+        """
+        if not self.veyn_log.exists():
+            return
+        with self.veyn_log.open("rb") as f:
+            if self._off is None or self._off > os.fstat(f.fileno()).st_size:
+                # First tick, or the log was replaced: walk to the cursor once.
+                off, seen = 0, 0
+                while seen < self.cursor:
+                    line = f.readline()
+                    if not line.endswith(b"\n"):
+                        break
+                    off = f.tell()
+                    if line.strip():
+                        seen += 1
+                if seen < self.cursor:
+                    return  # log is shorter than the cursor: nothing new yet
+                self._off = off
+            f.seek(self._off)
+            while True:
+                line = f.readline()
+                if not line.endswith(b"\n"):
+                    return  # end of file, or a line still being written
+                end = f.tell()
+                if line.strip():
+                    yield end, json.loads(line)
 
     def tick(self) -> None:
-        entries = read_jsonl(self.veyn_log)
-        for i in range(self.cursor, len(entries)):
-            e = entries[i]
+        for end, e in self._new_entries():
             if e.get("scopes") == [REM_SCOPE]:
                 key = f"{REM_SCOPE}|{e['key']}"
-                r = subprocess.run([str(self.qallow), "propose", str(self.store), key, str(self.spool)],
-                                   capture_output=True, text=True)
+                online = self.online_used < self.max_online
+                cmd = [str(self.qallow), "propose", str(self.store), key, str(self.spool)]
+                if online:
+                    cmd.append("--online")
+                r = subprocess.run(cmd, capture_output=True, text=True)
+                if r.returncode == 0 and online and r.stdout.startswith("proposed:"):
+                    self.online_used += 1
+                    self.online_file.write_text(str(self.online_used))
+                    log(f"hardware proposal {self.online_used}/{self.max_online} (limend env holds the token)")
                 if r.returncode != 0:
                     # Not persisted yet (VEYN hop still in flight): retry next tick, keep the cursor here.
                     n = self.retry.get(key, 0) + 1
@@ -120,7 +166,8 @@ class Proposer:
                         log(f"propose deferred ({n}x): {r.stderr.strip() or r.stdout.strip()}")
                     return
                 log(r.stdout.strip())
-            self.cursor = i + 1
+            self.cursor += 1
+            self._off = end
             self.cursor_file.write_text(str(self.cursor))
 
 
@@ -201,6 +248,11 @@ def main() -> int:
     ap.add_argument("--veyn-port", type=int, default=7700)
     ap.add_argument("--poll-ms", type=int, default=1000)
     ap.add_argument("--once", action="store_true", help="run every hop once in order, then exit (no daemons)")
+    ap.add_argument("--online", action="store_true",
+                    help="propose REM cues with offline:false so limend may route to real hardware "
+                         "(token from limend's env only); capped by --max-online-jobs")
+    ap.add_argument("--max-online-jobs", type=int, default=1,
+                    help="hardware proposals allowed for this --root, persisted across restarts (default 1)")
     args = ap.parse_args()
 
     ductei_root = Path(__file__).resolve().parent.parent
@@ -239,7 +291,16 @@ def main() -> int:
         subprocess.run([str(smoke_bin), str(veyn / "accepted.jsonl"), str(veyn / "rejected.jsonl"), str(f)], check=True)
         log(f"injected REM cue from {device} through DucteiBridge")
 
-    proposer = Proposer(args.qallow_cli, store, spool, veyn / "accepted.jsonl", root / "state")
+    max_online = args.max_online_jobs if args.online else 0
+    if args.online:
+        has_token = os.environ.get("LIMEN_QPU_TOKEN") or os.environ.get("IBM_QUANTUM_TOKEN")
+        has_crn = os.environ.get("LIMEN_QPU_INSTANCE") or os.environ.get("IBM_QUANTUM_CRN")
+        if not (has_token and has_crn):
+            print("--online needs LIMEN_QPU_TOKEN and LIMEN_QPU_INSTANCE in this shell's env; nothing started")
+            return 2
+        log(f"online mode: up to {max_online} hardware proposal(s) for this root, rest offline")
+    proposer = Proposer(args.qallow_cli, store, spool, veyn / "accepted.jsonl", root / "state",
+                        max_online=max_online)
     limend_env = dict(os.environ)
 
     if args.once:

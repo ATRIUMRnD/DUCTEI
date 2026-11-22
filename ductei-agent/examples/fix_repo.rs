@@ -1,0 +1,440 @@
+//! fix_repo: the fix_brain loop for any listed Rust repo. Runs after the hourly sweep.
+//!
+//! Repos come from D:\ATRIUM\ops\agent\fix-repos.txt, one per line: `name|D:\path\to\repo`.
+//! The repo's git root must also be its cargo root (Cargo.toml at the top). For each repo:
+//! 1. Scratch worktree at HEAD under D:\ATRIUM\ops\atrium-state\fix (real checkout untouched;
+//!    not under D:\ATRIUM\private, where Controlled Folder Access blocks cargo and rustc).
+//!    The path is the same every run (`fix\<name>`), so cargo's build cache stays warm.
+//! 2. cargo test there. All green: take the next open task for this repo from
+//!    D:\ATRIUM\ops\agent\tasks.txt (same gate, same patch flow), else report and move on.
+//! 3. First failing test: rerun it alone. Passing alone = flaky, so it is reported and the
+//!    task queue is used instead. Still failing: find its file, ask the brain chain for a
+//!    whole replacement file.
+//! 4. Gate with ductei-verify check-git (fail closed).
+//! 5. Accepted: write a .patch to atrium-state\agent\fixes and one outbox line for the phone.
+//!    Rejected or any error: one outbox line saying why. The worktree is always removed.
+//!
+//! Never commits, never pushes, never edits the real repo. Every child process runs hidden,
+//! and scratch output stays on D: (never the system temp folder).
+
+use ductei_agent::fix::{
+    defines_fn, extract_file, failing_tests, failure_text, next_task, parse_tasks, patch_header, patch_id, precheck, prompt, stem,
+    task_precheck, task_prompt, test_fn, Task,
+};
+use ductei_agent::ollama::{build_chain, parse_specs, report};
+use ductei_agent::{Entry, Model, ModelOut};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+const REPOS: &str = r"D:\ATRIUM\ops\agent\fix-repos.txt";
+const WT_ROOT: &str = r"D:\ATRIUM\ops\atrium-state\fix";
+const TARGET: &str = r"D:\ATRIUM\ops\atrium-state\fix\target";
+const VERIFY: &str = r"D:\ATRIUM\DUCTEI\target\release\ductei-verify.exe";
+const POLICY: &str = r"D:\ATRIUM\ops\agent\fix-verify.toml";
+const FIXES: &str = r"D:\ATRIUM\ops\atrium-state\agent\fixes";
+const OUTBOX: &str = r"D:\ATRIUM\ops\atrium-state\agent\outbox.jsonl";
+const BRAINS: &str = r"D:\ATRIUM\ops\agent\brains.txt";
+const STOP: &str = r"D:\ATRIUM\private\verify\STOP";
+const TASKS: &str = r"D:\ATRIUM\ops\agent\tasks.txt";
+const TASK_LOG: &str = r"D:\ATRIUM\ops\atrium-state\agent\tasks-state.txt";
+/// The first run after a cold cache rebuilds the whole workspace; later runs are incremental.
+const TEST_TIMEOUT: Duration = Duration::from_secs(1800);
+/// The model must send the whole file back inside its output budget (ollama::NUM_PREDICT
+/// tokens), so a file much bigger than this comes back cut off.
+const MAX_SRC: usize = 30_000;
+const MAX_REPOS: usize = 8;
+
+struct Repo {
+    name: String,
+    path: String,
+}
+
+/// Parse `name|path` lines; `#` comments and blanks are skipped. Names are short and file-safe,
+/// paths must be absolute D: paths with no `..`.
+fn parse_repos(text: &str) -> Result<Vec<Repo>, String> {
+    let mut out = Vec::new();
+    for (i, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let (name, path) = line.split_once('|').ok_or_else(|| format!("line {}: expected name|path", i + 1))?;
+        let (name, path) = (name.trim(), path.trim().trim_end_matches('\\'));
+        let name_ok = !name.is_empty() && name.len() <= 7 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '-');
+        let low = path.to_ascii_lowercase();
+        let path_ok = low.starts_with(r"d:\") && !low.split('\\').any(|s| s == "..");
+        if !name_ok {
+            return Err(format!("line {}: name must be 1-7 letters, digits or -", i + 1));
+        }
+        if !path_ok {
+            return Err(format!("line {}: path must be an absolute D: path", i + 1));
+        }
+        if out.iter().any(|r: &Repo| r.name == name) {
+            return Err(format!("line {}: name {name} listed twice", i + 1));
+        }
+        out.push(Repo { name: name.into(), path: path.into() });
+    }
+    if out.len() > MAX_REPOS {
+        return Err(format!("{} repos listed, limit {MAX_REPOS}", out.len()));
+    }
+    Ok(out)
+}
+
+/// Verifier task id: `<name>-<test stem>`, kept within the verifier's 64-char limit.
+fn task_id(name: &str, test: &str) -> String {
+    format!("{name}-{}", stem(test)).chars().take(64).collect()
+}
+
+/// Scratch worktree for a repo. Fixed per repo so cargo's path-keyed fingerprints match
+/// between runs and the shared target dir is reused instead of rebuilt.
+fn worktree_path(name: &str) -> String {
+    format!(r"{WT_ROOT}\{name}")
+}
+
+fn hidden(exe: &str) -> Command {
+    let mut c = Command::new(exe);
+    c.stdin(Stdio::null()).env("CARGO_TARGET_DIR", TARGET);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    c
+}
+
+/// Kill the child and everything it started (cargo spawns rustc and test binaries).
+fn kill_tree(ch: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        let mut k = hidden("taskkill");
+        let _ = k.args(["/PID", &ch.id().to_string(), "/T", "/F"]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    }
+    let _ = ch.kill();
+    let _ = ch.wait();
+}
+
+/// Run to completion with a hard timeout; returns (exit ok, stdout+stderr).
+fn run(mut c: Command, limit: Duration) -> Result<(bool, String), String> {
+    let dir = Path::new(WT_ROOT);
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let tag = format!("fixrepo-{}-{}", std::process::id(), now_nanos());
+    let (op, ep) = (dir.join(format!("{tag}.out")), dir.join(format!("{tag}.err")));
+    let o = std::fs::File::create(&op).map_err(|e| e.to_string())?;
+    let e = std::fs::File::create(&ep).map_err(|e| e.to_string())?;
+    let mut ch = c.stdout(o).stderr(e).spawn().map_err(|e| format!("spawn: {e}"))?;
+    let start = Instant::now();
+    let status = loop {
+        if let Some(s) = ch.try_wait().map_err(|e| e.to_string())? {
+            break Some(s);
+        }
+        if start.elapsed() > limit {
+            kill_tree(&mut ch);
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let text = format!(
+        "{}{}",
+        std::fs::read_to_string(&op).unwrap_or_default(),
+        std::fs::read_to_string(&ep).unwrap_or_default()
+    );
+    let _ = std::fs::remove_file(op);
+    let _ = std::fs::remove_file(ep);
+    match status {
+        Some(s) => Ok((s.success(), text)),
+        None => Err(format!("timed out after {}s", limit.as_secs())),
+    }
+}
+
+fn git(dir: &str, args: &[&str]) -> Result<String, String> {
+    let mut c = hidden("git");
+    c.arg("-C").arg(dir).args(args);
+    let (ok, out) = run(c, Duration::from_secs(120))?;
+    if ok { Ok(out) } else { Err(format!("git {}: {}", args.join(" "), out.trim())) }
+}
+
+fn now_nanos() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0)
+}
+
+fn say(name: &str, text: &str) {
+    let line = format!("[{name} fix] {text}");
+    println!("{line}");
+    let outbox = std::env::var("FIX_REPO_OUTBOX").unwrap_or_else(|_| OUTBOX.into());
+    if let Err(e) = report(Path::new(&outbox), &line) {
+        eprintln!("outbox: {e}");
+    }
+}
+
+/// Every .rs file under `root`, skipping target, .git and .venv.
+fn rust_files(root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(rd) = std::fs::read_dir(root) else { return };
+    for e in rd.flatten() {
+        let p = e.path();
+        let name = e.file_name().to_string_lossy().to_string();
+        if p.is_dir() {
+            if name != "target" && name != ".git" && name != ".venv" {
+                rust_files(&p, out);
+            }
+        } else if name.ends_with(".rs") {
+            out.push(p);
+        }
+    }
+}
+
+/// The file that defines the failing test, preferring one whose name matches the module path.
+fn locate(wt: &Path, test: &str) -> Option<PathBuf> {
+    let mut files = Vec::new();
+    rust_files(wt, &mut files);
+    let f = test_fn(test);
+    let hits: Vec<PathBuf> = files
+        .into_iter()
+        .filter(|p| std::fs::read_to_string(p).is_ok_and(|s| defines_fn(&s, f)))
+        .collect();
+    let first_mod = test.split("::").next().unwrap_or("");
+    hits.iter()
+        .find(|p| p.file_stem().is_some_and(|s| s.to_string_lossy() == first_mod))
+        .cloned()
+        .or_else(|| hits.first().cloned())
+}
+
+/// Does `test` pass when it is run alone? Used to tell a flaky test from a real failure.
+fn passes_alone(wt: &str, test: &str) -> bool {
+    let mut c = hidden("cargo");
+    c.current_dir(wt).args(["test", "--workspace", "--color", "never", "--", "--exact", test]);
+    matches!(run(c, TEST_TIMEOUT), Ok((true, out)) if failing_tests(&out).is_empty())
+}
+
+fn propose(repo: &Repo, wt: &str) -> Result<String, String> {
+    if !Path::new(wt).join("Cargo.toml").exists() {
+        return Err("no Cargo.toml at the repo root, skipped (only Rust repos rooted at git root)".into());
+    }
+    // 2. reproduce at HEAD
+    let mut c = hidden("cargo");
+    c.current_dir(wt).args(["test", "--workspace", "--no-fail-fast", "--color", "never"]);
+    let (ok, out) = run(c, TEST_TIMEOUT).map_err(|e| format!("cargo test: {e}"))?;
+    let fails = failing_tests(&out);
+    if ok && fails.is_empty() {
+        return queued_task(repo, wt);
+    }
+    let Some(test) = fails.first().cloned() else {
+        let tail: String = out.lines().rev().take(6).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
+        return Err(format!("tests did not pass but no failing test was named (build error?): {tail}"));
+    };
+
+    // A test that passes when rerun alone is flaky (timing under load), not a bug the model can
+    // fix. Say so and carry on to the task queue instead of chasing it every hour.
+    if passes_alone(wt, &test) {
+        return queued_task(repo, wt).map(|m| format!("flaky: {test} failed in the full run but passed alone. {m}"));
+    }
+
+    // 3. ask the brain chain
+    let file = locate(Path::new(wt), &test).ok_or_else(|| format!("could not find the file for {test}"))?;
+    let old = std::fs::read_to_string(&file).map_err(|e| e.to_string())?;
+    if old.len() > MAX_SRC {
+        return Err(format!("{test}: {} is {} bytes, too big to send whole", file.display(), old.len()));
+    }
+    let rel = file.strip_prefix(wt).map(|p| p.display().to_string()).unwrap_or_else(|_| file.display().to_string());
+    let failure = failure_text(&out, &test, 4000);
+    let specs = parse_specs(&std::fs::read_to_string(BRAINS).map_err(|e| format!("{BRAINS}: {e}"))?)?;
+    let charter = "You are the ATRIUM fix agent. You propose one small, correct Rust fix. A strict verifier rejects \
+                   anything that fails cargo check, clippy -D warnings or cargo test.";
+    let mut chain = build_chain(&specs, charter, &[], 900);
+    let ask = prompt(&test, &failure, &rel, &old).replace("Xing's brain repo", &format!("Xing's {} repo", repo.name));
+    let reply = match chain.complete(&[Entry::User { text: ask }])? {
+        ModelOut::Text(t) => t,
+        ModelOut::ToolCall { tool, .. } => return Err(format!("{test}: model asked for tool {tool} instead of a fix")),
+    };
+    let new = extract_file(&reply)
+        .or_else(|| defines_fn(&reply, test_fn(&test)).then(|| reply.clone()))
+        .ok_or_else(|| format!("{test}: model reply had no usable file"))?;
+    precheck(&old, &new, &test).map_err(|e| format!("{test}: {e}"))?;
+    std::fs::write(&file, &new).map_err(|e| e.to_string())?;
+
+    // 4. gate
+    let mut v = hidden(VERIFY);
+    v.args(["check-git", "--policy", POLICY, "--worktree", wt, "--task", &task_id(&repo.name, &test)]);
+    let (accepted, verdict) = run(v, Duration::from_secs(1800)).map_err(|e| format!("verifier: {e}"))?;
+    if !accepted {
+        let why: String = verdict.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(400).collect();
+        return Err(format!("{test}: verifier rejected the fix: {why}"));
+    }
+
+    // 5. patch for Xing
+    let msg = format!("Fix failing test {}", test_fn(&test));
+    write_patch(repo, wt, &stem(&test), "-", &msg, &format!("failing test {test}"))
+}
+
+/// Diff the worktree into a headed .patch, report it with its approve id.
+fn write_patch(repo: &Repo, wt: &str, label: &str, task: &str, msg: &str, what: &str) -> Result<String, String> {
+    let diff = git(wt, &["diff", "HEAD"])?;
+    if diff.trim().is_empty() {
+        return Err("verified change produced an empty diff".into());
+    }
+    let stat = git(wt, &["diff", "HEAD", "--shortstat"]).unwrap_or_default();
+    std::fs::create_dir_all(FIXES).map_err(|e| e.to_string())?;
+    let t = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let id = patch_id(t.as_secs(), t.subsec_nanos());
+    let patch = Path::new(FIXES).join(format!("P{id}-{}-{}.patch", repo.name, label.chars().take(40).collect::<String>()));
+    std::fs::write(&patch, format!("{}{diff}", patch_header(&repo.path, task, msg))).map_err(|e| e.to_string())?;
+    let preview: String = diff.lines().filter(|l| !l.starts_with("index ")).take(40).collect::<Vec<_>>().join("\n");
+    Ok(format!(
+        "PATCH {id} ready: {what} (verified: check, clippy, tests). {}\nCommit message: {msg}\n/approve {id} to commit it locally (never pushed), /reject {id} to drop it.\n{preview}",
+        stat.trim()
+    ))
+}
+
+/// Green repo: take the next queued task for it, if any.
+fn queued_task(repo: &Repo, wt: &str) -> Result<String, String> {
+    let Ok(qtext) = std::fs::read_to_string(TASKS) else {
+        return Ok("all tests pass at HEAD, no task queue".into());
+    };
+    let tasks = parse_tasks(&qtext).map_err(|e| format!("task queue: {e}"))?;
+    let log = std::fs::read_to_string(TASK_LOG).unwrap_or_default();
+    let Some(task) = next_task(&tasks, &log, &repo.name) else {
+        return Ok("all tests pass at HEAD, no open tasks".into());
+    };
+    match attempt_task(repo, wt, task) {
+        Ok(m) => {
+            log_task(&task.id, "pending");
+            Ok(m)
+        }
+        Err(e) => {
+            log_task(&task.id, "fail");
+            Err(format!("task {}: {e}", task.id))
+        }
+    }
+}
+
+fn log_task(id: &str, ev: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(TASK_LOG) {
+        let _ = f.write_all(format!("{id}|{ev}\n").as_bytes());
+    }
+}
+
+fn attempt_task(repo: &Repo, wt: &str, task: &Task) -> Result<String, String> {
+    let file = Path::new(wt).join(&task.file);
+    let old = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", task.file))?;
+    if old.len() > MAX_SRC {
+        return Err(format!("{} is {} bytes, too big to send whole", task.file, old.len()));
+    }
+    let specs = parse_specs(&std::fs::read_to_string(BRAINS).map_err(|e| format!("{BRAINS}: {e}"))?)?;
+    let charter = "You are the ATRIUM build agent. You make one small, correct Rust change with a test. A strict verifier \
+                   rejects anything that fails cargo check, clippy -D warnings or cargo test.";
+    let mut chain = build_chain(&specs, charter, &[], 900);
+    let ask = task_prompt(&task.instruction, &task.file, &old, &repo.name);
+    let reply = match chain.complete(&[Entry::User { text: ask }])? {
+        ModelOut::Text(t) => t,
+        ModelOut::ToolCall { tool, .. } => return Err(format!("model asked for tool {tool} instead of a change")),
+    };
+    let new = extract_file(&reply).ok_or("model reply had no usable file")?;
+    task_precheck(&old, &new)?;
+    std::fs::write(&file, &new).map_err(|e| e.to_string())?;
+    let mut v = hidden(VERIFY);
+    v.args(["check-git", "--policy", POLICY, "--worktree", wt, "--task", &task_id(&repo.name, &task.id)]);
+    let (accepted, verdict) = run(v, Duration::from_secs(1800)).map_err(|e| format!("verifier: {e}"))?;
+    if !accepted {
+        let why: String = verdict.split_whitespace().collect::<Vec<_>>().join(" ").chars().take(400).collect();
+        return Err(format!("verifier rejected the change: {why}"));
+    }
+    let msg: String = task.instruction.chars().take(72).collect();
+    write_patch(repo, wt, &task.id, &task.id, &msg, &format!("task {}", task.id))
+}
+
+/// Clear a worktree a crashed run left at the fixed path, so `worktree add` can reuse it.
+fn clear_stale(repo: &Repo, wt: &str) {
+    let _ = git(&repo.path, &["worktree", "remove", "--force", wt]);
+    if Path::new(wt).exists() {
+        let _ = std::fs::remove_dir_all(wt);
+    }
+    let _ = git(&repo.path, &["worktree", "prune"]);
+}
+
+fn one(repo: &Repo) {
+    let wt = worktree_path(&repo.name);
+    clear_stale(repo, &wt);
+    if let Err(e) = git(&repo.path, &["worktree", "add", "--detach", &wt, "HEAD"]) {
+        return say(&repo.name, &format!("worktree: {e}"));
+    }
+    match propose(repo, &wt) {
+        Ok(m) => say(&repo.name, &m),
+        Err(e) => say(&repo.name, &format!("no fix this run: {e}")),
+    }
+    // Always clean up the scratch worktree (the build cache in TARGET is kept). A test binary
+    // that just exited or a scanner can still hold a file for a moment: wait and retry once.
+    if git(&repo.path, &["worktree", "remove", "--force", &wt]).is_err() {
+        std::thread::sleep(Duration::from_secs(5));
+        if let Err(e) = git(&repo.path, &["worktree", "remove", "--force", &wt]) {
+            eprintln!("cleanup: {e}");
+            let _ = std::fs::remove_dir_all(&wt);
+        }
+    }
+    let _ = git(&repo.path, &["worktree", "prune"]);
+}
+
+fn main() {
+    if Path::new(STOP).exists() {
+        println!("[fix] kill switch on, skipping");
+        return;
+    }
+    let list = std::env::var("FIX_REPOS").unwrap_or_else(|_| REPOS.into());
+    let repos = match std::fs::read_to_string(&list).map_err(|e| format!("{list}: {e}")).and_then(|t| parse_repos(&t)) {
+        Ok(r) => r,
+        Err(e) => return say("all", &format!("repo list: {e}")),
+    };
+    if let Err(e) = std::fs::create_dir_all(WT_ROOT) {
+        return say("all", &format!("cannot create {WT_ROOT}: {e}"));
+    }
+    for r in &repos {
+        if Path::new(STOP).exists() {
+            println!("[fix] kill switch turned on mid-run, stopping");
+            return;
+        }
+        one(r);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_repo_list() {
+        let r = parse_repos("# comment\n\nbrain|D:\\brain\nductei|D:\\ATRIUM\\DUCTEI\\\n").unwrap();
+        assert_eq!(r.len(), 2);
+        assert_eq!(r[1].path, r"D:\ATRIUM\DUCTEI");
+    }
+
+    #[test]
+    fn rejects_bad_repo_lines() {
+        for bad in [
+            "brain D:\\brain",
+            "brain|C:\\Users\\x",
+            "brain|D:\\ATRIUM\\..\\x",
+            "bad name|D:\\x",
+            "toolongname|D:\\x",
+            "a|D:\\x\na|D:\\y",
+            "brain|relative\\path",
+        ] {
+            assert!(parse_repos(bad).is_err(), "{bad}");
+        }
+        let many: String = (0..9).map(|i| format!("r{i}|D:\\r{i}\n")).collect();
+        assert!(parse_repos(&many).is_err());
+    }
+
+    #[test]
+    fn task_ids_fit_the_verifier() {
+        let t = task_id("ductei", &"x".repeat(200));
+        assert!(t.len() <= 64 && t.starts_with("ductei-"));
+        assert!(t.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+    }
+
+    #[test]
+    fn worktree_path_is_stable_per_repo() {
+        assert_eq!(worktree_path("ductei"), worktree_path("ductei"));
+        assert_eq!(worktree_path("ductei"), r"D:\ATRIUM\ops\atrium-state\fix\ductei");
+        assert_ne!(worktree_path("ductei"), worktree_path("brain"));
+    }
+}

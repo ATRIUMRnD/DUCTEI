@@ -1,0 +1,47 @@
+name: kani
+on: [push, pull_request]
+permissions:
+  contents: read
+env:
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+
+jobs:
+  # Model-check the hard invariants in ductei-core/src/proofs.rs for every
+  # input within the harness bounds. The `test` job in ci.yml runs the same
+  # harness bodies as 20,000 random samples; this job is the real proof
+  # (ATRIUM INVARIANTS.md, N1 and N2). Kani is Linux/macOS only, so it runs
+  # here and not on the Windows machines.
+  #
+  # Each harness runs on its own so the log shows which one is slow or
+  # failing. All four pass under Kani 0.68 in a few seconds each (checked
+  # Nov 21, 2026 on Linux). The base64 round-trip is not here: it never
+  # finished under Kani and is covered by an exhaustive test in ci.yml.
+  prove:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+      # Cargo resolves the whole workspace, and ductei-sync pins private
+      # xingxerx/QFLTL (and transitively universal-clock).
+      - name: allow cargo to fetch private QFLTL deps
+        env:
+          QFLTL_READ_TOKEN: ${{ secrets.QFLTL_READ_TOKEN }}
+        run: |
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/QFLTL".insteadOf https://github.com/xingxerx/QFLTL
+          git config --global url."https://x-access-token:${QFLTL_READ_TOKEN}@github.com/xingxerx/universal-clock".insteadOf https://github.com/xingxerx/universal-clock
+      - name: install Kani
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+      - name: prove ductei-core invariants
+        run: |
+          for h in scope_policy_is_deny_by_default session_budget_admit_respects_bounds session_budget_sequence_never_exceeds_bound ack_applied_only_after_accept; do
+            echo "::group::$h"
+            cargo kani -p ductei-core --features net --harness "$h"
+            echo "::endgroup::"
+          done

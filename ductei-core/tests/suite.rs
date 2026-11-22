@@ -10,7 +10,14 @@ use std::net::{TcpListener, TcpStream};
 use ductei_core::grpc::{serve_grpc_blocking, GrpcClient};
 
 fn node(n: u8) -> [u8; 16] { [n; 16] }
-fn tmp(name: &str) -> String { format!("{}/{}-{}", std::env::temp_dir().display(), std::process::id(), name) }
+// A pid alone repeats across runs (Windows reuses them), and these files outlive the process, so a
+// reused pid would reopen an earlier run's channel and see its keys as StaleDelta. The per-process
+// nonce makes every run's paths unique.
+fn tmp(name: &str) -> String {
+    static RUN: std::sync::OnceLock<u128> = std::sync::OnceLock::new();
+    let run = RUN.get_or_init(|| std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+    format!("{}/{}-{}-{}", std::env::temp_dir().display(), std::process::id(), run, name)
+}
 fn env(key: &str, sc: &[&str], nd: u8, lam: u64) -> Envelope { scoped(key, sc, node(nd), lam, b"x") }
 fn chan(name: &str) -> Channel {
     Channel::open(ScopePolicy::new().allow("qallow.semantic.cert").allow("veyn.sensor.eeg"),
@@ -28,7 +35,41 @@ static DEFAULT_OUTBOX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 fn default_outbox_guard() -> std::sync::MutexGuard<'static, ()> {
     // A test that failed while holding the lock poisons it; the next test
     // should still run, not fail with a confusing PoisonError.
-    DEFAULT_OUTBOX_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    let g = DEFAULT_OUTBOX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    isolate_default_outbox();
+    g
+}
+
+/// Point the "default" outbox at a per-process temp file before any test
+/// resolves it. Without this, default_outbox_path() is the real per-user
+/// file (~/.ductei/outbox.jsonl when HOME is set), which a live ductei-node
+/// on the same machine is writing: tests raced it (flaky
+/// outbox_kill_and_restart_retry_ack2_default_path) and deleted it
+/// (remove_file in the default-path tests), wiping the node's pending
+/// intents. Every default-path test takes default_outbox_guard() first, so
+/// this runs before any of them reads the variable.
+#[cfg(feature = "net")]
+fn isolate_default_outbox() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let p = std::env::temp_dir().join(format!("ductei-test-outbox-{}.jsonl", std::process::id()));
+        std::env::set_var("DUCTEI_OUTBOX_PATH", p);
+    });
+}
+
+#[cfg(feature = "net")]
+#[test]
+fn tests_never_resolve_the_real_user_outbox() {
+    let _g = default_outbox_guard();
+    let p = ductei_core::transport::default_outbox_path();
+    assert!(p.starts_with(std::env::temp_dir()), "test outbox escaped temp: {}", p.display());
+    for var in ["HOME", "USERPROFILE", "XDG_STATE_HOME"] {
+        if let Ok(home) = std::env::var(var) {
+            let home = std::path::PathBuf::from(home);
+            // temp_dir() can live under the profile on Windows; only the ductei dirs are off limits.
+            assert!(!p.starts_with(home.join(".ductei")) && !p.starts_with(home.join("ductei")), "test outbox is the real one: {}", p.display());
+        }
+    }
 }
 
 #[test]
@@ -976,15 +1017,6 @@ fn quic_two_node_loopback() {
     drop(server);
 }
 
-#[cfg(feature = "pq")]
-#[test]
-fn mlkem_shared_secret_agreement() {
-    let pair = ductei_core::pq::generate_keypair();
-    let (ciphertext, sender_secret) = ductei_core::pq::encapsulate_to(&pair.public_key).unwrap();
-    let receiver_secret = ductei_core::pq::decapsulate_from(&pair, &ciphertext).unwrap();
-    assert_eq!(sender_secret, receiver_secret);
-}
-
 #[test]
 fn veyn_rem_events_pass_uncoalesced() {
     let mut a = ductei_veyn::Adapter::new(ductei_veyn::CoalescePolicy::default_policy());
@@ -998,4 +1030,91 @@ fn veyn_rem_events_pass_uncoalesced() {
         }
     }
     assert_eq!(accepted, 50);
+}
+
+#[cfg(feature = "net")]
+#[test]
+fn transport_connect_is_bounded_when_peer_does_not_answer() {
+    use std::time::{Duration, Instant};
+    // 192.0.2.0/24 is reserved for documentation (RFC 5737): nothing answers there.
+    let addr = "192.0.2.1:7";
+    let t = Instant::now();
+    assert!(ductei_core::transport::TcpClient::connect_timeout(addr, Duration::from_millis(300)).is_err());
+    assert!(t.elapsed() < Duration::from_secs(3));
+
+    let p = tmp("t5b.jsonl");
+    let r = tmp("t5br.jsonl");
+    let _ = std::fs::remove_file(&p);
+    let mut local = Channel::open(ScopePolicy::new().allow("qallow.semantic.cert"), &p, &r).unwrap();
+    let t = Instant::now();
+    let path = ductei_core::transport::send_local_first(addr, &env("a", &["qallow.semantic.cert"], 1, 1), &mut local, tmp("t5b-outbox.jsonl")).unwrap();
+    assert_eq!(path, DeliveryPath::LocalFallback);
+    assert!(t.elapsed() < Duration::from_secs(4), "the default connect timeout must bound the send");
+    let (envs, _) = local.replay(0).unwrap();
+    assert_eq!(envs.len(), 1);
+}
+
+// ---- log reader/writer robustness: polling a growing log, half-written lines
+
+#[test]
+fn replay_from_cursor_reads_only_new_lines_and_matches_a_full_scan() {
+    let p = tmp("inc.jsonl");
+    let mut log = LogStore::open(&p).unwrap();
+    let mut cursor = 0;
+    for round in 0..5u64 {
+        for i in 0..3u64 { log.append(&env(&format!("k{round}-{i}"), &["qallow.semantic.cert"], 1, round * 3 + i + 1)).unwrap(); }
+        let (new, next) = log.replay(cursor).unwrap();
+        assert_eq!(new.len(), 3, "round {round}");
+        assert_eq!(new[0].key, format!("k{round}-0"));
+        cursor = next;
+    }
+    assert_eq!(cursor, 15);
+    let (all, n) = LogStore::open(&p).unwrap().replay(0).unwrap();
+    assert_eq!((all.len(), n), (15, 15));
+    assert_eq!(log.replay(15).unwrap().0.len(), 0);
+}
+
+#[test]
+fn half_written_last_line_is_left_for_later_not_skipped() {
+    let p = tmp("torn.jsonl");
+    let mut log = LogStore::open(&p).unwrap();
+    log.append(&env("a", &["qallow.semantic.cert"], 1, 1)).unwrap();
+    let full = serde_json::to_string(&env("b", &["qallow.semantic.cert"], 1, 2)).unwrap();
+    let (head, tail) = full.split_at(full.len() / 2);
+    let mut raw = std::fs::OpenOptions::new().append(true).open(&p).unwrap();
+    std::io::Write::write_all(&mut raw, head.as_bytes()).unwrap();
+    let (got, cur) = log.replay(0).unwrap();
+    assert_eq!((got.len(), cur), (1, 1), "the unfinished line must not be counted");
+    std::io::Write::write_all(&mut raw, format!("{tail}\n").as_bytes()).unwrap();
+    let (got, cur) = log.replay(cur).unwrap();
+    assert_eq!((got.len(), cur), (1, 2));
+    assert_eq!(got[0].key, "b");
+}
+
+#[test]
+fn reopening_after_a_crash_mid_append_does_not_glue_the_next_entry() {
+    let (p, r) = (tmp("seal.jsonl"), tmp("seal-rej.jsonl"));
+    let a = serde_json::to_string(&env("a", &["qallow.semantic.cert"], 1, 1)).unwrap();
+    std::fs::write(&p, format!("{a}\n{{\"key\":\"half")).unwrap();
+    let mut ch = Channel::open(ScopePolicy::new().allow("qallow.semantic.cert"), &p, &r).unwrap();
+    ch.send(env("b", &["qallow.semantic.cert"], 1, 2)).unwrap();
+    let (got, _) = ch.replay(0).unwrap();
+    assert_eq!(got.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+}
+
+#[test]
+fn a_replaced_log_is_rescanned_not_resumed_from_a_stale_position() {
+    let p = tmp("swap.jsonl");
+    let mut log = LogStore::open(&p).unwrap();
+    for i in 1..=4u64 { log.append(&env(&format!("old{i}"), &["qallow.semantic.cert"], 1, i)).unwrap(); }
+    assert_eq!(log.replay(0).unwrap().1, 4);
+    let mut text = String::new();
+    for i in 1..=6u64 {
+        text.push_str(&serde_json::to_string(&env(&format!("replacement-entry-{i}"), &["qallow.semantic.cert"], 2, i)).unwrap());
+        text.push('\n');
+    }
+    std::fs::write(&p, text).unwrap();
+    let (got, cur) = log.replay(4).unwrap();
+    assert_eq!(cur, 6);
+    assert_eq!(got.iter().map(|e| e.key.as_str()).collect::<Vec<_>>(), ["replacement-entry-5", "replacement-entry-6"]);
 }

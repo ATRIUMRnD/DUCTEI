@@ -1,0 +1,151 @@
+# ATRIUM contract spec. One source of truth for wire formats, cert fields and
+# scopes shared by DUCTEI (Rust), Qallow (C) and LIMEN (Python).
+#
+#   cargo run -p atrium-spec -- gen   atrium-spec/spec/atrium.toml atrium-spec/generated
+#   cargo run -p atrium-spec -- check atrium-spec/spec/atrium.toml atrium-spec/generated
+#
+# `check` exits 1 when the committed generated files drift from this spec.
+
+[spec]
+name = "atrium"
+version = 1
+
+# ---- Qallow Sync Wire (QSW) v1 constants, mirrored from Qallow/include/qallow/sync_wire.h
+[[const]]
+name = "QSW_MAGIC"
+type = "u32"
+value = "0x4E595351"
+doc = "\"QSYN\" little-endian"
+
+[[const]]
+name = "QSW_PROTO_VER"
+type = "u16"
+value = "1"
+
+[[const]]
+name = "QSW_PROTO_VER_V2"
+type = "u16"
+value = "2"
+
+[[const]]
+name = "QSW_NODE_ID_LEN"
+type = "u32"
+value = "16"
+
+[[const]]
+name = "QSW_MAX_KEY_LEN"
+type = "u32"
+value = "1024"
+
+[[const]]
+name = "QSW_MAX_SCOPES"
+type = "u32"
+value = "16"
+
+[[const]]
+name = "QSW_MAX_SCOPE_LEN"
+type = "u32"
+value = "256"
+
+# ---- Scopes
+[[const]]
+name = "CERT_SCOPE"
+type = "string"
+value = "qallow.semantic.cert"
+doc = "DUCTEI scope a LIMEN cert summary is relayed under"
+
+# ---- Health states (ATRIUM INVARIANTS.md, N5: nothing fails silently)
+[[const]]
+name = "HEALTH_OK"
+type = "u8"
+value = "0"
+doc = "room is working"
+
+[[const]]
+name = "HEALTH_DEGRADED"
+type = "u8"
+value = "1"
+doc = "room is working but something is wrong; reason is required"
+
+[[const]]
+name = "HEALTH_DOWN"
+type = "u8"
+value = "2"
+doc = "room is not working, could not be checked, or was silent past HEALTH_SILENCE_MS"
+
+[[const]]
+name = "HEALTH_SILENCE_MS"
+type = "u32"
+value = "5000"
+doc = "no report inside this window counts as HEALTH_DOWN"
+
+# ---- QSW v1 hello header (sync_wire.h qsw_hello_t)
+[[struct]]
+name = "QswHello"
+doc = "QSW handshake header, v1"
+[[struct.field]]
+name = "magic"
+type = "u32"
+[[struct.field]]
+name = "proto_ver"
+type = "u16"
+[[struct.field]]
+name = "caps"
+type = "u16"
+doc = "capability flags, 0 for now"
+[[struct.field]]
+name = "node_id"
+type = "bytes[16]"
+[[struct.field]]
+name = "lamport"
+type = "u64"
+doc = "sender clock at send time"
+
+# ---- LIMEN cert summary (ductei-limen CertSummary / limend spool record)
+[[struct]]
+name = "CertSummary"
+doc = "Closed type. No credential fields. success_probability replaces the deprecated fidelity_estimate (LIMEN #37)."
+[[struct.field]]
+name = "job_id"
+type = "string"
+[[struct.field]]
+name = "backend"
+type = "string"
+[[struct.field]]
+name = "tier"
+type = "u8"
+[[struct.field]]
+name = "success_probability"
+type = "f64"
+[[struct.field]]
+name = "target_met"
+type = "bool"
+optional = true
+doc = "absent on pre-#37 certs"
+[[struct.field]]
+name = "lamport"
+type = "u64"
+
+# ---- Health report (N5). Health never carries a tamper verdict: integrity
+# alarms are a separate channel, so "unreachable" and "tampered" cannot be
+# confused.
+[[struct]]
+name = "Health"
+doc = "N5 health report, one per room. A check that cannot run reports HEALTH_DOWN, never HEALTH_OK."
+[[struct.field]]
+name = "room"
+type = "string"
+doc = "room name as listed in fleet status"
+[[struct.field]]
+name = "state"
+type = "u8"
+doc = "HEALTH_OK, HEALTH_DEGRADED or HEALTH_DOWN"
+[[struct.field]]
+name = "reason"
+type = "string"
+optional = true
+doc = "plain-English cause; required unless state is HEALTH_OK"
+[[struct.field]]
+name = "checked_ms"
+type = "u64"
+doc = "unix milliseconds when the check ran"

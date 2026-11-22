@@ -59,7 +59,7 @@ impl Arbitrary for bool {
 impl Arbitrary for u8 {
     fn any() -> Self {
         const INTERESTING: &[u8] = b",|a\0\x01\x02\x03\x7f\x80\xff";
-        if next() % 4 == 0 {
+        if next().is_multiple_of(4) {
             INTERESTING[(next() % INTERESTING.len() as u64) as usize]
         } else {
             next() as u8

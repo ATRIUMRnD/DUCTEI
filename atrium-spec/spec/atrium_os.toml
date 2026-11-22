@@ -1,0 +1,236 @@
+# ATRIUM OS contract spec: the job door. One request shape in, one receipt
+# shape out, shared by DUCTEI (Rust), Qallow (C) and LIMEN (Python).
+#
+#   cargo run -p atrium-spec -- gen   atrium-spec/spec/atrium_os.toml atrium-spec/generated
+#   cargo run -p atrium-spec -- check atrium-spec/spec/atrium_os.toml atrium-spec/generated
+#
+# Scalars and strings only (the compiler's closed type set). Richer values ride
+# as JSON text in a string field and are parsed by the closed Rust types that
+# own them (ductei-router Effect, ductei-qhr Status).
+
+[spec]
+name = "atrium_os"
+version = 1
+
+[[const]]
+name = "OS_CONTRACT_VER"
+type = "u16"
+value = "1"
+doc = "bumped on any change to JobRequest or JobReceipt"
+
+[[const]]
+name = "OS_RECEIPT_SCOPE"
+type = "string"
+value = "atrium.os.receipt"
+doc = "DUCTEI scope a job receipt is persisted under"
+
+[[const]]
+name = "OS_RECEIPT_KEY_PREFIX"
+type = "string"
+value = "atrium.os.receipt."
+doc = "envelope key is this prefix plus the job id"
+
+# ---- exit codes of `atrium submit` (the numbers the qhr CLI already uses)
+[[const]]
+name = "OS_EXIT_DONE"
+type = "u8"
+value = "0"
+
+[[const]]
+name = "OS_EXIT_ERROR"
+type = "u8"
+value = "1"
+doc = "the job could not be submitted, or a receipt did not verify"
+
+[[const]]
+name = "OS_EXIT_NEEDS_APPROVAL"
+type = "u8"
+value = "2"
+
+[[const]]
+name = "OS_EXIT_REFUSED"
+type = "u8"
+value = "3"
+doc = "denied by CANON or refused in pre-flight; the lane never ran"
+
+[[const]]
+name = "OS_EXIT_FAILED"
+type = "u8"
+value = "4"
+doc = "the lane ran and failed, or missed its deadline"
+
+# ---- persist states (N5: a receipt always says how far it got)
+[[const]]
+name = "OS_PERSIST_NONE"
+type = "u8"
+value = "0"
+doc = "in the QHR receipt chain only; persist_reason says why"
+
+[[const]]
+name = "OS_PERSIST_CHANNEL"
+type = "u8"
+value = "1"
+doc = "fsynced to the DUCTEI channel log; Qallow has not confirmed"
+
+[[const]]
+name = "OS_PERSIST_QALLOW"
+type = "u8"
+value = "2"
+doc = "read back out of the Qallow store, byte for byte"
+
+# ---- the request
+[[struct]]
+name = "JobRequest"
+doc = "One job for the OS door. Closed and flat: no credential fields exist."
+[[struct.field]]
+name = "id"
+type = "string"
+doc = "fresh per job; a plain file stem (A-Z a-z 0-9 . _ -), it names files in the spool"
+[[struct.field]]
+name = "intent"
+type = "string"
+doc = "plain-English purpose, recorded with the job"
+[[struct.field]]
+name = "op"
+type = "string"
+doc = "lane operation, prefixed by lane: qpu.run, cpu.sha256, llm.complete"
+[[struct.field]]
+name = "payload"
+type = "string"
+doc = "text handed to the lane; for qpu.run a limend request as JSON"
+[[struct.field]]
+name = "budget_ms"
+type = "u64"
+doc = "wall-clock budget from submit to result, gate included"
+[[struct.field]]
+name = "kind"
+type = "string"
+optional = true
+doc = "classify, chat, code, research or quantum; absent means code"
+[[struct.field]]
+name = "private"
+type = "bool"
+optional = true
+doc = "absent means true: the job never leaves this machine"
+[[struct.field]]
+name = "assurance"
+type = "string"
+optional = true
+doc = "verified (every receipt fsynced) or fast; absent means verified"
+[[struct.field]]
+name = "effects_json"
+type = "string"
+optional = true
+doc = "JSON list of ductei-router effects the job will have; CANON gates on them"
+
+# ---- the receipt
+[[struct]]
+name = "JobReceipt"
+doc = "What `atrium submit` returns. Every outcome field is bound to one signed entry in the QHR receipt chain; `atrium receipt` re-derives them instead of trusting this record."
+[[struct.field]]
+name = "contract_ver"
+type = "u16"
+[[struct.field]]
+name = "job_id"
+type = "string"
+[[struct.field]]
+name = "verdict"
+type = "string"
+doc = "done, denied, needs_approval, refused, lane_error or deadline_missed"
+[[struct.field]]
+name = "reason"
+type = "string"
+optional = true
+doc = "plain-English cause; present unless verdict is done"
+[[struct.field]]
+name = "tier"
+type = "string"
+doc = "router tier the job was given"
+[[struct.field]]
+name = "lane"
+type = "string"
+optional = true
+doc = "lane that ran or refused; absent when no single lane was involved"
+[[struct.field]]
+name = "backend"
+type = "string"
+optional = true
+doc = "LIMEN backend, from the cert (qpu.run that finished)"
+[[struct.field]]
+name = "success_probability"
+type = "f64"
+optional = true
+doc = "from the LIMEN cert"
+[[struct.field]]
+name = "target_met"
+type = "bool"
+optional = true
+doc = "from the LIMEN cert"
+[[struct.field]]
+name = "status_json"
+type = "string"
+doc = "the QHR status exactly as it was hashed into the chain entry"
+[[struct.field]]
+name = "pick_why"
+type = "string"
+doc = "how the lane was chosen; part of the signed result hash"
+[[struct.field]]
+name = "job_sha256"
+type = "string"
+[[struct.field]]
+name = "result_sha256"
+type = "string"
+[[struct.field]]
+name = "chain"
+type = "string"
+doc = "verified or fast: which QHR chain holds the entry"
+[[struct.field]]
+name = "qhr_receipt"
+type = "string"
+doc = "hash of the chain entry"
+[[struct.field]]
+name = "sig_scheme"
+type = "string"
+doc = "ml-dsa-65, ml-dsa-87 or none"
+[[struct.field]]
+name = "signer_fingerprint"
+type = "string"
+optional = true
+doc = "SHA-256 hex of the signing public key; absent when unsigned"
+[[struct.field]]
+name = "persist_state"
+type = "u8"
+doc = "OS_PERSIST_NONE, OS_PERSIST_CHANNEL or OS_PERSIST_QALLOW"
+[[struct.field]]
+name = "persist_key"
+type = "string"
+optional = true
+doc = "DUCTEI envelope key the receipt was stored under"
+[[struct.field]]
+name = "persist_reason"
+type = "string"
+optional = true
+doc = "why persist_state is not OS_PERSIST_QALLOW"
+[[struct.field]]
+name = "anchor_seq"
+type = "u64"
+optional = true
+doc = "chain position a signed head anchor was written for; absent when not anchored"
+[[struct.field]]
+name = "anchor_peers"
+type = "string"
+optional = true
+doc = "comma list of peers that acknowledged the anchor"
+[[struct.field]]
+name = "anchor_reason"
+type = "string"
+optional = true
+doc = "why some or all peers do not hold the anchor"
+[[struct.field]]
+name = "issued_ms"
+type = "u64"
+doc = "unix milliseconds; also the envelope's lamport"
+[[struct.field]]
+name = "elapsed_us"
+type = "u64"
+doc = "submit to chain entry written"

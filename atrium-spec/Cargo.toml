@@ -1,0 +1,19 @@
+[package]
+name = "atrium-spec"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "ATRIUM contract compiler: one TOML schema -> Rust, C and Python, plus a drift check for CI"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[[bin]]
+name = "atrium-spec"
+path = "src/main.rs"
+
+[dev-dependencies]
+ductei-limen = { path = "../ductei-limen" }
+serde_json = "1"
+

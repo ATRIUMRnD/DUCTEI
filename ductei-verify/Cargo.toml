@@ -1,0 +1,16 @@
+[package]
+name = "ductei-verify"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Fail-closed verifier for ATRIUM's self-improvement loop: decides what an agent output may become (accepted, training data, or nothing)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+sha2 = "0.10"
+
+[[bin]]
+name = "ductei-verify"
+path = "src/bin/ductei-verify.rs"

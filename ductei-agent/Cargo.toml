@@ -1,0 +1,10 @@
+[package]
+name = "ductei-agent"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Slice-based agent loop for ATRIUM: an idle agent is pure data on the DUCTEI log (pattern from hydro-project/infinity, Apache-2.0)."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

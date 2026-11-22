@@ -1,0 +1,38 @@
+[package]
+name = "ductei-mcp"
+version = "0.2.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "ductei-mcp-gate: a scoped, persisted, receipt-signing stdio gateway in front of any MCP server"
+
+[features]
+# ML-DSA receipt signing (FIPS 204). Off by default so the gate builds with
+# no PQ crates; receipts are still hash-chained, just unsigned (scheme = "none").
+sign = ["dep:pqcrypto-mldsa", "dep:pqcrypto-traits"]
+# Encrypt and mutually authenticate anchor pushes (anchor.encrypt = true) with the
+# QFLTL v3 handshake from ductei-sync. Off by default so the gate still builds
+# with no PQ crates; when a config asks for encryption and this is off, the gate
+# refuses to start rather than fall back to plaintext.
+qfltl = ["dep:ductei-sync"]
+
+[dependencies]
+ductei-core = { path = "../ductei-core", features = ["net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+sha2 = "0.10"
+getrandom = "0.2"
+zeroize = "1"
+ductei-sync = { path = "../ductei-sync", features = ["qfltl"], optional = true }
+# avx2 is left off on purpose: RUSTSEC-2026-0586 (the AVX2 verifier accepts signatures
+# FIPS 204 rejects on x86_64 Linux and macOS). The reference path is used instead.
+pqcrypto-mldsa = { version = "0.1", optional = true, default-features = false, features = ["std", "neon"] }
+pqcrypto-traits = { version = "0.3", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+# DPAPI (Data Protection API) wrapping of the signing key, user-scoped.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_System_Threading"] }
+
+[[bin]]
+name = "ductei-mcp-gate"
+path = "src/bin/gate.rs"
