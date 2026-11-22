@@ -46,8 +46,9 @@ impl ScopePolicy {
 
 /// The deny-by-default rule itself, independent of how the allow-list is
 /// stored. Split out of `ScopePolicy::permits` so it can be model-checked
-/// without a `HashSet` (see proofs.rs).
-fn permits_with(scopes: &[Scope], allowed: impl Fn(&Scope) -> bool) -> bool {
+/// without a `HashSet` (see proofs.rs). Generic over the scope type so the
+/// proof can use plain numbers: the solver runs out of memory on heap strings.
+fn permits_with<T>(scopes: &[T], allowed: impl Fn(&T) -> bool) -> bool {
     !scopes.is_empty() && scopes.iter().all(allowed)
 }
 

@@ -9,7 +9,8 @@
 //! reachable inside a harness, beyond the explicit assertions.
 //!
 //! Covered: deny-by-default scopes, bounded sessions, ack-after-persist
-//! mapping, blob base64 round-trip. Not covered here: fsync durability
+//! mapping. Blob base64 round-trip is tested (sampled and exhaustively to
+//! 3 bytes) but not model-checked. Not covered here: fsync durability
 //! itself, the C side of the QSW wire (see ductei-qallow proofs + the
 //! conformance job), multi-node ordering.
 
@@ -17,25 +18,29 @@
 #[path = "proof_shim.rs"]
 mod kani;
 
-use crate::{permits_with, ChannelError, Scope, SessionBound, SessionBudget};
+use crate::{permits_with, ChannelError, SessionBound, SessionBudget};
 
 // ---- Invariant: deny-by-default broadcast scopes -------------------------
 
-const NAMES: [&str; 3] = ["a", "b", "c"];
+const SLOTS: usize = 3;
 
 /// For any envelope with up to 3 scopes and any allow/deny pattern:
 /// an empty scope set is denied, one forbidden scope denies the whole
 /// envelope, and it is permitted only if every scope is allowed.
+///
+/// Scopes are the numbers 0..3 here, not strings. `permits_with` is generic
+/// over the scope type, so this checks the same code `ScopePolicy::permits`
+/// runs. With heap strings the solver ran the CI machine out of memory.
 #[cfg_attr(kani, kani::proof)]
 #[cfg_attr(kani, kani::unwind(5))]
 fn scope_policy_is_deny_by_default() {
     let n: usize = kani::any();
-    kani::assume(n <= NAMES.len());
-    let allowed: [bool; 3] = kani::any();
+    kani::assume(n <= SLOTS);
+    let allowed: [bool; SLOTS] = kani::any();
 
-    let scopes: Vec<Scope> = NAMES[..n].iter().map(|s| Scope((*s).to_string())).collect();
-    let lookup = |s: &Scope| NAMES.iter().position(|x| *x == s.0).is_some_and(|i| allowed[i]);
-    let permitted = permits_with(&scopes, lookup);
+    let ids: [u8; SLOTS] = [0, 1, 2];
+    let scopes = &ids[..n];
+    let permitted = permits_with(scopes, |s: &u8| allowed[*s as usize]);
 
     if n == 0 {
         assert!(!permitted, "an envelope with no scopes must be denied");
@@ -49,7 +54,6 @@ fn scope_policy_is_deny_by_default() {
         assert!(permitted, "an envelope whose scopes are all allowed must pass");
     }
 }
-
 // ---- Invariant: bounded sessions only ------------------------------------
 
 /// From any reachable budget state and any cost: admission implies the
@@ -149,8 +153,12 @@ fn ack_applied_only_after_accept() {
 
 /// Every blob of up to 4 bytes (both padding cases and a multi-chunk case)
 /// survives the JSONL/TCP base64 encoding unchanged.
-#[cfg_attr(kani, kani::proof)]
-#[cfg_attr(kani, kani::unwind(70))]
+///
+/// NOT model-checked: under Kani this harness never finished (String, Vec
+/// and iterator code is too heavy for the solver). It runs as a sampled
+/// test, and `base64_exhaustive_to_3_bytes` below checks every blob of 0 to
+/// 3 bytes, which covers both padding cases and the no-padding case.
+#[cfg(not(kani))]
 fn blob_base64_round_trips() {
     let len: usize = kani::any();
     kani::assume(len <= 4);
@@ -174,6 +182,25 @@ mod sampled {
     #[test] fn ack_mapping() { kani::run(ack_applied_only_after_accept, N) }
     #[test] fn base64() { kani::run(blob_base64_round_trips, N) }
 
+    /// All 16,843,009 blobs of 0 to 3 bytes round-trip. Complete for that
+    /// bound, so it stands in for the Kani harness that could not finish.
+    #[test]
+    fn base64_exhaustive_to_3_bytes() {
+        let check = |blob: &[u8]| {
+            let back = crate::b64::dec(&crate::b64::enc(blob));
+            assert_eq!(back.as_deref(), Some(blob));
+        };
+        check(&[]);
+        for a in 0..=255u8 {
+            check(&[a]);
+            for b in 0..=255u8 {
+                check(&[a, b]);
+                for c in 0..=255u8 {
+                    check(&[a, b, c]);
+                }
+            }
+        }
+    }
     /// Regression for the release-build wrap: a u64::MAX cost on a
     /// deadline-10 session used to be admitted and reset the total to 0.
     #[test]
